@@ -20,16 +20,48 @@ function rankCandidates(candidates: readonly RouteCandidate[]): RouteCandidate[]
   });
 }
 
+interface Decimal {
+  coefficient: bigint;
+  scale: number;
+}
+
+function decimal(value: number): Decimal {
+  const text = value.toString();
+  const exponentIndex = text.search(/e/i);
+  const significand = exponentIndex === -1 ? text : text.slice(0, exponentIndex);
+  const exponent = exponentIndex === -1 ? 0 : Number(text.slice(exponentIndex + 1));
+  const decimalPoint = significand.indexOf(".");
+  const fractionalDigits = decimalPoint === -1 ? 0 : significand.length - decimalPoint - 1;
+
+  return {
+    coefficient: BigInt(significand.replace(".", "")),
+    scale: fractionalDigits - exponent
+  };
+}
+
+function scaleDecimal(value: Decimal, scale: number): bigint {
+  return value.coefficient * (10n ** BigInt(scale - value.scale));
+}
+
+function marginAtLeast(first: number, second: number, threshold: number): boolean {
+  const firstValue = decimal(first);
+  const secondValue = decimal(second);
+  const thresholdValue = decimal(threshold);
+  const scale = Math.max(firstValue.scale, secondValue.scale, thresholdValue.scale);
+
+  return scaleDecimal(firstValue, scale) - scaleDecimal(secondValue, scale)
+    >= scaleDecimal(thresholdValue, scale);
+}
+
 export function decideRankedRoute(candidates: readonly RouteCandidate[]): RouteDecision {
   const ranked = rankCandidates(candidates);
   const first = ranked[0];
   const second = ranked[1];
 
-  const margin = first === undefined || second === undefined ? undefined : first.score - second.score;
   if (
     first === undefined
     || first.score < 0.85
-    || (margin !== undefined && margin + Number.EPSILON < 0.15)
+    || (second !== undefined && !marginAtLeast(first.score, second.score, 0.15))
   ) {
     return { kind: "clarification_required", candidates: ranked.slice(0, 3) };
   }

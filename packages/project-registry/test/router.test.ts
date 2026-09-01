@@ -98,6 +98,46 @@ describe("Registry.load", () => {
       .toThrow("duplicate alias");
   });
 
+  it("rejects duplicate project keys", () => {
+    const duplicateProjectKeyEntries = [entries[0], { ...entries[1], projectKey: "synthetic-api" }];
+
+    expect(() => Registry.load(registryFile(registryYaml(duplicateProjectKeyEntries)), discoveredProjects))
+      .toThrow("duplicate projectKey");
+  });
+
+  it("rejects duplicate Orca project identities", () => {
+    const duplicateOrcaProjectEntries = [
+      entries[0],
+      {
+        ...entries[1],
+        orcaProjectId: "orca-synthetic-api",
+        absolutePath: "/srv/orca/projects/synthetic-api"
+      }
+    ];
+
+    expect(() => Registry.load(registryFile(registryYaml(duplicateOrcaProjectEntries)), discoveredProjects))
+      .toThrow("duplicate orcaProjectId");
+  });
+
+  it("rejects normalized duplicate absolute paths", () => {
+    const normalizedDuplicatePath = "/srv/orca/projects/./synthetic-api";
+    const duplicatePathEntries = [entries[0], { ...entries[1], absolutePath: normalizedDuplicatePath }];
+    const duplicatePathImports = [
+      discoveredProjects[0],
+      { ...discoveredProjects[1], absolutePath: normalizedDuplicatePath }
+    ];
+
+    expect(() => Registry.load(registryFile(registryYaml(duplicatePathEntries)), duplicatePathImports))
+      .toThrow("duplicate absolutePath");
+  });
+
+  it("rejects duplicate worktree lock keys", () => {
+    const duplicateLockKeyEntries = [entries[0], { ...entries[1], lockKey: "synthetic-api" }];
+
+    expect(() => Registry.load(registryFile(registryYaml(duplicateLockKeyEntries)), discoveredProjects))
+      .toThrow("duplicate lockKey");
+  });
+
   it("rejects a relative project path", () => {
     const relativePathEntries = [{ ...entries[0], absolutePath: "projects/synthetic-api" }];
 
@@ -185,6 +225,19 @@ describe("decideRankedRoute", () => {
       candidates: [
         { projectKey: "a", score: 0.9, evidence: ["model"] },
         { projectKey: "b", score: 0.751, evidence: ["model"] }
+      ]
+    });
+  });
+
+  it("requires clarification when a represented margin is strictly below 0.15", () => {
+    expect(decideRankedRoute([
+      { projectKey: "a", score: 0.95, evidence: ["model"] },
+      { projectKey: "b", score: 0.8000000000000002, evidence: ["model"] }
+    ])).toEqual({
+      kind: "clarification_required",
+      candidates: [
+        { projectKey: "a", score: 0.95, evidence: ["model"] },
+        { projectKey: "b", score: 0.8000000000000002, evidence: ["model"] }
       ]
     });
   });

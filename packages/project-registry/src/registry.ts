@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { normalize as normalizePath } from "node:path";
 
 import { parse } from "yaml";
 
@@ -25,6 +26,34 @@ function assertUniqueAliases(entries: readonly ProjectRegistryEntry[]): void {
       }
       projectKeyByAlias.set(normalized, entry.projectKey);
     }
+  }
+}
+
+function assertUniqueRegistryIdentities(entries: readonly ProjectRegistryEntry[]): void {
+  const projectKeys = new Set<string>();
+  const orcaProjectIds = new Set<string>();
+  const absolutePaths = new Set<string>();
+  const lockKeys = new Set<string>();
+
+  for (const entry of entries) {
+    if (projectKeys.has(entry.projectKey)) {
+      throw new Error(`duplicate projectKey '${entry.projectKey}'`);
+    }
+    if (orcaProjectIds.has(entry.orcaProjectId)) {
+      throw new Error(`duplicate orcaProjectId '${entry.orcaProjectId}'`);
+    }
+    const absolutePath = normalizePath(entry.absolutePath);
+    if (absolutePaths.has(absolutePath)) {
+      throw new Error(`duplicate absolutePath '${absolutePath}'`);
+    }
+    if (lockKeys.has(entry.lockKey)) {
+      throw new Error(`duplicate lockKey '${entry.lockKey}'`);
+    }
+
+    projectKeys.add(entry.projectKey);
+    orcaProjectIds.add(entry.orcaProjectId);
+    absolutePaths.add(absolutePath);
+    lockKeys.add(entry.lockKey);
   }
 }
 
@@ -59,6 +88,7 @@ export class Registry {
     const document = ProjectRegistryDocumentSchema.parse(parse(readFileSync(path, "utf8")));
     const discovered = DiscoveredProjectSchema.array().parse(discoveredProjects);
 
+    assertUniqueRegistryIdentities(document.projects);
     assertUniqueAliases(document.projects);
     assertApprovedImports(document.projects, discovered);
 
