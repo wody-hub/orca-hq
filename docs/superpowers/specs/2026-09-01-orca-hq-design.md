@@ -166,6 +166,14 @@ interface CommandEnvelope {
   principalId: string;
   receivedAt: string;
   text: string;
+  attachments?: Array<{
+    provider: "slack";
+    providerFileId: string;
+    name: string;
+    mimeType?: string;
+    sizeBytes?: number;
+    contentSha256?: string;
+  }>;
   transcript?: {
     provider: "openai" | "local-whisper";
     sourceFileSha256: string;
@@ -291,7 +299,8 @@ interface PrincipalBinding {
 - The pilot begins with one owner and individually invited coworkers.
 - Unknown identities receive no project metadata and no command execution.
 - Approval records include principal, channel, operation digest, timestamp, and expiry.
-- An approval is valid only for the immutable proposal digest shown to the approver.
+- Viewer can inspect authorized metadata but cannot dispatch or approve. Operator can request L0/L1 and approve L2. Only owner can approve L3.
+- An approval is valid only for the immutable operation digest shown to the approver. The operation digest includes the proposal digest, requested operation, command digest, current diff hash when applicable, and target environment when applicable.
 - Any change to project, branch, scope, diff, command, or environment invalidates the approval.
 
 ## 11. HQ and Model Roles
@@ -400,6 +409,8 @@ Required logical tables:
 - `schema_migrations`
 
 Raw provider payloads are minimized. Tokens are never stored. Voice audio is deleted after transcription unless a user explicitly requests retention for a diagnostic case. Transcripts and diffs are stored as references or redacted summaries unless the local retention setting enables full storage.
+
+Slack attachment bytes are staged outside the repository, size-limited, content-hashed, and removed according to the same local retention policy. Provider download URLs and temporary paths are never persisted in Commands or audit events. Attachment content is untrusted input and cannot alter HQ policy or tool permissions.
 
 ## 16. Recovery and Error Handling
 
