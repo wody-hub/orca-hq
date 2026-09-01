@@ -5,5 +5,11 @@ export {
   type AuditEvent,
   type EnqueueOutboxMessage,
   type InboxEvent,
-  type OutboxMessage
+  type OutboxMessage,
+  type WorktreeAcquireResult,
+  type WorktreeHeartbeat,
+  type WorktreeHeartbeatResult,
+  type WorktreeLease,
+  type WorktreeRelease,
+  type WorktreeReleaseResult
 } from "./store.js";

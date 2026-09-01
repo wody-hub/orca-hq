@@ -52,11 +52,77 @@ const AuditEventSchema = AppendAuditEventSchema.extend({
   createdAt: z.string().datetime()
 }).strict();
 
+const WorktreeLeaseSchema = z.object({
+  lockKey: z.string().min(1),
+  commandId: z.string().min(1),
+  taskId: z.string().min(1),
+  projectKey: z.string().min(1),
+  worktreePath: z.string().min(1),
+  branch: z.string().min(1),
+  dispatchId: z.string().min(1),
+  acquiredAt: z.string().datetime(),
+  heartbeatAt: z.string().datetime(),
+  expiresAt: z.string().datetime()
+}).strict().superRefine((lease, context) => {
+  const acquiredAt = new Date(lease.acquiredAt).getTime();
+  const heartbeatAt = new Date(lease.heartbeatAt).getTime();
+  const expiresAt = new Date(lease.expiresAt).getTime();
+  if (heartbeatAt < acquiredAt) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "heartbeat precedes acquisition" });
+  }
+  if (expiresAt <= heartbeatAt) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "expiry must follow heartbeat" });
+  }
+});
+
+const WorktreeHeartbeatSchema = z.object({
+  lockKey: z.string().min(1),
+  dispatchId: z.string().min(1),
+  heartbeatAt: z.string().datetime(),
+  expiresAt: z.string().datetime()
+}).strict().refine(
+  (heartbeat) => new Date(heartbeat.expiresAt).getTime() > new Date(heartbeat.heartbeatAt).getTime(),
+  { message: "expiry must follow heartbeat" }
+);
+
+const WorktreeReleaseSchema = z.object({
+  lockKey: z.string().min(1),
+  dispatchId: z.string().min(1),
+  releasedAt: z.string().datetime()
+}).strict();
+
 export type InboxEvent = z.infer<typeof InboxEventSchema>;
 export type EnqueueOutboxMessage = z.infer<typeof EnqueueOutboxMessageSchema>;
 export type OutboxMessage = z.infer<typeof OutboxMessageSchema>;
 export type AppendAuditEvent = z.infer<typeof AppendAuditEventSchema>;
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export type WorktreeLease = z.infer<typeof WorktreeLeaseSchema>;
+export type WorktreeHeartbeat = z.infer<typeof WorktreeHeartbeatSchema>;
+export type WorktreeRelease = z.infer<typeof WorktreeReleaseSchema>;
+
+export type WorktreeAcquireResult =
+  | Readonly<{ kind: "acquired"; lease: WorktreeLease }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{
+      kind: "review_required";
+      reason: "expired_lease_requires_reconciliation";
+      lease: WorktreeLease;
+    }>;
+
+export type WorktreeHeartbeatResult =
+  | Readonly<{ kind: "heartbeated"; lease: WorktreeLease }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{ kind: "not_found" }>
+  | Readonly<{
+      kind: "review_required";
+      reason: "expired_lease_requires_reconciliation";
+      lease: WorktreeLease;
+    }>;
+
+export type WorktreeReleaseResult =
+  | Readonly<{ kind: "released" }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{ kind: "not_found" }>;
 
 interface CommandRow {
   payload_json: string;
@@ -98,6 +164,11 @@ interface AuditEventRow {
   created_at: string;
 }
 
+interface WorktreeLockRow {
+  state: string;
+  payload_json: string;
+}
+
 function parseJson(value: string): unknown {
   return JSON.parse(value) as unknown;
 }
@@ -121,6 +192,24 @@ function outboxMessageFromRow(row: OutboxMessageRow): OutboxMessage {
     updatedAt: row.updated_at
   };
   return OutboxMessageSchema.parse(candidate);
+}
+
+function normalizeTimestamp(value: string): string {
+  return new Date(value).toISOString();
+}
+
+function normalizeLease(leaseInput: WorktreeLease): WorktreeLease {
+  const lease = WorktreeLeaseSchema.parse(leaseInput);
+  return WorktreeLeaseSchema.parse({
+    ...lease,
+    acquiredAt: normalizeTimestamp(lease.acquiredAt),
+    heartbeatAt: normalizeTimestamp(lease.heartbeatAt),
+    expiresAt: normalizeTimestamp(lease.expiresAt)
+  });
+}
+
+function worktreeLeaseFromRow(row: WorktreeLockRow): WorktreeLease {
+  return normalizeLease(WorktreeLeaseSchema.parse(parseJson(row.payload_json)));
 }
 
 export class ControlStore {
@@ -274,5 +363,142 @@ export class ControlStore {
       data: parseJson(row.data_json),
       createdAt: row.created_at
     }));
+  }
+
+  acquireWorktreeLock(leaseInput: WorktreeLease): WorktreeAcquireResult {
+    const lease = normalizeLease(leaseInput);
+    const acquire = this.database.transaction((): WorktreeAcquireResult => {
+      const row = this.database.prepare(`
+        SELECT state, payload_json
+        FROM worktree_locks
+        WHERE id = ?
+      `).get(lease.lockKey) as WorktreeLockRow | undefined;
+
+      if (row === undefined) {
+        this.database.prepare(`
+          INSERT INTO worktree_locks (
+            id, dispatch_id, state, payload_json, created_at, updated_at
+          ) VALUES (?, ?, 'active', ?, ?, ?)
+        `).run(
+          lease.lockKey,
+          lease.dispatchId,
+          JSON.stringify(lease),
+          lease.acquiredAt,
+          lease.heartbeatAt
+        );
+        return Object.freeze({ kind: "acquired", lease });
+      }
+
+      if (row.state === "released") {
+        this.database.prepare(`
+          UPDATE worktree_locks
+          SET dispatch_id = ?, state = 'active', payload_json = ?,
+              created_at = ?, updated_at = ?
+          WHERE id = ? AND state = 'released'
+        `).run(
+          lease.dispatchId,
+          JSON.stringify(lease),
+          lease.acquiredAt,
+          lease.heartbeatAt,
+          lease.lockKey
+        );
+        return Object.freeze({ kind: "acquired", lease });
+      }
+
+      const existing = worktreeLeaseFromRow(row);
+      if (new Date(lease.acquiredAt).getTime() >= new Date(existing.expiresAt).getTime()) {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "expired_lease_requires_reconciliation",
+          lease: existing
+        });
+      }
+      if (existing.dispatchId === lease.dispatchId) {
+        return Object.freeze({ kind: "acquired", lease: existing });
+      }
+      return Object.freeze({ kind: "conflict", lease: existing });
+    });
+    return acquire.immediate();
+  }
+
+  heartbeatWorktreeLock(input: WorktreeHeartbeat): WorktreeHeartbeatResult {
+    const parsed = WorktreeHeartbeatSchema.parse(input);
+    const heartbeat = {
+      ...parsed,
+      heartbeatAt: normalizeTimestamp(parsed.heartbeatAt),
+      expiresAt: normalizeTimestamp(parsed.expiresAt)
+    };
+    const update = this.database.transaction((): WorktreeHeartbeatResult => {
+      const row = this.database.prepare(`
+        SELECT state, payload_json
+        FROM worktree_locks
+        WHERE id = ?
+      `).get(heartbeat.lockKey) as WorktreeLockRow | undefined;
+      if (row === undefined || row.state !== "active") {
+        return Object.freeze({ kind: "not_found" });
+      }
+
+      const existing = worktreeLeaseFromRow(row);
+      if (new Date(heartbeat.heartbeatAt).getTime() >= new Date(existing.expiresAt).getTime()) {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "expired_lease_requires_reconciliation",
+          lease: existing
+        });
+      }
+      if (existing.dispatchId !== heartbeat.dispatchId) {
+        return Object.freeze({ kind: "conflict", lease: existing });
+      }
+
+      const lease = normalizeLease({
+        ...existing,
+        heartbeatAt: heartbeat.heartbeatAt,
+        expiresAt: heartbeat.expiresAt
+      });
+      this.database.prepare(`
+        UPDATE worktree_locks
+        SET payload_json = ?, updated_at = ?
+        WHERE id = ? AND state = 'active' AND dispatch_id = ?
+      `).run(JSON.stringify(lease), lease.heartbeatAt, lease.lockKey, lease.dispatchId);
+      return Object.freeze({ kind: "heartbeated", lease });
+    });
+    return update.immediate();
+  }
+
+  releaseWorktreeLock(input: WorktreeRelease): WorktreeReleaseResult {
+    const release = WorktreeReleaseSchema.parse(input);
+    const releasedAt = normalizeTimestamp(release.releasedAt);
+    const update = this.database.transaction((): WorktreeReleaseResult => {
+      const row = this.database.prepare(`
+        SELECT state, payload_json
+        FROM worktree_locks
+        WHERE id = ?
+      `).get(release.lockKey) as WorktreeLockRow | undefined;
+      if (row === undefined || row.state !== "active") {
+        return Object.freeze({ kind: "not_found" });
+      }
+      const existing = worktreeLeaseFromRow(row);
+      if (existing.dispatchId !== release.dispatchId) {
+        return Object.freeze({ kind: "conflict", lease: existing });
+      }
+
+      this.database.prepare(`
+        UPDATE worktree_locks
+        SET state = 'released', updated_at = ?
+        WHERE id = ? AND state = 'active' AND dispatch_id = ?
+      `).run(releasedAt, release.lockKey, release.dispatchId);
+      return Object.freeze({ kind: "released" });
+    });
+    return update.immediate();
+  }
+
+  getWorktreeLock(lockKeyInput: string): WorktreeLease | undefined {
+    const lockKey = z.string().min(1).parse(lockKeyInput);
+    const row = this.database.prepare(`
+      SELECT state, payload_json
+      FROM worktree_locks
+      WHERE id = ? AND state = 'active'
+    `).get(lockKey) as WorktreeLockRow | undefined;
+    return row === undefined ? undefined : worktreeLeaseFromRow(row);
   }
 }

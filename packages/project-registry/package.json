@@ -8,11 +8,12 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/registry.ts src/router.ts src/schema.ts",
-    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/registry.ts src/router.ts src/schema.ts"
+    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/locks.ts src/registry.ts src/router.ts src/schema.ts",
+    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/locks.ts src/registry.ts src/router.ts src/schema.ts"
   },
   "dependencies": {
     "@orca-hq/core": "workspace:*",
+    "@orca-hq/persistence": "workspace:*",
     "yaml": "^2.8.1",
     "zod": "^3.24.2"
   }
