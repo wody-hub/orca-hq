@@ -27,7 +27,8 @@
 - Create: `package.json`
 - Create: `pnpm-workspace.yaml`
 - Create: `tsconfig.base.json`
-- Create: `vitest.workspace.ts`
+- Create: `vitest.config.ts`
+- Create: `pnpm-lock.yaml`
 - Create: `.gitignore`
 - Create: `packages/core/package.json`
 - Create: `packages/core/tsconfig.json`
@@ -70,7 +71,7 @@ describe("workspace", () => {
   "devDependencies": {
     "@types/node": "^22.15.0",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }
 ```
@@ -90,14 +91,14 @@ export const ORCA_HQ_PROTOCOL_VERSION = 1 as const;
 
 - [ ] **Step 4: Verify the workspace**
 
-Run: `pnpm test packages/core/test/workspace.test.ts && pnpm typecheck && pnpm build`
+Run: `pnpm test packages/core/test/workspace.test.ts && pnpm typecheck && pnpm build && pnpm test`
 
-Expected: all commands exit 0 and `packages/core/dist/index.js` exists.
+Expected: all commands exit 0 with no Vitest deprecation warning, and `packages/core/dist/index.js` exists.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add package.json pnpm-workspace.yaml tsconfig.base.json vitest.workspace.ts .gitignore packages/core
+git add package.json pnpm-workspace.yaml tsconfig.base.json vitest.config.ts .gitignore pnpm-lock.yaml packages/core docs/superpowers/plans/2026-09-01-01-foundation-control-plane.md
 git commit -m "build: initialize Orca HQ workspace"
 ```
 
