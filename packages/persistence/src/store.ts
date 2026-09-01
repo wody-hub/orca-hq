@@ -75,7 +75,7 @@ const WorktreeLeaseSchema = z.object({
   }
 });
 
-const WorktreeHeartbeatSchema = z.object({
+const WorktreeHeartbeatUpdateSchema = z.object({
   lockKey: z.string().min(1),
   dispatchId: z.string().min(1),
   heartbeatAt: z.string().datetime(),
@@ -85,7 +85,7 @@ const WorktreeHeartbeatSchema = z.object({
   { message: "expiry must follow heartbeat" }
 );
 
-const WorktreeReleaseSchema = z.object({
+const WorktreeReleaseUpdateSchema = z.object({
   lockKey: z.string().min(1),
   dispatchId: z.string().min(1),
   releasedAt: z.string().datetime()
@@ -97,8 +97,8 @@ export type OutboxMessage = z.infer<typeof OutboxMessageSchema>;
 export type AppendAuditEvent = z.infer<typeof AppendAuditEventSchema>;
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 export type WorktreeLease = z.infer<typeof WorktreeLeaseSchema>;
-export type WorktreeHeartbeat = z.infer<typeof WorktreeHeartbeatSchema>;
-export type WorktreeRelease = z.infer<typeof WorktreeReleaseSchema>;
+export type WorktreeHeartbeatUpdate = z.infer<typeof WorktreeHeartbeatUpdateSchema>;
+export type WorktreeReleaseUpdate = z.infer<typeof WorktreeReleaseUpdateSchema>;
 
 export type WorktreeAcquireResult =
   | Readonly<{ kind: "acquired"; lease: WorktreeLease }>
@@ -115,7 +115,7 @@ export type WorktreeHeartbeatResult =
   | Readonly<{ kind: "not_found" }>
   | Readonly<{
       kind: "review_required";
-      reason: "expired_lease_requires_reconciliation";
+      reason: "expired_lease_requires_reconciliation" | "non_monotonic_heartbeat";
       lease: WorktreeLease;
     }>;
 
@@ -421,8 +421,8 @@ export class ControlStore {
     return acquire.immediate();
   }
 
-  heartbeatWorktreeLock(input: WorktreeHeartbeat): WorktreeHeartbeatResult {
-    const parsed = WorktreeHeartbeatSchema.parse(input);
+  heartbeatWorktreeLock(input: WorktreeHeartbeatUpdate): WorktreeHeartbeatResult {
+    const parsed = WorktreeHeartbeatUpdateSchema.parse(input);
     const heartbeat = {
       ...parsed,
       heartbeatAt: normalizeTimestamp(parsed.heartbeatAt),
@@ -449,6 +449,13 @@ export class ControlStore {
       if (existing.dispatchId !== heartbeat.dispatchId) {
         return Object.freeze({ kind: "conflict", lease: existing });
       }
+      if (new Date(heartbeat.heartbeatAt).getTime() <= new Date(existing.heartbeatAt).getTime()) {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "non_monotonic_heartbeat",
+          lease: existing
+        });
+      }
 
       const lease = normalizeLease({
         ...existing,
@@ -465,8 +472,8 @@ export class ControlStore {
     return update.immediate();
   }
 
-  releaseWorktreeLock(input: WorktreeRelease): WorktreeReleaseResult {
-    const release = WorktreeReleaseSchema.parse(input);
+  releaseWorktreeLock(input: WorktreeReleaseUpdate): WorktreeReleaseResult {
+    const release = WorktreeReleaseUpdateSchema.parse(input);
     const releasedAt = normalizeTimestamp(release.releasedAt);
     const update = this.database.transaction((): WorktreeReleaseResult => {
       const row = this.database.prepare(`

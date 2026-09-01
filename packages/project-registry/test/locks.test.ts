@@ -4,16 +4,31 @@ import { join } from "node:path";
 
 import {
   ControlStore,
-  openDatabase,
-  type WorktreeLease
+  openDatabase
 } from "../../persistence/src/index.js";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { WorktreeLockService } from "../src/index.js";
+import {
+  WorktreeLockService,
+  type Clock,
+  type WorktreeLeaseRequest
+} from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
 const databases: Database.Database[] = [];
+
+class TestClock implements Clock {
+  constructor(private current: Date) {}
+
+  now(): Date {
+    return new Date(this.current);
+  }
+
+  set(instant: string): void {
+    this.current = new Date(instant);
+  }
+}
 
 function createDatabase(): Database.Database {
   const directory = mkdtempSync(join(tmpdir(), "orca-hq-locks-"));
@@ -52,7 +67,11 @@ function seedDispatch(database: Database.Database, dispatchId: string): void {
   `).run(dispatchId, taskId, now, now);
 }
 
-function lease(lockKey: string, dispatchId: string, overrides: Partial<WorktreeLease> = {}): WorktreeLease {
+function lease(
+  lockKey: string,
+  dispatchId: string,
+  overrides: Partial<WorktreeLeaseRequest> = {}
+): WorktreeLeaseRequest {
   return {
     lockKey,
     commandId: `command:${dispatchId}`,
@@ -61,9 +80,6 @@ function lease(lockKey: string, dispatchId: string, overrides: Partial<WorktreeL
     worktreePath: `/srv/worktrees/${dispatchId}`,
     branch: `dispatch/${dispatchId}`,
     dispatchId,
-    acquiredAt: "2026-09-01T10:00:00.000Z",
-    heartbeatAt: "2026-09-01T10:00:00.000Z",
-    expiresAt: "2026-09-01T10:05:00.000Z",
     ...overrides
   };
 }
@@ -71,12 +87,15 @@ function lease(lockKey: string, dispatchId: string, overrides: Partial<WorktreeL
 function setup(...dispatchIds: string[]): {
   database: Database.Database;
   locks: WorktreeLockService;
+  clock: TestClock;
 } {
   const database = createDatabase();
+  const clock = new TestClock(new Date("2026-09-01T10:00:00.000Z"));
   for (const dispatchId of dispatchIds) seedDispatch(database, dispatchId);
   return {
     database,
-    locks: new WorktreeLockService(new ControlStore(database))
+    locks: new WorktreeLockService(new ControlStore(database), clock),
+    clock
   };
 }
 
@@ -107,21 +126,24 @@ describe("WorktreeLockService", () => {
     }))).toEqual(first);
   });
 
-  it("heartbeats only the owning dispatch and persists across reopen", () => {
-    const { database, locks } = setup("dispatch:1", "dispatch:2");
+  it("heartbeats only the owning dispatch", () => {
+    const { locks } = setup("dispatch:1", "dispatch:2");
     locks.acquire(lease("repo:a", "dispatch:1"));
 
     expect(locks.heartbeat({
       lockKey: "repo:a",
-      dispatchId: "dispatch:2",
-      heartbeatAt: "2026-09-01T10:01:00.000Z",
-      expiresAt: "2026-09-01T10:06:00.000Z"
+      dispatchId: "dispatch:2"
     })).toMatchObject({ kind: "conflict" });
+  });
+
+  it("extends a lease by the fixed duration from authoritative clock time", () => {
+    const { database, locks, clock } = setup("dispatch:1");
+    locks.acquire(lease("repo:a", "dispatch:1"));
+    clock.set("2026-09-01T10:01:00.000Z");
+
     expect(locks.heartbeat({
       lockKey: "repo:a",
-      dispatchId: "dispatch:1",
-      heartbeatAt: "2026-09-01T10:01:00.000Z",
-      expiresAt: "2026-09-01T10:06:00.000Z"
+      dispatchId: "dispatch:1"
     })).toMatchObject({
       kind: "heartbeated",
       lease: {
@@ -130,58 +152,86 @@ describe("WorktreeLockService", () => {
       }
     });
 
-    expect(new WorktreeLockService(new ControlStore(database)).get("repo:a")).toMatchObject({
+    expect(new WorktreeLockService(new ControlStore(database), clock).get("repo:a")).toMatchObject({
       heartbeatAt: "2026-09-01T10:01:00.000Z"
     });
   });
 
-  it("releases only the owning dispatch and allows a later acquisition", () => {
-    const { locks } = setup("dispatch:1", "dispatch:2");
+  it("does not revive an expired lease when its owner sends a late heartbeat", () => {
+    const { locks, clock } = setup("dispatch:1");
+    const acquired = locks.acquire(lease("repo:a", "dispatch:1"));
+    clock.set("2026-09-01T10:05:00.001Z");
+
+    expect(locks.heartbeat({
+      lockKey: "repo:a",
+      dispatchId: "dispatch:1"
+    })).toMatchObject({
+      kind: "review_required",
+      reason: "expired_lease_requires_reconciliation"
+    });
+    expect(locks.get("repo:a")).toEqual(acquired.kind === "acquired" ? acquired.lease : undefined);
+  });
+
+  it("rejects a non-monotonic authoritative heartbeat without updating SQLite", () => {
+    const { locks, clock } = setup("dispatch:1");
     locks.acquire(lease("repo:a", "dispatch:1"));
+    clock.set("2026-09-01T10:01:00.000Z");
+    const firstHeartbeat = locks.heartbeat({ lockKey: "repo:a", dispatchId: "dispatch:1" });
+    clock.set("2026-09-01T10:00:30.000Z");
+
+    expect(locks.heartbeat({
+      lockKey: "repo:a",
+      dispatchId: "dispatch:1"
+    })).toMatchObject({
+      kind: "review_required",
+      reason: "non_monotonic_heartbeat"
+    });
+    expect(locks.get("repo:a")).toEqual(
+      firstHeartbeat.kind === "heartbeated" ? firstHeartbeat.lease : undefined
+    );
+  });
+
+  it("releases only the owning dispatch and allows a later acquisition", () => {
+    const { locks, clock } = setup("dispatch:1", "dispatch:2");
+    locks.acquire(lease("repo:a", "dispatch:1"));
+    clock.set("2026-09-01T10:02:00.000Z");
 
     expect(locks.release({
       lockKey: "repo:a",
-      dispatchId: "dispatch:2",
-      releasedAt: "2026-09-01T10:02:00.000Z"
+      dispatchId: "dispatch:2"
     })).toMatchObject({ kind: "conflict" });
     expect(locks.release({
       lockKey: "repo:a",
-      dispatchId: "dispatch:1",
-      releasedAt: "2026-09-01T10:02:00.000Z"
+      dispatchId: "dispatch:1"
     })).toEqual({ kind: "released" });
-    expect(locks.acquire(lease("repo:a", "dispatch:2", {
-      acquiredAt: "2026-09-01T10:02:01.000Z",
-      heartbeatAt: "2026-09-01T10:02:01.000Z",
-      expiresAt: "2026-09-01T10:07:01.000Z"
-    }))).toMatchObject({ kind: "acquired", lease: { dispatchId: "dispatch:2" } });
+    expect(locks.acquire(lease("repo:a", "dispatch:2")))
+      .toMatchObject({ kind: "acquired", lease: { dispatchId: "dispatch:2" } });
   });
 
   it("fails closed when an existing lease expired until reconciliation releases it", () => {
-    const { locks } = setup("dispatch:1", "dispatch:2");
+    const { locks, clock } = setup("dispatch:1", "dispatch:2");
     locks.acquire(lease("repo:a", "dispatch:1"));
+    clock.set("2026-09-01T10:05:00.000Z");
 
-    expect(locks.acquire(lease("repo:a", "dispatch:2", {
-      acquiredAt: "2026-09-01T10:05:00Z",
-      heartbeatAt: "2026-09-01T10:05:00Z",
-      expiresAt: "2026-09-01T10:10:00Z"
-    }))).toMatchObject({
+    expect(locks.acquire(lease("repo:a", "dispatch:2"))).toMatchObject({
       kind: "review_required",
       reason: "expired_lease_requires_reconciliation",
       lease: { dispatchId: "dispatch:1" }
     });
   });
 
-  it("uses parsed timestamps instead of lexical mixed-precision ordering", () => {
-    const { locks } = setup("dispatch:1", "dispatch:2");
-    locks.acquire(lease("repo:a", "dispatch:1", {
-      expiresAt: "2026-09-01T10:00:00.100Z"
-    }));
+  it("stores authoritative timestamps in canonical ISO form", () => {
+    const { locks, clock } = setup("dispatch:1");
+    clock.set("2026-09-01T10:00:00.100Z");
 
-    expect(locks.acquire(lease("repo:a", "dispatch:2", {
-      acquiredAt: "2026-09-01T10:00:00Z",
-      heartbeatAt: "2026-09-01T10:00:00Z",
-      expiresAt: "2026-09-01T10:05:00Z"
-    }))).toMatchObject({ kind: "conflict" });
+    expect(locks.acquire(lease("repo:a", "dispatch:1"))).toMatchObject({
+      kind: "acquired",
+      lease: {
+        acquiredAt: "2026-09-01T10:00:00.100Z",
+        heartbeatAt: "2026-09-01T10:00:00.100Z",
+        expiresAt: "2026-09-01T10:05:00.100Z"
+      }
+    });
   });
 
   it("rolls back an immediate acquire transaction when persistence fails", () => {
@@ -203,7 +253,10 @@ describe("WorktreeLockService", () => {
     const { database, locks } = setup("dispatch:1", "dispatch:2");
     const competingDatabase = openDatabase(database.name);
     databases.push(competingDatabase);
-    const competingLocks = new WorktreeLockService(new ControlStore(competingDatabase));
+    const competingLocks = new WorktreeLockService(
+      new ControlStore(competingDatabase),
+      new TestClock(new Date("2026-09-01T10:00:00.000Z"))
+    );
 
     const results = [
       locks.acquire(lease("repo:a", "dispatch:1")),

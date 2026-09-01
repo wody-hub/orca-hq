@@ -94,6 +94,9 @@ describe("risk classification", () => {
   it.each([
     ["inspect_status", "L0"],
     ["edit_isolated_worktree", "L1"],
+    ["test_isolated_worktree", "L1"],
+    ["commit_changes", "L2"],
+    ["push_branch", "L2"],
     ["create_pull_request", "L2"],
     ["deploy_production", "L3"],
     ["delete_data", "L3"],
@@ -305,6 +308,7 @@ describe("proposal authorization", () => {
   });
 
   it("requires typed-phrase evidence for an L3 approval", () => {
+    const expectedTypedPhraseDigest = "f".repeat(64);
     const l3Proposal = proposal({ riskLevel: "L3" });
     const l3ProposalDigest = proposalDigest(l3Proposal);
     const l3OperationDigest = approvalOperationDigest({
@@ -323,13 +327,23 @@ describe("proposal authorization", () => {
       operation: "deploy_production",
       diffSha256: undefined,
       targetEnvironment: "production",
+      expectedTypedPhraseDigest,
       approval
     });
 
     expect(authorizeProposal(l3Proposal, l3Context).kind).toBe("approval_required");
     expect(authorizeProposal(l3Proposal, {
       ...l3Context,
-      approval: { ...approval, typedPhraseDigest: "f".repeat(64) }
+      approval: { ...approval, typedPhraseDigest: "e".repeat(64) }
+    }).kind).toBe("approval_required");
+    expect(authorizeProposal(l3Proposal, {
+      ...l3Context,
+      expectedTypedPhraseDigest: undefined,
+      approval: { ...approval, typedPhraseDigest: expectedTypedPhraseDigest }
+    }).kind).toBe("approval_required");
+    expect(authorizeProposal(l3Proposal, {
+      ...l3Context,
+      approval: { ...approval, typedPhraseDigest: expectedTypedPhraseDigest }
     }).kind).toBe("auto");
   });
 

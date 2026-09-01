@@ -7,9 +7,9 @@ export {
   type InboxEvent,
   type OutboxMessage,
   type WorktreeAcquireResult,
-  type WorktreeHeartbeat,
   type WorktreeHeartbeatResult,
+  type WorktreeHeartbeatUpdate,
   type WorktreeLease,
-  type WorktreeRelease,
+  type WorktreeReleaseUpdate,
   type WorktreeReleaseResult
 } from "./store.js";

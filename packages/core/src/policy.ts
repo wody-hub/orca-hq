@@ -28,6 +28,7 @@ const AuthorizationContextSchema = z.object({
   commandDigest: Sha256Schema,
   diffSha256: Sha256Schema.optional(),
   targetEnvironment: z.string().min(1).optional(),
+  expectedTypedPhraseDigest: Sha256Schema.optional(),
   now: NowSchema,
   approval: z.unknown().optional()
 }).strict();
@@ -40,6 +41,7 @@ export interface AuthorizationContext {
   readonly commandDigest: string;
   readonly diffSha256?: string | undefined;
   readonly targetEnvironment?: string | undefined;
+  readonly expectedTypedPhraseDigest?: string | undefined;
   readonly now: string | Date;
   readonly approval?: ApprovalRecord | undefined;
 }
@@ -64,6 +66,9 @@ export type PolicyDecision =
 const riskByOperation = Object.freeze({
   inspect_status: "L0",
   edit_isolated_worktree: "L1",
+  test_isolated_worktree: "L1",
+  commit_changes: "L2",
+  push_branch: "L2",
   create_pull_request: "L2",
   deploy_production: "L3",
   delete_data: "L3",
@@ -120,7 +125,13 @@ function approvalStatus(
     return "changed";
   }
 
-  if (proposal.riskLevel === "L3" && approval.typedPhraseDigest === undefined) {
+  if (
+    proposal.riskLevel === "L3"
+    && (
+      context.expectedTypedPhraseDigest === undefined
+      || approval.typedPhraseDigest !== context.expectedTypedPhraseDigest
+    )
+  ) {
     return "invalid";
   }
 
