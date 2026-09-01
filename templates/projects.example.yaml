@@ -1,0 +1,37 @@
+projects:
+  - projectKey: synthetic-api
+    orcaProjectId: orca-synthetic-api
+    absolutePath: /srv/orca/projects/synthetic-api
+    canonicalRemote: https://git.example.test/synthetic/api.git
+    aliases:
+      - Synthetic API
+      - synthetic backend
+    component: backend
+    instructionsFiles:
+      - AGENTS.md
+    setupPolicy: run
+    allowedOperations:
+      - L0
+      - L1
+      - L2
+    requiredChecks:
+      - pnpm test
+    sensitivePaths:
+      - secrets/**
+    lockKey: synthetic-api
+  - projectKey: synthetic-web
+    orcaProjectId: orca-synthetic-web
+    absolutePath: /srv/orca/projects/synthetic-web
+    canonicalRemote: https://git.example.test/synthetic/web.git
+    aliases:
+      - Synthetic Web
+    component: frontend
+    instructionsFiles: []
+    setupPolicy: inherit
+    allowedOperations:
+      - L0
+      - L1
+    requiredChecks:
+      - pnpm test
+    sensitivePaths: []
+    lockKey: synthetic-web
