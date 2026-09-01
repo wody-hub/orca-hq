@@ -140,6 +140,21 @@ describe("ControlStore", () => {
     expect(store.claimOutbox(outboxMessage.nextAttemptAt, "worker-2")).toBeUndefined();
   });
 
+  it("does not claim a mixed-precision timestamp that is still in the future", () => {
+    const store = testStore();
+    store.enqueueOutbox({
+      ...outboxMessage,
+      id: "outbox-mixed-precision",
+      nextAttemptAt: "2026-09-01T00:00:00.100Z"
+    });
+
+    expect(store.claimOutbox("2026-09-01T00:00:00Z")).toBeUndefined();
+    expect(store.claimOutbox("2026-09-01T00:00:00.100Z")).toMatchObject({
+      id: "outbox-mixed-precision",
+      nextAttemptAt: "2026-09-01T00:00:00.100Z"
+    });
+  });
+
   it("does not lose an audit event across reopen", () => {
     const path = temporaryDatabasePath();
     const firstDatabase = openDatabase(path);

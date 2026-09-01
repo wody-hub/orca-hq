@@ -206,6 +206,7 @@ export class ControlStore {
   enqueueOutbox(messageInput: EnqueueOutboxMessage): "inserted" | "duplicate" {
     const message = EnqueueOutboxMessageSchema.parse(messageInput);
     const now = new Date().toISOString();
+    const nextAttemptAt = new Date(message.nextAttemptAt).toISOString();
     const result = this.database.prepare(`
       INSERT INTO outbox_messages (
         id, command_id, channel, destination, template, payload_json, state,
@@ -219,7 +220,7 @@ export class ControlStore {
       message.destination,
       message.template,
       JSON.stringify(message.payload),
-      message.nextAttemptAt,
+      nextAttemptAt,
       now,
       now
     );
@@ -227,7 +228,7 @@ export class ControlStore {
   }
 
   claimOutbox(nowInput: string, workerId = "control-store"): OutboxMessage | undefined {
-    const now = z.string().datetime().parse(nowInput);
+    const now = new Date(z.string().datetime().parse(nowInput)).toISOString();
     const claimant = z.string().min(1).parse(workerId);
     return this.database.transaction(() => {
       const row = this.database.prepare(`
