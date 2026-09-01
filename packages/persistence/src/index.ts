@@ -5,6 +5,8 @@ export {
   type AuditEvent,
   type EnqueueOutboxMessage,
   type InboxEvent,
+  JsonValueSchema,
+  type JsonValue,
   type OutboxMessage,
   type WorktreeAcquireResult,
   type WorktreeHeartbeatResult,

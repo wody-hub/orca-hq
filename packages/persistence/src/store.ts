@@ -7,7 +7,59 @@ import {
 import type Database from "better-sqlite3";
 import { z } from "zod";
 
-const JsonObjectSchema = z.record(z.unknown());
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+function isJsonValue(value: unknown, ancestors: Set<object>): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (typeof value !== "object" || ancestors.has(value)) {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    ancestors.add(value);
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index) || !isJsonValue(value[index], ancestors)) {
+        ancestors.delete(value);
+        return false;
+      }
+    }
+    ancestors.delete(value);
+    return Reflect.ownKeys(value).every((key) => key === "length" || (
+      typeof key === "string" && /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length
+    ));
+  }
+
+  const prototype = Object.getPrototypeOf(value) as object | null;
+  if (prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+
+  ancestors.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || !isJsonValue((value as Record<string, unknown>)[key], ancestors)) {
+      ancestors.delete(value);
+      return false;
+    }
+  }
+  ancestors.delete(value);
+  return true;
+}
+
+export const JsonValueSchema = z.custom<JsonValue>(
+  (value): value is JsonValue => isJsonValue(value, new Set()),
+  { message: "must be a lossless JSON value" }
+);
 
 const InboxEventSchema = z.object({
   id: z.string().min(1),
@@ -25,7 +77,7 @@ const EnqueueOutboxMessageSchema = z.object({
   channel: z.enum(["slack", "telegram", "tailscale-web"]),
   destination: z.string().min(1),
   template: z.string().min(1),
-  payload: JsonObjectSchema,
+  payload: JsonValueSchema,
   nextAttemptAt: z.string().datetime()
 }).strict();
 
@@ -35,7 +87,7 @@ const OutboxMessageSchema = EnqueueOutboxMessageSchema.extend({
   claimedBy: z.string().min(1).nullable(),
   claimedAt: z.string().datetime().nullable(),
   providerMessageId: z.string().min(1).nullable(),
-  lastError: JsonObjectSchema.nullable(),
+  lastError: JsonValueSchema.nullable(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime()
 }).strict();
@@ -44,7 +96,7 @@ const AppendAuditEventSchema = z.object({
   id: z.string().min(1).optional(),
   subjectId: z.string().min(1),
   eventType: z.string().min(1),
-  data: JsonObjectSchema
+  data: JsonValueSchema
 }).strict();
 
 const AuditEventSchema = AppendAuditEventSchema.extend({
@@ -254,7 +306,7 @@ export class ControlStore {
         `${command.commandId}:command_received`,
         command.commandId,
         command.channel,
-        command.externalMessageId,
+        command.idempotencyKey,
         JSON.stringify(command),
         now
       );

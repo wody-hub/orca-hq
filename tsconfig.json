@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "noEmit": true,
+    "paths": {
+      "@orca-hq/core": ["packages/core/src/index.ts"],
+      "@orca-hq/persistence": ["packages/persistence/src/index.ts"],
+      "@orca-hq/project-registry": ["packages/project-registry/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts", "vitest.config.ts"]
+}

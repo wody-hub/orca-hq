@@ -190,6 +190,26 @@ describe("routeProject", () => {
       ]
     });
   });
+
+  it("does not match an approved alias inside a longer Unicode token", () => {
+    const apiEntry = { ...entries[0], aliases: ["api"] };
+
+    expect(routeProject({ text: "Please update the capitalization rules" }, [apiEntry])).toEqual({
+      kind: "clarification_required",
+      candidates: []
+    });
+  });
+
+  it("matches normalized Korean and multi-word approved aliases at token boundaries", () => {
+    const koreanEntry = { ...entries[0], aliases: ["합성 백엔드"] };
+
+    expect(routeProject({ text: "오늘 합성   백엔드 테스트를 실행해 주세요" }, [koreanEntry])).toEqual({
+      kind: "selected",
+      projectKey: "synthetic-api",
+      score: 1,
+      evidence: ["alias:합성 백엔드"]
+    });
+  });
 });
 
 describe("decideRankedRoute", () => {
@@ -240,5 +260,23 @@ describe("decideRankedRoute", () => {
         { projectKey: "b", score: 0.8000000000000002, evidence: ["model"] }
       ]
     });
+  });
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    -0.01,
+    1.01
+  ])("fails closed for an invalid runtime score %s", (score) => {
+    expect(decideRankedRoute([
+      { projectKey: "a", score, evidence: ["model"] }
+    ])).toEqual({ kind: "clarification_required", candidates: [] });
+  });
+
+  it("fails closed when any ranked candidate violates the strict runtime shape", () => {
+    expect(decideRankedRoute([
+      { projectKey: "a", score: 0.95, evidence: ["model"] },
+      { projectKey: "b", score: 0.7, evidence: ["model"], unexpected: true }
+    ] as never)).toEqual({ kind: "clarification_required", candidates: [] });
   });
 });

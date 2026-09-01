@@ -1,7 +1,17 @@
+import { fileURLToPath } from "node:url";
+
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  test: {
-    projects: ["packages/*"]
+  resolve: {
+    alias: {
+      "@orca-hq/core": fileURLToPath(new URL("./packages/core/src/index.ts", import.meta.url)),
+      "@orca-hq/persistence": fileURLToPath(
+        new URL("./packages/persistence/src/index.ts", import.meta.url)
+      ),
+      "@orca-hq/project-registry": fileURLToPath(
+        new URL("./packages/project-registry/src/index.ts", import.meta.url)
+      )
+    }
   }
 });

@@ -1,4 +1,4 @@
-import type { RouteCandidate } from "@orca-hq/core";
+import { RouteCandidateSchema, type RouteCandidate } from "@orca-hq/core";
 
 import { normalizeAlias } from "./registry.js";
 import type { ProjectRegistryEntry } from "./schema.js";
@@ -53,8 +53,13 @@ function marginAtLeast(first: number, second: number, threshold: number): boolea
     >= scaleDecimal(thresholdValue, scale);
 }
 
-export function decideRankedRoute(candidates: readonly RouteCandidate[]): RouteDecision {
-  const ranked = rankCandidates(candidates);
+export function decideRankedRoute(candidates: readonly unknown[]): RouteDecision {
+  const parsedCandidates = RouteCandidateSchema.array().safeParse(candidates);
+  if (!parsedCandidates.success) {
+    return { kind: "clarification_required", candidates: [] };
+  }
+
+  const ranked = rankCandidates(parsedCandidates.data);
   const first = ranked[0];
   const second = ranked[1];
 
@@ -80,7 +85,14 @@ export function routeProject(
 ): RouteDecision {
   const text = normalizeAlias(input.text);
   const candidates = entries.flatMap((entry): RouteCandidate[] => {
-    const alias = entry.aliases.find((candidateAlias) => text.includes(normalizeAlias(candidateAlias)));
+    const alias = entry.aliases.find((candidateAlias) => {
+      const normalizedAlias = normalizeAlias(candidateAlias);
+      const escapedAlias = normalizedAlias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(
+        `(?<![\\p{L}\\p{M}\\p{N}_])${escapedAlias}(?![\\p{L}\\p{M}\\p{N}_])`,
+        "u"
+      ).test(text);
+    });
     return alias === undefined
       ? []
       : [{ projectKey: entry.projectKey, score: 1, evidence: [`alias:${alias}`] }];

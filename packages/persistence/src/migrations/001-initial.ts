@@ -33,8 +33,6 @@ export const initialMigration = {
       );
       CREATE UNIQUE INDEX commands_idempotency_key_unique
         ON commands(idempotency_key);
-      CREATE UNIQUE INDEX commands_provider_message_unique
-        ON commands(channel, external_message_id);
 
       CREATE TABLE command_payloads (
         id TEXT PRIMARY KEY,

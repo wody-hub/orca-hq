@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZodError } from "zod";
 
-import { ControlStore, migrate, openDatabase } from "../src/index.js";
+import { ControlStore, migrate, openDatabase, type JsonValue } from "../src/index.js";
 
 const command = {
   commandId: "cmd-1",
@@ -58,32 +58,40 @@ afterEach(() => {
 });
 
 describe("ControlStore", () => {
-  it("inserts one command and one inbox event for duplicate delivery", () => {
+  it("keeps one command, inbox event, and audit for an exact composite redelivery", () => {
     const store = testStore();
+    const redelivery = { ...command, commandId: "cmd-redelivered" };
 
     expect(store.insertCommand(command)).toBe("inserted");
-    expect(store.insertCommand(command)).toBe("duplicate");
+    expect(store.insertCommand(redelivery)).toBe("duplicate");
     expect(store.listCommands()).toHaveLength(1);
-    expect(store.listInboxEvents()).toHaveLength(1);
+    expect(store.listInboxEvents()).toEqual([
+      expect.objectContaining({ providerEventId: command.idempotencyKey })
+    ]);
     expect(store.listAuditEvents()).toHaveLength(1);
   });
 
-  it("deduplicates a provider event even when its command identifiers change", () => {
+  it("persists identical raw provider message IDs from different composite scopes", () => {
     const database = openDatabase(temporaryDatabasePath());
     openDatabases.push(database);
     const store = new ControlStore(database);
-    const replay = {
+    const otherScope = {
       ...command,
-      commandId: "cmd-replayed",
-      idempotencyKey: "incorrectly-changed-idempotency-key",
-      principalId: "unrelated-principal"
+      commandId: "cmd-other-scope",
+      idempotencyKey: "slack:T999:171.001",
+      principalId: "other-owner"
     };
 
     expect(store.insertCommand(command)).toBe("inserted");
-    expect(store.insertCommand(replay)).toBe("duplicate");
-    expect(store.listCommands()).toEqual([command]);
-    expect(store.listInboxEvents()).toHaveLength(1);
+    expect(store.insertCommand(otherScope)).toBe("inserted");
+    expect(store.listCommands()).toEqual([command, otherScope]);
+    expect(store.listInboxEvents().map(({ providerEventId }) => providerEventId)).toEqual([
+      command.idempotencyKey,
+      otherScope.idempotencyKey
+    ]);
+    expect(store.listAuditEvents()).toHaveLength(2);
     expect(database.prepare("SELECT id FROM principals ORDER BY id").all()).toEqual([
+      { id: otherScope.principalId },
       { id: command.principalId }
     ]);
   });
@@ -180,6 +188,80 @@ describe("ControlStore", () => {
     ]);
   });
 
+  it("round-trips every JSON value shape through real outbox and audit rows", () => {
+    const store = testStore();
+    const nestedJson = {
+      string: "value",
+      number: 1.25,
+      boolean: false,
+      nil: null,
+      array: [1, "two", true, null, { nested: ["ok"] }]
+    };
+
+    expect(store.enqueueOutbox({
+      ...outboxMessage,
+      id: "outbox-json",
+      payload: nestedJson
+    })).toBe("inserted");
+    expect(store.claimOutbox(outboxMessage.nextAttemptAt)).toMatchObject({
+      id: "outbox-json",
+      payload: nestedJson
+    });
+
+    const auditValues = [
+      null,
+      true,
+      42.5,
+      "text",
+      [1, null, "three"],
+      nestedJson
+    ] satisfies JsonValue[];
+    for (const [index, data] of auditValues.entries()) {
+      store.appendAudit({
+        id: `audit-json-${index}`,
+        subjectId: command.commandId,
+        eventType: "json.roundtrip",
+        data
+      });
+    }
+    expect(store.listAuditEvents().map(({ data }) => data)).toEqual(auditValues);
+  });
+
+  it("rejects non-JSON outbox payloads and audit data before SQLite persistence", () => {
+    const store = testStore();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const invalidValues = [
+      undefined,
+      () => undefined,
+      Symbol("invalid"),
+      1n,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      { nested: undefined },
+      [undefined],
+      cyclic
+    ];
+
+    for (const [index, invalid] of invalidValues.entries()) {
+      expect(() => store.enqueueOutbox({
+        ...outboxMessage,
+        id: `outbox-invalid-${index}`,
+        payload: invalid
+      } as never)).toThrow(ZodError);
+      expect(() => store.appendAudit({
+        id: `audit-invalid-${index}`,
+        subjectId: command.commandId,
+        eventType: "json.rejected",
+        data: invalid
+      } as never)).toThrow(ZodError);
+    }
+
+    expect(store.listAuditEvents()).toEqual([]);
+    expect(store.claimOutbox(outboxMessage.nextAttemptAt)).toBeUndefined();
+  });
+
   it("rejects malformed command, outbox, and audit JSON read from storage", () => {
     const database = openDatabase(temporaryDatabasePath());
     openDatabases.push(database);
@@ -199,10 +281,10 @@ describe("ControlStore", () => {
     database.prepare("UPDATE inbox_events SET payload_json = '{}' WHERE command_id = ?").run(command.commandId);
     expect(() => store.listInboxEvents()).toThrow(ZodError);
 
-    database.prepare("UPDATE outbox_messages SET payload_json = '[]' WHERE id = ?").run(outboxMessage.id);
+    database.prepare("UPDATE outbox_messages SET payload_json = '1e400' WHERE id = ?").run(outboxMessage.id);
     expect(() => store.claimOutbox(outboxMessage.nextAttemptAt)).toThrow(ZodError);
 
-    database.prepare("UPDATE audit_events SET data_json = '[]' WHERE id = ?").run("audit-corrupt");
+    database.prepare("UPDATE audit_events SET data_json = '1e400' WHERE id = ?").run("audit-corrupt");
     expect(() => store.listAuditEvents()).toThrow(ZodError);
   });
 });
@@ -274,7 +356,7 @@ describe("SQLite migrations", () => {
     `).run("2026-09-01T00:00:00.000Z")).toThrow("FOREIGN KEY constraint failed");
   });
 
-  it("indexes command idempotency, provider inbox IDs, and due outbox claims", () => {
+  it("indexes composite idempotency keys without raw provider-message uniqueness", () => {
     const database = openDatabase(temporaryDatabasePath());
     openDatabases.push(database);
 
@@ -302,6 +384,9 @@ describe("SQLite migrations", () => {
     expect(commandIndexes).toContainEqual(expect.objectContaining({
       name: "commands_idempotency_key_unique",
       unique: 1
+    }));
+    expect(commandIndexes).not.toContainEqual(expect.objectContaining({
+      name: "commands_provider_message_unique"
     }));
     expect(inboxIndexes).toContainEqual(expect.objectContaining({
       name: "inbox_provider_event_unique",

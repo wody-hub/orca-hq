@@ -1,13 +1,15 @@
 {
   "name": "orca-hq",
   "private": true,
+  "type": "module",
   "packageManager": "pnpm@9.15.5",
   "engines": { "node": ">=22.20 <23" },
   "scripts": {
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "verify:clean": "node scripts/verify-clean-workspace.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
