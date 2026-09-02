@@ -45,13 +45,17 @@ import {
   ProviderCapabilitiesSchema,
   ProviderInspectReceiptSchema,
   ProviderStartReceiptSchema,
+  STRICT_WORKER_LAUNCH_POLICY,
   WorkerProviderError,
   WorkerProviderRegistry,
+  parseWorkerLaunchPolicy,
+  providerStartOrcaAuditReceipt,
   selectProvider,
   workerPrompt,
   type ProviderCapabilities,
   type ProviderInspectReceipt,
   type ProviderStartReceipt,
+  type WorkerLaunchPolicy,
   type WorkerProvider,
   type WorkerProviderId
 } from "./providers.js";
@@ -462,6 +466,7 @@ export class ExecutionService {
   readonly #lifecycle: ExecutionLifecycle;
   readonly #providers: WorkerProviderRegistryPort;
   readonly #providerCapabilities: ProviderCapabilities;
+  readonly #workerLaunchPolicy: WorkerLaunchPolicy;
   readonly #assignmentArtifacts: AssignmentArtifactStore;
   readonly #dispatchLookup = new Map<string, DispatchLookup>();
   readonly #runs = new Map<string, RunContext>();
@@ -474,6 +479,7 @@ export class ExecutionService {
     assignmentArtifacts: AssignmentArtifactStore;
     providers?: WorkerProviderRegistryPort | undefined;
     providerCapabilities?: ProviderCapabilities | undefined;
+    workerLaunchPolicy?: WorkerLaunchPolicy | undefined;
   }>) {
     this.#orca = options.orca;
     this.#placements = options.placements;
@@ -486,6 +492,9 @@ export class ExecutionService {
     this.#providerCapabilities = Object.freeze(ProviderCapabilitiesSchema.parse(
       options.providerCapabilities ?? DEFAULT_PROVIDER_CAPABILITIES
     ));
+    this.#workerLaunchPolicy = parseWorkerLaunchPolicy(
+      options.workerLaunchPolicy ?? STRICT_WORKER_LAUNCH_POLICY
+    );
     this.#assignmentArtifacts = options.assignmentArtifacts;
   }
 
@@ -931,9 +940,10 @@ export class ExecutionService {
         name: task.task.localId,
         setup: context.project.setupPolicy,
         assignmentArtifact,
-        providerEnvironmentIsolation:
+        providerChildEnvironmentIsolationCapability:
           this.#providerCapabilities.providerChildEnvironmentIsolation,
         assignmentArtifactAccess: this.#providerCapabilities.assignmentArtifactAccess,
+        workerLaunchPolicy: this.#workerLaunchPolicy,
         ...(retryOf === undefined ? {} : { retryOf })
       })
     );
@@ -956,7 +966,7 @@ export class ExecutionService {
     const selection = selectProvider({
       role: assignment.role,
       preferredAgent: assignment.preferredAgent
-    }, this.#providerCapabilities);
+    }, this.#providerCapabilities, this.#workerLaunchPolicy);
     if (selection.kind === "unavailable") {
       const code = selection.reason === "provider_authentication_required"
         ? "provider_authentication_required"
@@ -1008,7 +1018,9 @@ export class ExecutionService {
       || JSON.stringify(
         parsed.data.boundary.providerChildEnvironmentIsolation
       ) !== JSON.stringify(
-        this.#providerCapabilities.providerChildEnvironmentIsolation
+        this.#workerLaunchPolicy.kind === "orca_supervised_private_pilot"
+          ? { kind: "unverified_orca_supervised" }
+          : this.#providerCapabilities.providerChildEnvironmentIsolation
       )
       || JSON.stringify(
         parsed.data.boundary.assignmentArtifactAccess
@@ -1021,7 +1033,22 @@ export class ExecutionService {
         ...(boundDispatchId === undefined ? {} : { trustedDispatchId: boundDispatchId })
       });
     }
-    return parsed.data as ProviderStartReceipt;
+    let auditReceipt: OrcaReceipt;
+    try {
+      auditReceipt = providerStartOrcaAuditReceipt(
+        parsed.data.orcaReceipt,
+        parsed.data.boundary.providerChildEnvironmentIsolation
+      );
+    } catch {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "start", {
+        workerMayBeLive: true,
+        trustedDispatchId: parsed.data.orcaDispatchId
+      });
+    }
+    return Object.freeze(ProviderStartReceiptSchema.parse({
+      ...parsed.data,
+      orcaReceipt: auditReceipt
+    })) as ProviderStartReceipt;
   }
 
   #validatedInspectReceipt(

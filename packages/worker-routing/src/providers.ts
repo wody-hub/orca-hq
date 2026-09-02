@@ -55,6 +55,71 @@ const EffectiveEnvironmentKeysSchema = z.array(SafeProviderEnvironmentKeySchema)
     }
   });
 
+export const PrivatePilotSecretBoundaryAttestationSchema = z.object({
+  channelAndVoiceSecrets: z.literal("keychain_or_runtime_only"),
+  absentFromAssignment: z.literal(true),
+  absentFromPromptArtifact: z.literal(true),
+  absentFromLogsAndAudit: z.literal(true),
+  absentFromConfiguredProviderEnvironment: z.literal(true),
+  inheritedProviderChildEnvironmentInspection: z.literal("not_available")
+}).strict();
+
+export type PrivatePilotSecretBoundaryAttestation = Readonly<
+  z.infer<typeof PrivatePilotSecretBoundaryAttestationSchema>
+>;
+
+export const WorkerLaunchPolicySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("strict_verified_isolation") }).strict(),
+  z.object({
+    kind: z.literal("orca_supervised_private_pilot"),
+    secretBoundaryAttestation: PrivatePilotSecretBoundaryAttestationSchema
+  }).strict()
+]);
+
+export type WorkerLaunchPolicy = Readonly<
+  | { kind: "strict_verified_isolation" }
+  | {
+      kind: "orca_supervised_private_pilot";
+      secretBoundaryAttestation: PrivatePilotSecretBoundaryAttestation;
+    }
+>;
+
+export const STRICT_WORKER_LAUNCH_POLICY: WorkerLaunchPolicy = Object.freeze({
+  kind: "strict_verified_isolation"
+});
+
+export type WorkerLaunchPolicyFailureCode =
+  | "invalid_worker_launch_policy"
+  | "private_pilot_secret_boundary_attestation_invalid";
+
+export class WorkerLaunchPolicyError extends TypeError {
+  readonly code: WorkerLaunchPolicyFailureCode;
+  readonly retryable = false;
+
+  constructor(code: WorkerLaunchPolicyFailureCode) {
+    super("Worker launch policy is invalid");
+    this.name = "WorkerLaunchPolicyError";
+    this.code = code;
+  }
+}
+
+export function parseWorkerLaunchPolicy(value: unknown): WorkerLaunchPolicy {
+  const parsed = WorkerLaunchPolicySchema.safeParse(value);
+  if (!parsed.success) {
+    const code = (value as { kind?: unknown })?.kind === "orca_supervised_private_pilot"
+      ? "private_pilot_secret_boundary_attestation_invalid"
+      : "invalid_worker_launch_policy";
+    throw new WorkerLaunchPolicyError(code);
+  }
+  if (parsed.data.kind === "strict_verified_isolation") {
+    return STRICT_WORKER_LAUNCH_POLICY;
+  }
+  return Object.freeze({
+    kind: parsed.data.kind,
+    secretBoundaryAttestation: Object.freeze({ ...parsed.data.secretBoundaryAttestation })
+  });
+}
+
 export const ProviderChildEnvironmentIsolationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("unsupported") }).strict(),
   z.object({
@@ -65,6 +130,18 @@ export const ProviderChildEnvironmentIsolationSchema = z.discriminatedUnion("kin
 
 export type ProviderChildEnvironmentIsolation = Readonly<
   z.infer<typeof ProviderChildEnvironmentIsolationSchema>
+>;
+
+export const ProviderChildEnvironmentBoundarySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("verified_effective_allowlist"),
+    effectiveEnvironmentKeys: EffectiveEnvironmentKeysSchema
+  }).strict(),
+  z.object({ kind: z.literal("unverified_orca_supervised") }).strict()
+]);
+
+export type ProviderChildEnvironmentBoundary = Readonly<
+  z.infer<typeof ProviderChildEnvironmentBoundarySchema>
 >;
 
 export const AssignmentArtifactAccessSchema = z.discriminatedUnion("kind", [
@@ -147,10 +224,12 @@ function unavailableSelection(
 
 export function selectProvider(
   inputValue: ProviderSelectionInput,
-  capabilitiesValue: ProviderCapabilities
+  capabilitiesValue: ProviderCapabilities,
+  workerLaunchPolicyValue: WorkerLaunchPolicy = STRICT_WORKER_LAUNCH_POLICY
 ): ProviderSelection {
   const input = ProviderSelectionInputSchema.parse(inputValue);
   const capabilities = ProviderCapabilitiesSchema.parse(capabilitiesValue);
+  const workerLaunchPolicy = parseWorkerLaunchPolicy(workerLaunchPolicyValue);
   if (input.role === "hq" && input.preferredAgent !== "codex") {
     return Object.freeze({
       kind: "unavailable",
@@ -161,6 +240,7 @@ export function selectProvider(
   if (
     input.role !== "hq"
     && capabilities.providerChildEnvironmentIsolation.kind === "unsupported"
+    && workerLaunchPolicy.kind === "strict_verified_isolation"
   ) {
     return Object.freeze({
       kind: "unavailable",
@@ -213,8 +293,9 @@ const ProviderStartContextSchema = z.object({
   setup: z.enum(["run", "skip", "inherit"]).optional(),
   retryOf: NonBlankStringSchema.optional(),
   assignmentArtifact: AssignmentArtifactSchema,
-  providerEnvironmentIsolation: ProviderChildEnvironmentIsolationSchema,
-  assignmentArtifactAccess: AssignmentArtifactAccessSchema
+  providerChildEnvironmentIsolationCapability: ProviderChildEnvironmentIsolationSchema,
+  assignmentArtifactAccess: AssignmentArtifactAccessSchema,
+  workerLaunchPolicy: WorkerLaunchPolicySchema
 }).strict();
 
 export type ProviderStartContext = Readonly<z.infer<typeof ProviderStartContextSchema>>;
@@ -225,11 +306,23 @@ const ProviderBoundarySchema = z.object({
   attemptContext: z.literal("orca_injected_task_spec_and_prestart_assignment"),
   credentialSource: z.literal("provider_authenticated_cli"),
   postStartMail: z.literal(false),
-  providerChildEnvironmentIsolation: ProviderChildEnvironmentIsolationSchema.refine(
-    (value) => value.kind === "verified_effective_allowlist"
-  ),
+  providerChildEnvironmentIsolation: ProviderChildEnvironmentBoundarySchema,
   assignmentArtifactAccess: z.object({ kind: z.literal("same_host") }).strict()
 }).strict();
+
+const ProviderStartOrcaAuditReceiptSchema = z.object({
+  id: NonBlankStringSchema,
+  ok: z.literal(true),
+  result: z.object({
+    dispatchId: NonBlankStringSchema,
+    taskId: NonBlankStringSchema,
+    runId: NonBlankStringSchema,
+    state: NonBlankStringSchema,
+    stage: NonBlankStringSchema,
+    setup: z.object({ state: NonBlankStringSchema }),
+    effects: z.array(z.object({}))
+  })
+});
 
 export const ProviderStartReceiptSchema = z.object({
   kind: z.literal("provider_start"),
@@ -352,13 +445,61 @@ function explicitOrcaRejection(error: unknown): boolean {
   return (error as { code?: unknown })?.code === "orca_command_failed";
 }
 
-function startResult(receipt: OrcaReceipt, expectedTaskId: string): Readonly<{
+export function providerStartOrcaAuditReceipt(
+  receiptValue: OrcaReceipt,
+  boundaryValue: ProviderChildEnvironmentBoundary
+): OrcaReceipt {
+  const receipt = parseOrcaOperationReceipt("dispatch_worker", receiptValue);
+  const boundary = ProviderChildEnvironmentBoundarySchema.parse(boundaryValue);
+  const result = receipt.result as {
+    launch?: { providerEnvironment?: unknown };
+  };
+  if (boundary.kind === "unverified_orca_supervised") {
+    if (result.launch?.providerEnvironment !== undefined) {
+      throw Object.assign(new Error("unexpected private-pilot environment claim"), {
+        code: "invalid_orca_receipt",
+        workerMayBeLive: true
+      });
+    }
+  } else {
+    const isolation = ProviderChildEnvironmentIsolationSchema.safeParse(
+      result.launch?.providerEnvironment
+    );
+    if (
+      !isolation.success
+      || isolation.data.kind !== "verified_effective_allowlist"
+      || JSON.stringify(isolation.data) !== JSON.stringify(boundary)
+    ) {
+      throw Object.assign(new Error("provider start environment attestation mismatch"), {
+        code: "invalid_orca_receipt",
+        workerMayBeLive: true
+      });
+    }
+  }
+  // The operation parser validates the public shape; this projection strips
+  // pass-through metadata, diagnostics, launch extensions, and effect contents.
+  const projected = ProviderStartOrcaAuditReceiptSchema.parse(receipt);
+  return boundary.kind === "unverified_orca_supervised"
+    ? projected
+    : {
+        ...projected,
+        result: {
+          ...projected.result,
+          launch: {
+            providerEnvironment: boundary
+          }
+        }
+      };
+}
+
+function startResult(
+  receipt: OrcaReceipt,
+  expectedTaskId: string,
+  expectedBoundary: ProviderChildEnvironmentBoundary
+): Readonly<{
   dispatchId: string;
   taskId: string;
-  providerEnvironmentIsolation: Extract<
-    ProviderChildEnvironmentIsolation,
-    { kind: "verified_effective_allowlist" }
-  >;
+  providerChildEnvironmentBoundary: ProviderChildEnvironmentBoundary;
 }> {
   const result = receipt.result as {
     dispatchId?: unknown;
@@ -383,6 +524,20 @@ function startResult(receipt: OrcaReceipt, expectedTaskId: string): Readonly<{
       workerMayBeLive: true
     });
   }
+  if (expectedBoundary.kind === "unverified_orca_supervised") {
+    if (result.launch?.providerEnvironment !== undefined) {
+      throw Object.assign(new Error("unexpected private-pilot environment claim"), {
+        code: "invalid_orca_receipt",
+        workerMayBeLive: true,
+        trustedDispatchId: result.dispatchId
+      });
+    }
+    return Object.freeze({
+      dispatchId: result.dispatchId,
+      taskId: result.taskId,
+      providerChildEnvironmentBoundary: expectedBoundary
+    });
+  }
   const isolation = ProviderChildEnvironmentIsolationSchema.safeParse(
     result.launch?.providerEnvironment
   );
@@ -396,7 +551,7 @@ function startResult(receipt: OrcaReceipt, expectedTaskId: string): Readonly<{
   return Object.freeze({
     dispatchId: result.dispatchId,
     taskId: result.taskId,
-    providerEnvironmentIsolation: isolation.data
+    providerChildEnvironmentBoundary: isolation.data
   });
 }
 
@@ -474,7 +629,13 @@ export class OrcaWorkerProvider implements WorkerProvider {
     if (assignment.preferredAgent !== this.id) {
       throw new WorkerProviderError("provider_mismatch", this.id, "start");
     }
-    if (context.providerEnvironmentIsolation.kind === "unsupported") {
+    const providerEnvironmentBoundary = context.workerLaunchPolicy.kind
+      === "orca_supervised_private_pilot"
+      ? Object.freeze({ kind: "unverified_orca_supervised" as const })
+      : context.providerChildEnvironmentIsolationCapability.kind === "unsupported"
+        ? undefined
+        : context.providerChildEnvironmentIsolationCapability;
+    if (providerEnvironmentBoundary === undefined) {
       throw new WorkerProviderError(
         "provider_environment_isolation_unavailable",
         this.id,
@@ -511,16 +672,24 @@ export class OrcaWorkerProvider implements WorkerProvider {
     try {
       const rawReceipt = await this.#orca.execute(operation);
       const orcaReceipt = parseOrcaOperationReceipt("dispatch_worker", rawReceipt);
-      const result = startResult(orcaReceipt, context.orcaTaskId);
+      const result = startResult(
+        orcaReceipt,
+        context.orcaTaskId,
+        providerEnvironmentBoundary
+      );
       if (
-        JSON.stringify(result.providerEnvironmentIsolation.effectiveEnvironmentKeys)
-          !== JSON.stringify(context.providerEnvironmentIsolation.effectiveEnvironmentKeys)
+        JSON.stringify(result.providerChildEnvironmentBoundary)
+          !== JSON.stringify(providerEnvironmentBoundary)
       ) {
         throw new WorkerProviderError("invalid_provider_receipt", this.id, "start", {
           workerMayBeLive: true,
           trustedDispatchId: result.dispatchId
         });
       }
+      const auditReceipt = providerStartOrcaAuditReceipt(
+        orcaReceipt,
+        result.providerChildEnvironmentBoundary
+      );
       return Object.freeze(ProviderStartReceiptSchema.parse({
         kind: "provider_start",
         protocol: 1,
@@ -536,10 +705,10 @@ export class OrcaWorkerProvider implements WorkerProvider {
           attemptContext: "orca_injected_task_spec_and_prestart_assignment",
           credentialSource: "provider_authenticated_cli",
           postStartMail: false,
-          providerChildEnvironmentIsolation: result.providerEnvironmentIsolation,
+          providerChildEnvironmentIsolation: result.providerChildEnvironmentBoundary,
           assignmentArtifactAccess: context.assignmentArtifactAccess
         },
-        orcaReceipt
+        orcaReceipt: auditReceipt
       })) as ProviderStartReceipt;
     } catch (error) {
       const classified = classifiedProviderError(this.id, "start", error);

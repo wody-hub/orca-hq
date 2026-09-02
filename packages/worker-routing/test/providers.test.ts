@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   ClaudeWorkerProvider,
   CodexWorkerProvider,
+  STRICT_WORKER_LAUNCH_POLICY,
   WorkerProviderRegistry,
   parseWorkerAssignment,
   selectProvider,
@@ -14,6 +15,7 @@ import {
   type ProviderCapabilities,
   type ProviderStartContext,
   type WorkerAssignment,
+  type WorkerLaunchPolicy,
   type WorkerProviderId
 } from "../src/index.js";
 
@@ -63,6 +65,7 @@ class FakeProviderOrca {
   staleObservation = false;
   startTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
+  includeProviderEnvironment = true;
 
   async execute(operation: OrcaOperation): Promise<OrcaReceipt> {
     this.calls.push(structuredClone(operation));
@@ -81,12 +84,16 @@ class FakeProviderOrca {
               stage: "ready",
               setup: { state: "running" },
               effects: [],
-              launch: {
-                providerEnvironment: {
-                  kind: "verified_effective_allowlist",
-                  effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
-                }
-              }
+              ...(this.includeProviderEnvironment
+                ? {
+                    launch: {
+                      providerEnvironment: {
+                        kind: "verified_effective_allowlist",
+                        effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
+                      }
+                    }
+                  }
+                : {})
             });
       case "show_worker":
         return receipt("worker-show-1", {
@@ -153,6 +160,18 @@ const availableCapabilities: ProviderCapabilities = {
 
 const verifiedEnvironmentIsolation = availableCapabilities.providerChildEnvironmentIsolation;
 
+const privatePilotPolicy: WorkerLaunchPolicy = {
+  kind: "orca_supervised_private_pilot",
+  secretBoundaryAttestation: {
+    channelAndVoiceSecrets: "keychain_or_runtime_only",
+    absentFromAssignment: true,
+    absentFromPromptArtifact: true,
+    absentFromLogsAndAudit: true,
+    absentFromConfiguredProviderEnvironment: true,
+    inheritedProviderChildEnvironmentInspection: "not_available"
+  }
+};
+
 function artifactFor(currentAssignment: WorkerAssignment): AssignmentArtifact {
   const content = workerPrompt(currentAssignment);
   const artifactDigest = createHash("sha256")
@@ -177,8 +196,9 @@ function startContext(
     orcaTaskId: "orca-task-1",
     setup: "run",
     assignmentArtifact: artifactFor(currentAssignment),
-    providerEnvironmentIsolation: verifiedEnvironmentIsolation,
+    providerChildEnvironmentIsolationCapability: verifiedEnvironmentIsolation,
     assignmentArtifactAccess: { kind: "same_host" },
+    workerLaunchPolicy: STRICT_WORKER_LAUNCH_POLICY,
     ...overrides
   };
 }
@@ -374,6 +394,35 @@ describe("Orca-backed worker providers", () => {
     });
   });
 
+  it.each(["codex", "claude"] as const)(
+    "starts the exact %s provider under the explicit private-pilot policy without a public environment claim",
+    async (providerId) => {
+      // Break caught: Orca 1.4.195 omits child-environment evidence, so the pilot must record uncertainty.
+      const orca = new FakeProviderOrca();
+      orca.includeProviderEnvironment = false;
+      const currentAssignment = assignment(providerId);
+
+      const started = await providers(orca).get(providerId).start(currentAssignment, {
+        ...startContext(currentAssignment),
+        providerChildEnvironmentIsolationCapability: { kind: "unsupported" },
+        workerLaunchPolicy: privatePilotPolicy
+      });
+
+      expect(started.boundary.providerChildEnvironmentIsolation).toEqual({
+        kind: "unverified_orca_supervised"
+      });
+      expect(started.orcaReceipt.result).not.toHaveProperty("launch.providerEnvironment");
+      expect(JSON.stringify(started)).not.toContain("verified_effective_allowlist");
+      expect(orca.calls).toEqual([{
+        kind: "dispatch_worker",
+        taskId: "orca-task-1",
+        worktree: currentAssignment.worktree.path,
+        agent: providerId,
+        setup: "run"
+      }]);
+    }
+  );
+
   it("classifies authentication, process, and stale-dispatch failures without leaking diagnostics", async () => {
     // Break caught: collapsing failures or echoing provider stderr can retry auth errors and expose secrets.
     const cases = [
@@ -433,7 +482,7 @@ describe("Orca-backed worker providers", () => {
 
     await expect(providers(orca).get("codex").start(currentAssignment, {
       ...startContext(currentAssignment),
-      providerEnvironmentIsolation: { kind: "unsupported" }
+      providerChildEnvironmentIsolationCapability: { kind: "unsupported" }
     })).rejects.toMatchObject({
       code: "provider_environment_isolation_unavailable",
       provider: "codex",
@@ -514,5 +563,27 @@ describe("provider selection", () => {
       provider: "codex",
       reason: "provider_assignment_artifact_access_unavailable"
     });
+  });
+
+  it("selects an available worker with unsupported isolation only under the explicit private pilot", () => {
+    // Break caught: an implicit fallback would silently weaken the default worker boundary.
+    const capabilities: ProviderCapabilities = {
+      ...availableCapabilities,
+      providerChildEnvironmentIsolation: { kind: "unsupported" }
+    };
+
+    expect(selectProvider(
+      { role: "implement", preferredAgent: "codex" },
+      capabilities
+    )).toEqual({
+      kind: "unavailable",
+      provider: "codex",
+      reason: "provider_environment_isolation_unavailable"
+    });
+    expect(selectProvider(
+      { role: "implement", preferredAgent: "codex" },
+      capabilities,
+      privatePilotPolicy
+    )).toEqual({ kind: "selected", provider: "codex" });
   });
 });

@@ -8,14 +8,16 @@ import {
   createSandboxRepo,
   type SandboxRepo
 } from "../../test-support/src/index.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  AssignmentArtifactSchema,
   CodexWorkerProvider,
   ExecutionLifecycle,
   ExecutionService,
   GitWorktreePlacementService,
   WorkerProviderError,
+  parseWorkerAssignment,
   workerPrompt,
   type AssignmentArtifact,
   type AssignmentArtifactReference,
@@ -37,6 +39,7 @@ import {
   type TaskRecord,
   type UserVisibleLifecycleMessage,
   type WorkerDoneCommit,
+  type WorkerLaunchPolicy,
   type WorkerMessage,
   type WorkerProvider,
   type WorkerProviderRegistryPort
@@ -81,6 +84,52 @@ const proposal: ExecutionProposal = {
   ]
 };
 
+const privatePilotPolicy: WorkerLaunchPolicy = {
+  kind: "orca_supervised_private_pilot",
+  secretBoundaryAttestation: {
+    channelAndVoiceSecrets: "keychain_or_runtime_only",
+    absentFromAssignment: true,
+    absentFromPromptArtifact: true,
+    absentFromLogsAndAudit: true,
+    absentFromConfiguredProviderEnvironment: true,
+    inheritedProviderChildEnvironmentInspection: "not_available"
+  }
+};
+
+function withUnsafeProviderStartAuditFields(
+  receiptValue: ProviderStartReceipt,
+  secret: string,
+  includeEnvironmentClaim: boolean
+): ProviderStartReceipt {
+  const result = receiptValue.orcaReceipt.result as Record<string, unknown>;
+  return {
+    ...receiptValue,
+    orcaReceipt: {
+      ...receiptValue.orcaReceipt,
+      result: {
+        ...result,
+        setup: {
+          ...(result.setup as Record<string, unknown>),
+          diagnostic: secret
+        },
+        effects: [{ diagnostic: secret }],
+        diagnostic: secret,
+        ...(includeEnvironmentClaim
+          ? {
+              launch: {
+                providerEnvironment: {
+                  kind: "verified_effective_allowlist",
+                  effectiveEnvironmentKeys: ["HOME", "PATH"]
+                }
+              }
+            }
+          : {})
+      },
+      _meta: { diagnostic: secret }
+    }
+  };
+}
+
 function authorized(
   proposalOverride: ExecutionProposal = proposal,
   projectOverride: ProjectRegistryEntry = project,
@@ -101,6 +150,13 @@ class RecordingOrca {
   malformedDispatchId: string | undefined;
   dispatchTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
+  includeProviderEnvironment = true;
+  startSecretExtensions: Readonly<{
+    slack: string;
+    telegram: string;
+    tailscale: string;
+    openAiVoice: string;
+  }> | undefined;
   #task = 0;
   #dispatch = 0;
 
@@ -133,21 +189,36 @@ class RecordingOrca {
             dispatchId: this.malformedDispatchId
           });
         }
-        return receipt(`dispatch-receipt-${this.#dispatch}`, {
-          dispatchId: `orca-dispatch-${this.#dispatch}`,
-          taskId: this.dispatchTaskId ?? operation.taskId,
-          runId: "orca-run-1",
-          state: "ready",
-          stage: "ready",
-          setup: { state: "running" },
-          effects: [],
-          launch: {
-            providerEnvironment: {
-              kind: "verified_effective_allowlist",
-              effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
-            }
-          }
-        });
+        const extensions = this.startSecretExtensions;
+        return {
+          id: `dispatch-receipt-${this.#dispatch}`,
+          ok: true,
+          result: {
+            dispatchId: `orca-dispatch-${this.#dispatch}`,
+            taskId: this.dispatchTaskId ?? operation.taskId,
+            runId: "orca-run-1",
+            state: "ready",
+            stage: "ready",
+            setup: {
+              state: "running",
+              ...(extensions === undefined ? {} : { diagnostic: extensions.tailscale })
+            },
+            effects: extensions === undefined ? [] : [{ diagnostic: extensions.openAiVoice }],
+            ...(this.includeProviderEnvironment
+              ? {
+                  launch: {
+                    providerEnvironment: {
+                      kind: "verified_effective_allowlist",
+                      effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
+                    },
+                    ...(extensions === undefined ? {} : { diagnostic: extensions.slack })
+                  }
+                }
+              : {}),
+            ...(extensions === undefined ? {} : { diagnostic: extensions.telegram })
+          },
+          ...(extensions === undefined ? {} : { _meta: { diagnostic: extensions.slack } })
+        };
       }
       case "show_worker":
         return receipt(`show-receipt-${operation.dispatchId}`, {
@@ -403,7 +474,8 @@ class MemoryGit implements GitWorktreePort {
 function setup(
   git = new MemoryGit(),
   providerCapabilities?: ProviderCapabilities,
-  providerFactory?: (orca: RecordingOrca) => WorkerProviderRegistryPort
+  providerFactory?: (orca: RecordingOrca) => WorkerProviderRegistryPort,
+  workerLaunchPolicy?: WorkerLaunchPolicy
 ): {
   service: ExecutionService;
   orca: RecordingOrca;
@@ -438,6 +510,7 @@ function setup(
       lifecycle,
       assignmentArtifacts: artifacts,
       providerCapabilities: providerCapabilities ?? supportedCapabilities,
+      ...(workerLaunchPolicy === undefined ? {} : { workerLaunchPolicy }),
       ...(providerFactory === undefined ? {} : { providers: providerFactory(orca) })
     }),
     orca,
@@ -453,6 +526,7 @@ function setup(
 const sandboxes: SandboxRepo[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(sandboxes.splice(0).map((sandbox) => sandbox.cleanup()));
 });
 
@@ -850,6 +924,298 @@ describe("ExecutionService preflight and dispatch", () => {
     expect(orca.calls).toEqual([]);
     expect(locks.acquired).toEqual([]);
     expect(store.runs.size).toBe(0);
+  });
+
+  it.each([
+    {
+      name: "missing",
+      policy: { kind: "orca_supervised_private_pilot" }
+    },
+    {
+      name: "false",
+      policy: {
+        ...privatePilotPolicy,
+        secretBoundaryAttestation: {
+          ...privatePilotPolicy.secretBoundaryAttestation,
+          absentFromLogsAndAudit: false
+        }
+      }
+    }
+  ])("rejects a $name private-pilot attestation while configuration is still mutation-free", ({ policy }) => {
+    // Break caught: accepting a partial or aspirational attestation would silently enable the exception.
+    const orca = new RecordingOrca();
+    const locks = new RecordingLocks();
+    const store = new MemoryLifecycleStore();
+    const artifacts = new MemoryAssignmentArtifactStore();
+    let caught: unknown;
+
+    try {
+      new ExecutionService({
+        orca,
+        placements: new GitWorktreePlacementService(new MemoryGit()),
+        locks,
+        lifecycle: new ExecutionLifecycle({ store }),
+        assignmentArtifacts: artifacts,
+        providerCapabilities: {
+          codex: { worker: "available", hq: "available" },
+          claude: { worker: "available", hq: "unavailable" },
+          providerChildEnvironmentIsolation: { kind: "unsupported" },
+          assignmentArtifactAccess: { kind: "same_host" }
+        },
+        workerLaunchPolicy: policy as WorkerLaunchPolicy
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: "private_pilot_secret_boundary_attestation_invalid"
+    });
+    expect(artifacts.staged).toEqual([]);
+    expect(orca.calls).toEqual([]);
+    expect(locks.acquired).toEqual([]);
+    expect(store.runs.size).toBe(0);
+  });
+
+  it("persists an unverified boundary for an explicit private-pilot launch without Orca environment evidence", async () => {
+    // Break caught: supervision must never be promoted into a verified provider child environment claim.
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: { kind: "unsupported" },
+      assignmentArtifactAccess: { kind: "same_host" }
+    };
+    const setupResult = setup(
+      new MemoryGit(),
+      capabilities,
+      undefined,
+      privatePilotPolicy
+    );
+    setupResult.orca.includeProviderEnvironment = false;
+
+    await expect(setupResult.service.start(authorized())).resolves.toMatchObject({
+      kind: "started",
+      dispatchIds: ["orca-dispatch-1"]
+    });
+
+    const dispatch = [...setupResult.store.dispatches.values()][0];
+    expect(dispatch?.providerStartReceipt?.boundary.providerChildEnvironmentIsolation).toEqual({
+      kind: "unverified_orca_supervised"
+    });
+    expect(dispatch?.receipt?.result).not.toHaveProperty("launch.providerEnvironment");
+    expect(JSON.stringify(dispatch)).not.toContain("verified_effective_allowlist");
+  });
+
+  it("rejects and fences a private-pilot start receipt that asserts verified child isolation", async () => {
+    // Break caught: an outer unverified label cannot coexist with a nested verified claim in durable audit.
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: { kind: "unsupported" },
+      assignmentArtifactAccess: { kind: "same_host" }
+    };
+    const setupResult = setup(
+      new MemoryGit(),
+      capabilities,
+      undefined,
+      privatePilotPolicy
+    );
+    const extensionSecret = "private-receipt-extension-c8cb21cc";
+    setupResult.orca.startSecretExtensions = {
+      slack: extensionSecret,
+      telegram: extensionSecret,
+      tailscale: extensionSecret,
+      openAiVoice: extensionSecret
+    };
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      workerMayBeLive: true,
+      trustedDispatchId: "orca-dispatch-1"
+    });
+
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    }]);
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    const durableAudit = JSON.stringify({
+      runs: [...setupResult.store.runs.values()],
+      tasks: [...setupResult.store.tasks.values()],
+      dispatches: [...setupResult.store.dispatches.values()],
+      transitions: setupResult.store.transitions,
+      messages: setupResult.store.messages
+    });
+    expect(durableAudit).not.toContain(extensionSecret);
+    expect(durableAudit).not.toContain("verified_effective_allowlist");
+  });
+
+  it("sanitizes a private-pilot receipt returned by an injected provider before persistence", async () => {
+    // Break caught: a custom registry port must not bypass the durable receipt allowlist.
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: { kind: "unsupported" },
+      assignmentArtifactAccess: { kind: "same_host" }
+    };
+    const extensionSecret = "custom-provider-extension-e13704bc";
+    const setupResult = setup(new MemoryGit(), capabilities, (orca) => {
+      const delegate = new CodexWorkerProvider({ orca });
+      const provider: WorkerProvider = {
+        id: "codex",
+        start: async (assignment, context) => withUnsafeProviderStartAuditFields(
+          await delegate.start(assignment, context),
+          extensionSecret,
+          false
+        ),
+        inspect: (dispatchId) => delegate.inspect(dispatchId)
+      };
+      return { get: () => provider };
+    }, privatePilotPolicy);
+    setupResult.orca.includeProviderEnvironment = false;
+
+    await expect(setupResult.service.start(authorized())).resolves.toMatchObject({
+      kind: "started"
+    });
+
+    const durableAudit = JSON.stringify([...setupResult.store.dispatches.values()]);
+    expect(durableAudit).not.toContain(extensionSecret);
+    expect(durableAudit).not.toContain("verified_effective_allowlist");
+  });
+
+  it("rejects and fences a contradictory private-pilot receipt from an injected provider", async () => {
+    // Break caught: dependency injection is not authority to weaken the service receipt boundary.
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: { kind: "unsupported" },
+      assignmentArtifactAccess: { kind: "same_host" }
+    };
+    const extensionSecret = "custom-provider-claim-ea83df16";
+    const setupResult = setup(new MemoryGit(), capabilities, (orca) => {
+      const delegate = new CodexWorkerProvider({ orca });
+      const provider: WorkerProvider = {
+        id: "codex",
+        start: async (assignment, context) => withUnsafeProviderStartAuditFields(
+          await delegate.start(assignment, context),
+          extensionSecret,
+          true
+        ),
+        inspect: (dispatchId) => delegate.inspect(dispatchId)
+      };
+      return { get: () => provider };
+    }, privatePilotPolicy);
+    setupResult.orca.includeProviderEnvironment = false;
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      workerMayBeLive: true,
+      trustedDispatchId: "orca-dispatch-1"
+    });
+
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    }]);
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    const durableAudit = JSON.stringify([...setupResult.store.dispatches.values()]);
+    expect(durableAudit).not.toContain(extensionSecret);
+    expect(durableAudit).not.toContain("verified_effective_allowlist");
+  });
+
+  it("keeps synthetic channel, network, and voice secrets out of every private-pilot launch surface", async () => {
+    // Break caught: a process-global secret must not migrate into durable assignment or audit material.
+    const secrets = {
+      SLACK_BOT_TOKEN: "xoxb-private-pilot-slack-93e468f2",
+      TELEGRAM_BOT_TOKEN: "private-pilot-telegram-2f9029c1",
+      TAILSCALE_AUTH_KEY: "tskey-auth-private-pilot-cb552d1a",
+      OPENAI_API_KEY: "sk-private-pilot-voice-fd856297"
+    } as const;
+    for (const [key, value] of Object.entries(secrets)) vi.stubEnv(key, value);
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: { kind: "unsupported" },
+      assignmentArtifactAccess: { kind: "same_host" }
+    };
+    const setupResult = setup(
+      new MemoryGit(),
+      capabilities,
+      undefined,
+      privatePilotPolicy
+    );
+    setupResult.orca.includeProviderEnvironment = false;
+    setupResult.orca.startSecretExtensions = {
+      slack: secrets.SLACK_BOT_TOKEN,
+      telegram: secrets.TELEGRAM_BOT_TOKEN,
+      tailscale: secrets.TAILSCALE_AUTH_KEY,
+      openAiVoice: secrets.OPENAI_API_KEY
+    };
+
+    const result = await setupResult.service.start(authorized());
+    const dispatch = [...setupResult.store.dispatches.values()][0];
+    const artifact = setupResult.artifacts.staged[0];
+    if (dispatch === undefined || artifact === undefined) {
+      throw new Error("private-pilot launch did not persist its audit inputs");
+    }
+    const schemaErrors: unknown[] = [];
+    try {
+      parseWorkerAssignment({
+        ...dispatch.assignment,
+        SLACK_BOT_TOKEN: secrets.SLACK_BOT_TOKEN
+      });
+    } catch (error) {
+      schemaErrors.push(error);
+    }
+    try {
+      AssignmentArtifactSchema.parse({
+        ...artifact,
+        TELEGRAM_BOT_TOKEN: secrets.TELEGRAM_BOT_TOKEN
+      });
+    } catch (error) {
+      schemaErrors.push(error);
+    }
+    expect(schemaErrors).toHaveLength(2);
+
+    const taskSpecs = setupResult.orca.calls
+      .filter((operation) => operation.kind === "create_task")
+      .map((operation) => operation.spec);
+    const dispatchOperation = setupResult.orca.calls.find(
+      (operation) => operation.kind === "dispatch_worker"
+    );
+    expect(dispatchOperation).not.toHaveProperty("environment");
+    const serializedAuditAndErrors = JSON.stringify({
+      result,
+      taskSpecs,
+      assignment: dispatch.assignment,
+      promptAndArtifact: setupResult.artifacts.staged,
+      providerReceipts: {
+        start: dispatch.providerStartReceipt,
+        inspect: dispatch.providerInspectReceipts
+      },
+      lifecycle: {
+        runs: [...setupResult.store.runs.values()],
+        tasks: [...setupResult.store.tasks.values()],
+        dispatches: [...setupResult.store.dispatches.values()],
+        transitions: setupResult.store.transitions,
+        messages: setupResult.store.messages
+      },
+      applicationConfiguredProviderLaunch: dispatchOperation,
+      schemaErrors
+    });
+    for (const value of Object.values(secrets)) {
+      expect(serializedAuditAndErrors).not.toContain(value);
+    }
+    expect(serializedAuditAndErrors).toContain("unverified_orca_supervised");
+    expect(serializedAuditAndErrors).not.toContain("verified_effective_allowlist");
   });
 
   it("publishes an invariant Task reference before atomically staging the exact attempt", async () => {

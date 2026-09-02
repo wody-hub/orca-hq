@@ -163,6 +163,21 @@ describe("Orca CLI capability adapter", () => {
     ]);
   });
 
+  it("does not promote Orca 1.4.195 into a verified provider child-environment capability", async () => {
+    // Break caught: a compatible version bump is not evidence of an undocumented isolation contract.
+    const fake = await fakeOrca();
+    await enqueueStartup(fake, statusWith({ version: "1.4.195" }));
+
+    await expect(clientFor(fake).health()).resolves.toMatchObject({
+      compatible: true,
+      version: "1.4.195",
+      providerChildEnvironmentIsolation: {
+        kind: "unsupported",
+        reason: "public_worker_start_has_no_child_environment_contract"
+      }
+    });
+  });
+
   it("targets a saved runtime with the documented non-secret common CLI argument", async () => {
     // Break caught: filtering ORCA_ENVIRONMENT without an explicit replacement disconnects HQ.
     const fake = await fakeOrca();
