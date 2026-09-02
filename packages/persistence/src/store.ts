@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import {
   CommandEnvelopeSchema,
-  type CommandEnvelope
+  type CommandEnvelope,
+  type CommandIngress
 } from "@orca-hq/core";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -264,8 +265,20 @@ function worktreeLeaseFromRow(row: WorktreeLockRow): WorktreeLease {
   return normalizeLease(WorktreeLeaseSchema.parse(parseJson(row.payload_json)));
 }
 
-export class ControlStore {
+export class ControlStore implements CommandIngress {
   constructor(private readonly database: Database.Database) {}
+
+  async accept(input: CommandEnvelope): Promise<Readonly<{
+    kind: "accepted" | "duplicate";
+    commandId: string;
+  }>> {
+    const command = CommandEnvelopeSchema.parse(input);
+    const status = this.insertCommand(command);
+    return Object.freeze({
+      kind: status === "inserted" ? "accepted" : "duplicate",
+      commandId: command.commandId
+    });
+  }
 
   insertCommand(commandInput: CommandEnvelope): "inserted" | "duplicate" {
     const command = CommandEnvelopeSchema.parse(commandInput);
