@@ -66,6 +66,13 @@ class FakeProviderOrca {
   startTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
   includeProviderEnvironment = true;
+  inspectionReadSource: "transcript" | "terminal" = "transcript";
+  inspectionSecrets: Readonly<{
+    slack: string;
+    telegram: string;
+    tailscale: string;
+    openAiVoice: string;
+  }> | undefined;
 
   async execute(operation: OrcaOperation): Promise<OrcaReceipt> {
     this.calls.push(structuredClone(operation));
@@ -95,46 +102,94 @@ class FakeProviderOrca {
                   }
                 : {})
             });
-      case "show_worker":
-        return receipt("worker-show-1", {
-          dispatch: {
-            id: operation.dispatchId,
-            task_id: "orca-task-1",
-            run_id: "orca-run-1",
-            status: "dispatched"
+      case "show_worker": {
+        const secrets = this.inspectionSecrets;
+        return {
+          id: "worker-show-1",
+          ok: true,
+          result: {
+            dispatch: {
+              id: operation.dispatchId,
+              task_id: "orca-task-1",
+              run_id: "orca-run-1",
+              status: "dispatched",
+              ...(secrets === undefined ? {} : { diagnostic: secrets.slack })
+            },
+            worker: {
+              dispatch_id: operation.dispatchId,
+              state: "ready",
+              stage: "ready",
+              agent_terminal_handle: "terminal-1",
+              ...(secrets === undefined ? {} : { diagnostic: secrets.telegram })
+            },
+            terminal: secrets === undefined
+              ? null
+              : { lines: [secrets.tailscale], diagnostic: secrets.openAiVoice },
+            observation: {
+              status: "ready",
+              exactWorker: !this.staleObservation,
+              ...(secrets === undefined ? {} : { diagnostic: secrets.openAiVoice })
+            },
+            terminalResource: {
+              id: "resource-1",
+              ownershipState: "owned",
+              releaseState: "active",
+              ...(secrets === undefined ? {} : { diagnostic: secrets.slack })
+            },
+            ...(secrets === undefined ? {} : { diagnostic: secrets.telegram })
           },
-          worker: {
-            dispatch_id: operation.dispatchId,
-            state: "ready",
-            stage: "ready",
-            agent_terminal_handle: "terminal-1"
-          },
-          terminal: null,
-          observation: {
-            status: "ready",
-            exactWorker: !this.staleObservation
-          },
-          terminalResource: {
-            id: "resource-1",
-            ownershipState: "owned",
-            releaseState: "active"
-          }
-        });
-      case "read_worker":
-        return receipt("worker-read-1", {
+          ...(secrets === undefined ? {} : { _meta: { diagnostic: secrets.tailscale } })
+        };
+      }
+      case "read_worker": {
+        const secrets = this.inspectionSecrets;
+        const base = {
           dispatchId: operation.dispatchId,
-          source: "transcript",
+          source: this.inspectionReadSource,
           cursor: "cursor-1",
-          status: { worker: "ready", terminal: "running" },
-          transcript: {
-            messages: [],
-            limited: false,
-            nextCursor: "cursor-1",
-            returnedMessageCount: 0
+          status: {
+            worker: "ready",
+            terminal: "running",
+            ...(secrets === undefined ? {} : { diagnostic: secrets.slack })
           },
-          warnings: [],
-          archived: false
-        });
+          warnings: secrets === undefined ? [] : [secrets.telegram],
+          archived: false,
+          ...(secrets === undefined ? {} : { diagnostic: secrets.tailscale })
+        };
+        const content = this.inspectionReadSource === "transcript"
+          ? {
+              transcript: {
+                messages: secrets === undefined
+                  ? []
+                  : [{
+                      id: "message-1",
+                      role: "assistant",
+                      blocks: [{ type: "text", text: secrets.openAiVoice }],
+                      timestamp: 1,
+                      source: "worker",
+                      diagnostic: secrets.slack
+                    }],
+                limited: false,
+                nextCursor: "cursor-1",
+                returnedMessageCount: secrets === undefined ? 0 : 1,
+                ...(secrets === undefined ? {} : { diagnostic: secrets.telegram })
+              }
+            }
+          : {
+              terminal: {
+                lines: secrets === undefined ? [] : [secrets.openAiVoice],
+                limited: false,
+                nextCursor: "cursor-1",
+                ...(secrets === undefined ? {} : { diagnostic: secrets.telegram })
+              }
+            };
+        return {
+          id: "worker-read-1",
+          ok: true,
+          result: { ...base, ...content },
+          ...(secrets === undefined ? {} : { _meta: { diagnostic: secrets.tailscale } })
+        };
+      }
       default:
         throw new Error(`unexpected operation ${operation.kind}`);
     }
@@ -256,6 +311,78 @@ describe("Orca-backed worker providers", () => {
         nestedWorkers: "forbidden",
         reportExactlyOnce: true
       });
+    }
+  );
+
+  it.each(["transcript", "terminal"] as const)(
+    "projects %s inspection receipts to metadata-only audit records",
+    async (source) => {
+      // Break caught: public inspection payloads can contain channel, network, or voice secrets.
+      const orca = new FakeProviderOrca();
+      const secrets = {
+        slack: "xoxb-inspection-slack-705cfc04",
+        telegram: "inspection-telegram-5b89e7bb",
+        tailscale: "tskey-inspection-c4ef57f1",
+        openAiVoice: "sk-inspection-voice-e204c472"
+      } as const;
+      orca.inspectionReadSource = source;
+      orca.inspectionSecrets = secrets;
+
+      const inspected = await providers(orca).get("codex").inspect("orca-dispatch-2");
+
+      expect(inspected.showReceipt).toEqual({
+        id: "worker-show-1",
+        ok: true,
+        result: {
+          dispatch: {
+            id: "orca-dispatch-2",
+            task_id: "orca-task-1",
+            run_id: "orca-run-1",
+            status: "dispatched"
+          },
+          worker: {
+            dispatch_id: "orca-dispatch-2",
+            state: "ready",
+            stage: "ready",
+            agent_terminal_handle: "terminal-1"
+          },
+          observation: { status: "ready", exactWorker: true },
+          terminalResource: {
+            id: "resource-1",
+            ownershipState: "owned",
+            releaseState: "active"
+          }
+        }
+      });
+      expect(inspected.readReceipt).toEqual({
+        id: "worker-read-1",
+        ok: true,
+        result: {
+          dispatchId: "orca-dispatch-2",
+          source,
+          cursor: "cursor-1",
+          status: { worker: "ready", terminal: "running" },
+          ...(source === "transcript"
+            ? {
+                transcript: {
+                  limited: false,
+                  nextCursor: "cursor-1",
+                  returnedMessageCount: 1
+                }
+              }
+            : { terminal: { limited: false, nextCursor: "cursor-1" } }),
+          archived: false
+        }
+      });
+      expect(inspected.workerState).toBe("ready");
+      const audit = JSON.stringify(inspected);
+      for (const value of Object.values(secrets)) expect(audit).not.toContain(value);
+      expect(audit).not.toContain("messages");
+      expect(audit).not.toContain("blocks");
+      expect(audit).not.toContain("lines");
+      expect(audit).not.toContain("warnings");
+      expect(audit).not.toContain("_meta");
+      expect(audit).not.toContain("diagnostic");
     }
   );
 

@@ -49,6 +49,7 @@ import {
   WorkerProviderError,
   WorkerProviderRegistry,
   parseWorkerLaunchPolicy,
+  providerInspectOrcaAuditReceipts,
   providerStartOrcaAuditReceipt,
   selectProvider,
   workerPrompt,
@@ -1066,7 +1067,24 @@ export class ExecutionService {
     ) {
       throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
     }
-    return parsed.data as ProviderInspectReceipt;
+    let auditReceipts: ReturnType<typeof providerInspectOrcaAuditReceipts>;
+    try {
+      auditReceipts = providerInspectOrcaAuditReceipts(
+        parsed.data.showReceipt,
+        parsed.data.readReceipt,
+        dispatchId
+      );
+    } catch {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
+    }
+    if (parsed.data.workerState !== auditReceipts.workerState) {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
+    }
+    return Object.freeze(ProviderInspectReceiptSchema.parse({
+      ...parsed.data,
+      showReceipt: auditReceipts.showReceipt,
+      readReceipt: auditReceipts.readReceipt
+    })) as ProviderInspectReceipt;
   }
 
   async #launchWithIntervention(

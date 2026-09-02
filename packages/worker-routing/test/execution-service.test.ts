@@ -34,6 +34,7 @@ import {
   type LifecycleStore,
   type LifecycleTransition,
   type ProviderCapabilities,
+  type ProviderInspectReceipt,
   type ProviderStartReceipt,
   type RunRecord,
   type TaskRecord,
@@ -126,6 +127,81 @@ function withUnsafeProviderStartAuditFields(
           : {})
       },
       _meta: { diagnostic: secret }
+    }
+  };
+}
+
+function withUnsafeProviderInspectAuditFields(
+  receiptValue: ProviderInspectReceipt,
+  secrets: Readonly<{
+    slack: string;
+    telegram: string;
+    tailscale: string;
+    openAiVoice: string;
+  }>,
+  source: "transcript" | "terminal"
+): ProviderInspectReceipt {
+  const showResult = receiptValue.showReceipt.result as Record<string, unknown>;
+  const dispatch = showResult.dispatch as Record<string, unknown>;
+  const worker = showResult.worker as Record<string, unknown>;
+  const observation = showResult.observation as Record<string, unknown>;
+  const terminalResource = showResult.terminalResource as Record<string, unknown>;
+  const readResult = receiptValue.readReceipt.result as Record<string, unknown>;
+  return {
+    ...receiptValue,
+    showReceipt: {
+      ...receiptValue.showReceipt,
+      result: {
+        ...showResult,
+        dispatch: { ...dispatch, diagnostic: secrets.slack },
+        worker: { ...worker, diagnostic: secrets.telegram },
+        terminal: { lines: [secrets.tailscale], diagnostic: secrets.openAiVoice },
+        observation: { ...observation, diagnostic: secrets.openAiVoice },
+        terminalResource: { ...terminalResource, diagnostic: secrets.slack },
+        diagnostic: secrets.telegram
+      },
+      _meta: { diagnostic: secrets.tailscale }
+    },
+    readReceipt: {
+      ...receiptValue.readReceipt,
+      result: {
+        dispatchId: readResult.dispatchId,
+        source,
+        cursor: readResult.cursor,
+        status: {
+          ...(readResult.status as Record<string, unknown>),
+          diagnostic: secrets.slack
+        },
+        warnings: [secrets.telegram],
+        archived: readResult.archived,
+        ...(source === "transcript"
+          ? {
+              transcript: {
+                messages: [{
+                  id: "message-1",
+                  role: "assistant",
+                  blocks: [{ type: "text", text: secrets.openAiVoice }],
+                  timestamp: 1,
+                  source: "worker",
+                  diagnostic: secrets.slack
+                }],
+                limited: false,
+                nextCursor: "cursor-1",
+                returnedMessageCount: 1,
+                diagnostic: secrets.telegram
+              }
+            }
+          : {
+              terminal: {
+                lines: [secrets.openAiVoice],
+                limited: false,
+                nextCursor: "cursor-1",
+                diagnostic: secrets.telegram
+              }
+            }),
+        diagnostic: secrets.tailscale
+      },
+      _meta: { diagnostic: secrets.tailscale }
     }
   };
 }
@@ -1086,6 +1162,98 @@ describe("ExecutionService preflight and dispatch", () => {
     expect(durableAudit).not.toContain(extensionSecret);
     expect(durableAudit).not.toContain("verified_effective_allowlist");
   });
+
+  it.each(["transcript", "terminal"] as const)(
+    "reprojects injected private-pilot %s inspection receipts before persistence",
+    async (source) => {
+      // Break caught: a custom registry port must not restore raw worker output after provider sanitization.
+      const capabilities: ProviderCapabilities = {
+        codex: { worker: "available", hq: "available" },
+        claude: { worker: "available", hq: "unavailable" },
+        providerChildEnvironmentIsolation: { kind: "unsupported" },
+        assignmentArtifactAccess: { kind: "same_host" }
+      };
+      const secrets = {
+        slack: "xoxb-custom-inspection-slack-1f233df9",
+        telegram: "custom-inspection-telegram-3a417fba",
+        tailscale: "tskey-custom-inspection-b54dbcac",
+        openAiVoice: "sk-custom-inspection-voice-03728e62"
+      } as const;
+      const setupResult = setup(new MemoryGit(), capabilities, (orca) => {
+        const delegate = new CodexWorkerProvider({ orca });
+        const provider: WorkerProvider = {
+          id: "codex",
+          start: (assignment, context) => delegate.start(assignment, context),
+          inspect: async (dispatchId) => withUnsafeProviderInspectAuditFields(
+            await delegate.inspect(dispatchId),
+            secrets,
+            source
+          )
+        };
+        return { get: () => provider };
+      }, privatePilotPolicy);
+      setupResult.orca.includeProviderEnvironment = false;
+
+      await expect(setupResult.service.start(authorized())).resolves.toMatchObject({
+        kind: "started"
+      });
+
+      const receipt = [...setupResult.store.dispatches.values()][0]
+        ?.providerInspectReceipts?.[0];
+      expect(receipt?.showReceipt).toEqual({
+        id: "show-receipt-orca-dispatch-1",
+        ok: true,
+        result: {
+          dispatch: {
+            id: "orca-dispatch-1",
+            task_id: "orca-task-1",
+            run_id: "orca-run-1",
+            status: "dispatched"
+          },
+          worker: {
+            dispatch_id: "orca-dispatch-1",
+            state: "ready",
+            stage: "ready",
+            agent_terminal_handle: "terminal-orca-dispatch-1"
+          },
+          observation: { status: "ready", exactWorker: true },
+          terminalResource: {
+            id: "resource-orca-dispatch-1",
+            ownershipState: "owned",
+            releaseState: "active"
+          }
+        }
+      });
+      expect(receipt?.readReceipt).toEqual({
+        id: "read-receipt-orca-dispatch-1",
+        ok: true,
+        result: {
+          dispatchId: "orca-dispatch-1",
+          source,
+          cursor: "cursor-1",
+          status: { worker: "ready", terminal: "running" },
+          ...(source === "transcript"
+            ? {
+                transcript: {
+                  limited: false,
+                  nextCursor: "cursor-1",
+                  returnedMessageCount: 1
+                }
+              }
+            : { terminal: { limited: false, nextCursor: "cursor-1" } }),
+          archived: false
+        }
+      });
+      const durableAudit = JSON.stringify([...setupResult.store.dispatches.values()]);
+      for (const value of Object.values(secrets)) expect(durableAudit).not.toContain(value);
+      expect(durableAudit).not.toContain("messages");
+      expect(durableAudit).not.toContain("blocks");
+      expect(durableAudit).not.toContain("lines");
+      expect(durableAudit).not.toContain("warnings");
+      expect(durableAudit).not.toContain("_meta");
+      expect(durableAudit).not.toContain("diagnostic");
+    }
+  );
 
   it("rejects and fences a contradictory private-pilot receipt from an injected provider", async () => {
     // Break caught: dependency injection is not authority to weaken the service receipt boundary.

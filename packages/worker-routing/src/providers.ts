@@ -324,6 +324,66 @@ const ProviderStartOrcaAuditReceiptSchema = z.object({
   })
 });
 
+const ProviderInspectShowOrcaAuditReceiptSchema = z.object({
+  id: NonBlankStringSchema,
+  ok: z.literal(true),
+  result: z.object({
+    dispatch: z.object({
+      id: NonBlankStringSchema,
+      task_id: NonBlankStringSchema,
+      run_id: NonBlankStringSchema,
+      status: NonBlankStringSchema
+    }),
+    worker: z.object({
+      dispatch_id: NonBlankStringSchema,
+      state: NonBlankStringSchema,
+      stage: NonBlankStringSchema,
+      agent_terminal_handle: NonBlankStringSchema.nullable()
+    }),
+    observation: z.object({
+      status: NonBlankStringSchema,
+      exactWorker: z.boolean()
+    }),
+    terminalResource: z.object({
+      id: NonBlankStringSchema,
+      ownershipState: NonBlankStringSchema,
+      releaseState: NonBlankStringSchema
+    })
+  })
+});
+
+const ProviderInspectReadBaseAuditResultSchema = z.object({
+  dispatchId: NonBlankStringSchema,
+  cursor: NonBlankStringSchema,
+  status: z.object({
+    worker: NonBlankStringSchema,
+    terminal: NonBlankStringSchema
+  }),
+  archived: z.boolean()
+});
+
+const ProviderInspectReadOrcaAuditReceiptSchema = z.object({
+  id: NonBlankStringSchema,
+  ok: z.literal(true),
+  result: z.discriminatedUnion("source", [
+    ProviderInspectReadBaseAuditResultSchema.extend({
+      source: z.literal("transcript"),
+      transcript: z.object({
+        limited: z.boolean(),
+        nextCursor: NonBlankStringSchema,
+        returnedMessageCount: z.number().int().nonnegative()
+      })
+    }),
+    ProviderInspectReadBaseAuditResultSchema.extend({
+      source: z.literal("terminal"),
+      terminal: z.object({
+        limited: z.boolean(),
+        nextCursor: NonBlankStringSchema
+      })
+    })
+  ])
+});
+
 export const ProviderStartReceiptSchema = z.object({
   kind: z.literal("provider_start"),
   protocol: z.literal(1),
@@ -490,6 +550,63 @@ export function providerStartOrcaAuditReceipt(
           }
         }
       };
+}
+
+export function providerInspectOrcaAuditReceipts(
+  showReceiptValue: OrcaReceipt,
+  readReceiptValue: OrcaReceipt,
+  expectedDispatchIdValue: string
+): Readonly<{
+  workerState: string;
+  showReceipt: OrcaReceipt;
+  readReceipt: OrcaReceipt;
+}> {
+  const expectedDispatchId = NonBlankStringSchema.parse(expectedDispatchIdValue);
+  const showReceipt = (() => {
+    try {
+      return ProviderInspectShowOrcaAuditReceiptSchema.parse(
+        parseOrcaOperationReceipt("show_worker", showReceiptValue)
+      );
+    } catch (error) {
+      const auditReceipt = ProviderInspectShowOrcaAuditReceiptSchema.safeParse(
+        showReceiptValue
+      );
+      if (auditReceipt.success) return auditReceipt.data;
+      throw error;
+    }
+  })();
+  const shown = showResult(showReceipt);
+  const readReceipt = (() => {
+    try {
+      return ProviderInspectReadOrcaAuditReceiptSchema.parse(
+        parseOrcaOperationReceipt("read_worker", readReceiptValue)
+      );
+    } catch (error) {
+      const auditReceipt = ProviderInspectReadOrcaAuditReceiptSchema.safeParse(
+        readReceiptValue
+      );
+      if (auditReceipt.success) return auditReceipt.data;
+      throw error;
+    }
+  })();
+  if (
+    !shown.exactWorker
+    || shown.dispatchId !== expectedDispatchId
+    || shown.workerDispatchId !== expectedDispatchId
+    || readDispatchId(readReceipt) !== expectedDispatchId
+  ) {
+    throw Object.assign(new Error("provider inspection Dispatch mismatch"), {
+      code: "invalid_orca_receipt"
+    });
+  }
+  // The operation parsers validate public receipts. These projections retain
+  // only lifecycle metadata and remove terminal/transcript content, warnings,
+  // diagnostics, _meta, and every pass-through extension before durable audit.
+  return Object.freeze({
+    workerState: shown.workerState,
+    showReceipt,
+    readReceipt
+  });
 }
 
 function startResult(
@@ -741,14 +858,19 @@ export class OrcaWorkerProvider implements WorkerProvider {
       if (readDispatchId(readReceipt) !== dispatchId) {
         throw new WorkerProviderError("stale_dispatch", this.id, "inspect");
       }
+      const auditReceipts = providerInspectOrcaAuditReceipts(
+        showReceipt,
+        readReceipt,
+        dispatchId
+      );
       return Object.freeze(ProviderInspectReceiptSchema.parse({
         kind: "provider_inspect",
         protocol: 1,
         provider: this.id,
         dispatchId,
-        workerState: shown.workerState,
-        showReceipt,
-        readReceipt
+        workerState: auditReceipts.workerState,
+        showReceipt: auditReceipts.showReceipt,
+        readReceipt: auditReceipts.readReceipt
       })) as ProviderInspectReceipt;
     } catch (error) {
       throw classifiedProviderError(this.id, "inspect", error);
