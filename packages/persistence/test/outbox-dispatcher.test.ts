@@ -120,6 +120,40 @@ describe("OutboxDispatcher", () => {
     })).not.toContain(secretBody);
   });
 
+  it("never promotes a token-shaped provider error message into persisted failure metadata", async () => {
+    // Break caught: treating an alphanumeric Error.message as a normalized code persists token-shaped secrets.
+    const tokenShapedMessage = "ProductionBearerToken123";
+    const slack = deliveryPort().mockRejectedValueOnce(Object.assign(
+      new Error(tokenShapedMessage),
+      { retryable: false as const }
+    ));
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      providers: { slack: { deliver: slack } }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(store.getOutbox("m1")).toMatchObject({
+      state: "failed",
+      lastError: { code: "provider_delivery_failed", retryable: false }
+    });
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "m1",
+      eventType: "outbox.delivery_failed",
+      data: {
+        channel: "slack",
+        attempts: 1,
+        failure: { code: "provider_delivery_failed", retryable: false }
+      }
+    }));
+    expect(JSON.stringify({
+      lastError: store.getOutbox("m1")?.lastError,
+      audit: store.listAuditEvents()
+    })).not.toContain(tokenShapedMessage);
+  });
+
   it("fans a Telegram company-work final result out to Slack with only its redacted summary", async () => {
     // Break caught: enqueueing the mirror after Telegram delivery can lose the official Slack record on a crash.
     database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();

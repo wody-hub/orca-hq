@@ -152,8 +152,7 @@ function normalizeDeliveryFailure(error: unknown): OutboundDeliveryFailure {
   const record = typeof error === "object" && error !== null
     ? error as Record<string, unknown>
     : undefined;
-  const errorMessage = error instanceof Error ? error.message : undefined;
-  const candidateCode = record?.code ?? errorMessage;
+  const candidateCode = record?.code;
   const code = typeof candidateCode === "string" && SAFE_ERROR_CODE.test(candidateCode)
     ? candidateCode
     : "provider_delivery_failed";
