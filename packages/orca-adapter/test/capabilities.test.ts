@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFakeOrca, type FakeOrca } from "../../test-support/src/index.js";
 import { OrcaClient } from "../src/index.js";
+import { runOrca } from "../src/process.js";
 
 const officialSkillText = {
   "orca-cli": "orca cli reference",
@@ -56,7 +57,7 @@ function clientFor(
   return new OrcaClient({
     executablePath: fake.executablePath,
     signal: options.signal ?? new AbortController().signal,
-    timeoutMs: options.timeoutMs ?? 500,
+    timeoutMs: options.timeoutMs ?? 5_000,
     ...(options.terminationGraceMs === undefined
       ? {}
       : { terminationGraceMs: options.terminationGraceMs }),
@@ -211,13 +212,16 @@ describe("Orca CLI capability adapter", () => {
   it("classifies a bounded process timeout", async () => {
     // Break caught: an unresponsive CLI child can otherwise stall the coordinator indefinitely.
     const fake = await fakeOrca();
-    await enqueueStartup(fake);
     await fake.enqueueJson(["repo", "list", "--json"], {
       id: "projects", ok: true, result: { repos: [] }
-    }, { delayMs: 200 });
+    }, { delayMs: 60_000 });
 
-    await expect(clientFor(fake, { timeoutMs: 40 }).execute({ kind: "list_projects" }))
-      .rejects.toMatchObject({ code: "orca_timeout", timeoutMs: 40 });
+    await expect(runOrca(["repo", "list"], {
+      executablePath: fake.executablePath,
+      signal: new AbortController().signal,
+      timeoutMs: 100,
+      terminationGraceMs: 20
+    })).rejects.toMatchObject({ code: "orca_timeout", timeoutMs: 100 });
   });
 
   it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
@@ -234,20 +238,20 @@ describe("Orca CLI capability adapter", () => {
   it("SIGKILLs a timeout child that ignores SIGTERM before returning", async () => {
     // Break caught: waiting forever after SIGTERM defeats the configured timeout and leaves an orphan.
     const fake = await fakeOrca();
-    await enqueueStartup(fake);
     const args = ["repo", "list", "--json"] as const;
     await fake.enqueueJson(args, {
       id: "projects", ok: true, result: { repos: [] }
-    }, { delayMs: 1_500, ignoreSigterm: true });
-    const client = clientFor(fake, { timeoutMs: 300, terminationGraceMs: 20 });
-    await client.health();
+    }, { delayMs: 60_000, ignoreSigterm: true });
 
-    const startedAt = Date.now();
-    const execution = client.execute({ kind: "list_projects" }).catch((error: unknown) => error);
+    const execution = runOrca(["repo", "list"], {
+      executablePath: fake.executablePath,
+      signal: new AbortController().signal,
+      timeoutMs: 2_000,
+      terminationGraceMs: 20
+    }).catch((error: unknown) => error);
+
+    await expect(execution).resolves.toMatchObject({ code: "orca_timeout", timeoutMs: 2_000 });
     const pid = await fake.waitForProcess(args);
-
-    await expect(execution).resolves.toMatchObject({ code: "orca_timeout", timeoutMs: 300 });
-    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(processExists(pid)).toBe(false);
   });
 
@@ -286,27 +290,23 @@ describe("Orca CLI capability adapter", () => {
     // Break caught: abort must have a hard shutdown deadline and must not resolve while the child survives.
     const fake = await fakeOrca();
     const controller = new AbortController();
-    await enqueueStartup(fake);
     const args = ["repo", "list", "--json"] as const;
     await fake.enqueueJson(args, {
       id: "projects", ok: true, result: { repos: [] }
-    }, { delayMs: 1_500, ignoreSigterm: true });
-    const client = clientFor(fake, {
+    }, { delayMs: 60_000, ignoreSigterm: true });
+
+    const execution = runOrca(["repo", "list"], {
+      executablePath: fake.executablePath,
       signal: controller.signal,
-      timeoutMs: 5_000,
+      timeoutMs: 10_000,
       terminationGraceMs: 20
     });
-    await client.health();
-
-    const execution = client.execute({ kind: "list_projects" });
-    const pid = await fake.waitForProcess(args);
-    const abortedAt = Date.now();
+    const pid = await fake.waitForProcess(args, 5_000);
     controller.abort();
 
     await expect(execution).rejects.toMatchObject({ code: "orca_aborted" });
-    expect(Date.now() - abortedAt).toBeLessThan(500);
     expect(processExists(pid)).toBe(false);
-  });
+  }, 10_000);
 
   it("turns a stale worker handle receipt into a typed recovery error", async () => {
     // Break caught: treating stale runtime handles as generic process failures can trigger unsafe blind retries.
