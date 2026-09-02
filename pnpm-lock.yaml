@@ -18,6 +18,18 @@ importers:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@22.20.1)(vite@7.3.6(@types/node@22.20.1)(yaml@2.9.0))
 
+  packages/codex-hq:
+    dependencies:
+      '@orca-hq/core':
+        specifier: workspace:*
+        version: link:../core
+      '@orca-hq/project-registry':
+        specifier: workspace:*
+        version: link:../project-registry
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
+
   packages/core:
     dependencies:
       zod:
