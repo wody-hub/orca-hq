@@ -133,6 +133,178 @@ export type TaskRecord = Readonly<{
   state: string;
 }>;
 
+const StoredGeneratedTaskSchema = z.object({
+  taskId: z.string().min(1),
+  runId: z.string().min(1),
+  title: z.string().min(1),
+  role: z.enum(["investigate", "implement", "verify", "summarize"]),
+  preferredAgent: z.enum(["codex", "claude"]),
+  cycle: z.number().int().min(0).max(2)
+}).passthrough();
+
+const StoredTaskPayloadSchema = z.object({
+  id: z.string().min(1).optional(),
+  taskId: z.string().min(1).optional(),
+  runId: z.string().min(1),
+  title: z.string().min(1),
+  role: z.enum(["investigate", "implement", "verify", "summarize"]),
+  preferredAgent: z.enum(["codex", "claude"]),
+  cycle: z.number().int().min(0).max(2).optional()
+}).passthrough().refine(
+  (task) => task.id !== undefined || task.taskId !== undefined,
+  { message: "persisted Task payload requires an identity" }
+);
+
+const VerificationReportStoreSchema = z.object({
+  reportId: z.string().min(1),
+  runId: z.string().min(1),
+  verificationTaskId: z.string().min(1),
+  implementationTaskId: z.string().min(1),
+  implementationDispatchId: z.string().min(1),
+  cycle: z.number().int().min(0).max(2),
+  verdict: z.enum(["pass", "fail"]),
+  projectRoute: z.object({
+    projectKey: z.string().min(1),
+    orcaProjectId: z.string().min(1),
+    repositoryPath: z.string().min(1)
+  }).strict(),
+  changedFiles: z.array(z.string().min(1)),
+  diffSummary: z.string().min(1),
+  commands: z.array(z.object({
+    command: z.string().min(1),
+    exitCode: z.number().int(),
+    result: z.string().min(1),
+    auditReference: z.string().min(1)
+  }).strict()).min(1),
+  implementationProvider: z.enum(["codex", "claude"]),
+  verifierProvider: z.enum(["codex", "claude"]),
+  findings: z.array(z.string().min(1)),
+  evidence: z.array(z.string().min(1)),
+  auditReferences: z.array(z.string().min(1)).min(1),
+  verifierEffects: z.object({
+    filesModified: z.literal(false),
+    committed: z.literal(false),
+    pushed: z.literal(false),
+    pullRequestChanged: z.literal(false),
+    merged: z.literal(false),
+    deployed: z.literal(false),
+    secretsAccessed: z.literal(false),
+    productionAccessed: z.literal(false)
+  }).strict()
+}).strict().superRefine((report, context) => {
+  if (report.implementationProvider === report.verifierProvider) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["verifierProvider"],
+      message: "verification must use the opposite model family"
+    });
+  }
+  if (report.verdict === "pass" && (
+    report.evidence.length === 0
+    || report.commands.some(({ exitCode }) => exitCode !== 0)
+    || report.commands.some(({ auditReference }) => !report.evidence.includes(auditReference))
+  )) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["evidence"],
+      message: "passing verification requires passing command evidence"
+    });
+  }
+  if (report.verdict === "fail" && report.findings.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["findings"],
+      message: "failed verification requires findings"
+    });
+  }
+});
+
+const VerificationDecisionStoreSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("verified_success"),
+    evidence: z.array(z.string().min(1)).min(1)
+  }).strict(),
+  z.object({
+    kind: z.literal("create_fix_task"),
+    findings: z.array(z.string().min(1)).min(1),
+    nextCycle: z.number().int().min(1).max(2)
+  }).strict(),
+  z.object({
+    kind: z.literal("intervention_required"),
+    findings: z.array(z.string().min(1)).min(1)
+  }).strict()
+]);
+
+const VerificationAuditDataStoreSchema = z.object({
+  reportId: z.string().min(1),
+  runId: z.string().min(1),
+  verificationTaskId: z.string().min(1),
+  implementationTaskId: z.string().min(1),
+  implementationDispatchId: z.string().min(1),
+  cycle: z.number().int().min(0).max(2),
+  verdict: z.enum(["pass", "fail"]),
+  projectKey: z.string().min(1),
+  implementationProvider: z.enum(["codex", "claude"]),
+  verifierProvider: z.enum(["codex", "claude"]),
+  commandAuditReferences: z.array(z.string().min(1)),
+  auditReferences: z.array(z.string().min(1)),
+  evidenceReferences: z.array(z.string().min(1)),
+  findingCount: z.number().int().nonnegative()
+}).strict();
+
+const FixTaskStoreSchema = z.object({
+  taskId: z.string().min(1),
+  runId: z.string().min(1),
+  sourceVerificationTaskId: z.string().min(1),
+  implementationTaskId: z.string().min(1),
+  title: z.string().min(1),
+  role: z.literal("implement"),
+  preferredAgent: z.enum(["codex", "claude"]),
+  dependsOn: z.array(z.string().min(1)).length(1),
+  cycle: z.number().int().min(1).max(2),
+  findings: z.array(z.string().min(1)).min(1),
+  requestedScope: z.array(z.string().min(1)),
+  prohibitedEffects: z.array(z.string().min(1)),
+  permissions: z.literal("read-write"),
+  nestedWorkers: z.literal("forbidden")
+}).strict();
+
+const VerificationCommitStoreSchema = z.object({
+  report: VerificationReportStoreSchema,
+  decision: VerificationDecisionStoreSchema,
+  audit: z.object({
+    subjectId: z.string().min(1),
+    eventType: z.enum([
+      "verification.passed",
+      "verification.failed",
+      "verification.intervention_required"
+    ]),
+    data: VerificationAuditDataStoreSchema
+  }).strict(),
+  fixTask: FixTaskStoreSchema.optional(),
+  outboxMessage: z.object({
+    id: z.string().min(1),
+    template: z.enum(["success", "intervention_required"]),
+    payload: JsonValueSchema,
+    commandId: z.string().min(1).optional(),
+    channel: z.enum(["slack", "telegram", "tailscale-web"]),
+    destination: z.string().min(1),
+    nextAttemptAt: z.string().datetime()
+  }).strict().optional()
+}).strict();
+
+export type StoredTaskRecord = Readonly<{
+  id: string;
+  taskId: string;
+  runId: string;
+  state: string;
+  title: string;
+  role: "investigate" | "implement" | "verify" | "summarize";
+  preferredAgent: "codex" | "claude";
+  cycle?: number | undefined;
+  payload: JsonValue;
+}>;
+
 interface CommandRow {
   payload_json: string;
 }
@@ -190,6 +362,11 @@ interface WorktreeLockRow {
 interface TaskRow {
   id: string;
   state: string;
+}
+
+interface StoredTaskRow extends TaskRow {
+  run_id: string;
+  payload_json: string;
 }
 
 function parseJson(value: string): unknown {
@@ -392,6 +569,15 @@ export class ControlStore implements CommandIngress {
     return row === undefined ? undefined : outboxMessageFromRow(row);
   }
 
+  listOutbox(): OutboxMessage[] {
+    const rows = this.database.prepare(`
+      SELECT *
+      FROM outbox_messages
+      ORDER BY created_at, id
+    `).all() as OutboxMessageRow[];
+    return rows.map(outboxMessageFromRow);
+  }
+
   getTask(idInput: string): TaskRecord | undefined {
     const id = z.string().min(1).parse(idInput);
     const row = this.database.prepare(`
@@ -400,6 +586,247 @@ export class ControlStore implements CommandIngress {
       WHERE id = ?
     `).get(id) as TaskRow | undefined;
     return row === undefined ? undefined : Object.freeze({ id: row.id, state: row.state });
+  }
+
+  saveVerificationTask(taskInput: unknown): void {
+    const payload = JsonValueSchema.parse(taskInput);
+    const task = StoredGeneratedTaskSchema.parse(payload);
+    if (task.role !== "verify") throw new TypeError("verification Task must have verify role");
+    const now = new Date().toISOString();
+    const existing = this.database.prepare(`
+      SELECT run_id, state, payload_json
+      FROM tasks
+      WHERE id = ?
+    `).get(task.taskId) as Omit<StoredTaskRow, "id"> | undefined;
+    if (existing !== undefined) {
+      if (
+        existing.run_id !== task.runId
+        || existing.state !== "planned"
+        || existing.payload_json !== JSON.stringify(payload)
+      ) {
+        throw new Error(`Task ${task.taskId} already exists with different verification inputs`);
+      }
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO tasks (id, run_id, state, payload_json, created_at, updated_at)
+      VALUES (?, ?, 'planned', ?, ?, ?)
+    `).run(task.taskId, task.runId, JSON.stringify(payload), now, now);
+  }
+
+  listTasks(): StoredTaskRecord[] {
+    const rows = this.database.prepare(`
+      SELECT id, run_id, state, payload_json
+      FROM tasks
+      ORDER BY created_at, id
+    `).all() as StoredTaskRow[];
+    return rows.map((row) => {
+      const payload = JsonValueSchema.parse(parseJson(row.payload_json));
+      const task = StoredTaskPayloadSchema.parse(payload);
+      const payloadTaskId = task.taskId ?? task.id;
+      if (payloadTaskId !== row.id || task.runId !== row.run_id) {
+        throw new TypeError("persisted Task identity does not match its payload");
+      }
+      return Object.freeze({
+        id: row.id,
+        taskId: row.id,
+        runId: task.runId,
+        state: row.state,
+        title: task.title,
+        role: task.role,
+        preferredAgent: task.preferredAgent,
+        ...(task.cycle === undefined ? {} : { cycle: task.cycle }),
+        payload
+      });
+    });
+  }
+
+  commitVerification(commitInput: unknown): void {
+    const commit = VerificationCommitStoreSchema.parse(JsonValueSchema.parse(commitInput));
+    const { report, decision, audit, fixTask, outboxMessage } = commit;
+    if (report.implementationProvider === report.verifierProvider) {
+      throw new TypeError("verification report must use the opposite model family");
+    }
+    const expectedAuditEvent = decision.kind === "verified_success"
+      ? "verification.passed"
+      : decision.kind === "intervention_required"
+        ? "verification.intervention_required"
+        : "verification.failed";
+    if (
+      audit.subjectId !== report.verificationTaskId
+      || audit.eventType !== expectedAuditEvent
+      || audit.data.reportId !== report.reportId
+      || audit.data.runId !== report.runId
+      || audit.data.verificationTaskId !== report.verificationTaskId
+      || audit.data.implementationTaskId !== report.implementationTaskId
+      || audit.data.implementationDispatchId !== report.implementationDispatchId
+      || audit.data.cycle !== report.cycle
+      || audit.data.verdict !== report.verdict
+      || audit.data.implementationProvider !== report.implementationProvider
+      || audit.data.verifierProvider !== report.verifierProvider
+      || audit.data.projectKey !== report.projectRoute.projectKey
+      || audit.data.findingCount !== report.findings.length
+      || JSON.stringify(audit.data.commandAuditReferences)
+        !== JSON.stringify(report.commands.map(({ auditReference }) => auditReference))
+      || JSON.stringify(audit.data.auditReferences) !== JSON.stringify(report.auditReferences)
+      || JSON.stringify(audit.data.evidenceReferences) !== JSON.stringify(report.evidence)
+    ) {
+      throw new TypeError("verification audit does not match its report");
+    }
+    const passing = report.verdict === "pass" && decision.kind === "verified_success";
+    const fixing = report.verdict === "fail" && decision.kind === "create_fix_task";
+    const intervening = report.verdict === "fail" && decision.kind === "intervention_required";
+    if (!passing && !fixing && !intervening) {
+      throw new TypeError("verification decision does not match its verdict");
+    }
+    if (
+      (decision.kind === "verified_success"
+        && JSON.stringify(decision.evidence) !== JSON.stringify(report.evidence))
+      || (decision.kind !== "verified_success"
+        && JSON.stringify(decision.findings) !== JSON.stringify(report.findings))
+    ) {
+      throw new TypeError("verification decision evidence does not match its report");
+    }
+    if (
+      (passing && (fixTask !== undefined || outboxMessage?.template !== "success"))
+      || (fixing && (fixTask === undefined || outboxMessage !== undefined))
+      || (intervening && (fixTask !== undefined || outboxMessage?.template !== "intervention_required"))
+    ) {
+      throw new TypeError("verification side effects do not match the completion decision");
+    }
+    if (outboxMessage !== undefined) {
+      const payload = outboxMessage.payload;
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+        throw new TypeError("verification Outbox payload must be an object");
+      }
+      const expectedState = passing ? "verified_success" : "intervention_required";
+      if (
+        outboxMessage.id !== `${report.reportId}:${passing ? "success" : "intervention"}`
+        || payload.state !== expectedState
+        || payload.reportId !== report.reportId
+        || payload.implementationTaskId !== report.implementationTaskId
+      ) {
+        throw new TypeError("verification Outbox does not match its report");
+      }
+      if (passing && (
+        payload.implementationProvider !== report.implementationProvider
+        || payload.verifierProvider !== report.verifierProvider
+        || payload.diffSummary !== report.diffSummary
+        || JSON.stringify(payload.projectRoute) !== JSON.stringify(report.projectRoute)
+        || JSON.stringify(payload.changedFiles) !== JSON.stringify(report.changedFiles)
+        || JSON.stringify(payload.commands) !== JSON.stringify(report.commands)
+        || JSON.stringify(payload.auditReferences) !== JSON.stringify(report.auditReferences)
+        || JSON.stringify(payload.evidence) !== JSON.stringify(report.evidence)
+      )) {
+        throw new TypeError("verified success Outbox is missing final report evidence");
+      }
+    }
+    if (fixTask !== undefined && (
+      fixTask.role !== "implement"
+      || fixTask.runId !== report.runId
+      || decision.kind !== "create_fix_task"
+      || fixTask.cycle !== decision.nextCycle
+      || fixTask.taskId !== `${report.implementationTaskId}:fix:${decision.nextCycle}`
+      || fixTask.sourceVerificationTaskId !== report.verificationTaskId
+      || fixTask.implementationTaskId !== report.implementationTaskId
+      || fixTask.preferredAgent !== report.implementationProvider
+      || JSON.stringify(fixTask.dependsOn) !== JSON.stringify([report.verificationTaskId])
+      || JSON.stringify(fixTask.findings) !== JSON.stringify(report.findings)
+    )) {
+      throw new TypeError("Fix Task does not match the failed verification");
+    }
+
+    this.database.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT run_id, payload_json
+        FROM tasks
+        WHERE id = ?
+      `).get(report.verificationTaskId) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+      if (row === undefined || row.run_id !== report.runId) {
+        throw new Error(`Verification Task ${report.verificationTaskId} is not persisted for its Run`);
+      }
+      const taskPayload = StoredGeneratedTaskSchema.parse(parseJson(row.payload_json));
+      if (
+        taskPayload.taskId !== report.verificationTaskId
+        || taskPayload.preferredAgent !== report.verifierProvider
+        || taskPayload.implementationTaskId !== report.implementationTaskId
+        || taskPayload.implementationDispatchId !== report.implementationDispatchId
+        || taskPayload.implementationProvider !== report.implementationProvider
+        || taskPayload.cycle !== report.cycle
+        || taskPayload.gitDiff === undefined
+        || typeof taskPayload.gitDiff !== "object"
+        || taskPayload.gitDiff === null
+        || (taskPayload.gitDiff as { summary?: unknown }).summary !== report.diffSummary
+        || JSON.stringify(taskPayload.projectRoute) !== JSON.stringify(report.projectRoute)
+        || JSON.stringify(taskPayload.changedFiles) !== JSON.stringify(report.changedFiles)
+        || JSON.stringify(
+          Array.isArray(taskPayload.testReceipts)
+            ? taskPayload.testReceipts.map((receipt) =>
+              typeof receipt === "object" && receipt !== null && "command" in receipt
+                ? (receipt as { command: unknown }).command
+                : undefined
+            )
+            : []
+        ) !== JSON.stringify(report.commands.map(({ command }) => command))
+        || !Array.isArray(taskPayload.auditReferences)
+        || !taskPayload.auditReferences.every((reference) =>
+          typeof reference === "string" && report.auditReferences.includes(reference)
+        )
+      ) {
+        throw new TypeError("verification report does not own the persisted Task");
+      }
+      if (fixTask !== undefined && (
+        JSON.stringify(fixTask.requestedScope) !== JSON.stringify(taskPayload.requestedScope)
+        || JSON.stringify(fixTask.prohibitedEffects)
+          !== JSON.stringify(taskPayload.implementationProhibitedEffects)
+      )) {
+        throw new TypeError("Fix Task does not preserve its implementation boundary");
+      }
+      const taskState = passing
+        ? "verified_success"
+        : intervening
+          ? "intervention_required"
+          : "verification_failed";
+      const durablePayload = JsonValueSchema.parse({ ...taskPayload, report });
+      const now = new Date().toISOString();
+      this.database.prepare(`
+        UPDATE tasks
+        SET state = ?, payload_json = ?, updated_at = ?
+        WHERE id = ? AND run_id = ?
+      `).run(taskState, JSON.stringify(durablePayload), now, report.verificationTaskId, report.runId);
+
+      if (fixTask !== undefined) {
+        const fixPayload = JsonValueSchema.parse(fixTask);
+        this.database.prepare(`
+          INSERT INTO tasks (id, run_id, state, payload_json, created_at, updated_at)
+          VALUES (?, ?, 'planned', ?, ?, ?)
+        `).run(fixTask.taskId, fixTask.runId, JSON.stringify(fixPayload), now, now);
+      }
+
+      const runState = passing ? "verified_success" : intervening ? "intervention_required" : "active";
+      const runUpdate = this.database.prepare(`
+        UPDATE runs SET state = ?, updated_at = ? WHERE id = ?
+      `).run(runState, now, report.runId);
+      if (runUpdate.changes !== 1) throw new Error(`Run ${report.runId} is not persisted`);
+
+      this.appendAudit({
+        id: `${report.reportId}:audit`,
+        subjectId: audit.subjectId,
+        eventType: audit.eventType,
+        data: audit.data
+      });
+      if (outboxMessage !== undefined) {
+        this.enqueueOutbox({
+          id: outboxMessage.id,
+          ...(outboxMessage.commandId === undefined ? {} : { commandId: outboxMessage.commandId }),
+          channel: outboxMessage.channel,
+          destination: outboxMessage.destination,
+          template: outboxMessage.template,
+          payload: outboxMessage.payload,
+          nextAttemptAt: outboxMessage.nextAttemptAt
+        });
+      }
+    }).immediate();
   }
 
   markOutboxDelivered(

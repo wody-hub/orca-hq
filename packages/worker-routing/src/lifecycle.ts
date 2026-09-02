@@ -99,6 +99,7 @@ export type RunState =
   | "creating"
   | "active"
   | "awaiting_verification"
+  | "verified_success"
   | "intervention_required";
 
 export type TaskState =
@@ -107,6 +108,8 @@ export type TaskState =
   | "ready"
   | "running"
   | "worker_done"
+  | "verification_failed"
+  | "verified_success"
   | "intervention_required";
 
 export type DispatchState =

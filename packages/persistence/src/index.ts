@@ -9,6 +9,7 @@ export {
   JsonValueSchema,
   type JsonValue,
   type OutboxMessage,
+  type StoredTaskRecord,
   type TaskRecord,
   type WorktreeAcquireResult,
   type WorktreeHeartbeatResult,
