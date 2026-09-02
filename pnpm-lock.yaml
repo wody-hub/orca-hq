@@ -112,6 +112,21 @@ importers:
         specifier: ^3.24.2
         version: 3.25.76
 
+  packages/worker-routing:
+    dependencies:
+      '@orca-hq/core':
+        specifier: workspace:*
+        version: link:../core
+      '@orca-hq/orca-adapter':
+        specifier: workspace:*
+        version: link:../orca-adapter
+      '@orca-hq/project-registry':
+        specifier: workspace:*
+        version: link:../project-registry
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':

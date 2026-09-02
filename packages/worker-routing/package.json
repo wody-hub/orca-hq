@@ -1,0 +1,20 @@
+{
+  "name": "@orca-hq/worker-routing",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts",
+    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts"
+  },
+  "dependencies": {
+    "@orca-hq/core": "workspace:*",
+    "@orca-hq/orca-adapter": "workspace:*",
+    "@orca-hq/project-registry": "workspace:*",
+    "zod": "^3.24.2"
+  }
+}

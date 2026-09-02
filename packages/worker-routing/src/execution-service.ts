@@ -1,0 +1,718 @@
+import {
+  ExecutionProposalSchema,
+  type ExecutionProposal,
+  type ExecutionTask
+} from "@orca-hq/core";
+import type {
+  OrcaClient,
+  OrcaOperation,
+  OrcaReceipt
+} from "@orca-hq/orca-adapter";
+import {
+  ProjectRegistryEntrySchema,
+  type ProjectRegistryEntry
+} from "@orca-hq/project-registry";
+
+import {
+  ExecutionLifecycle,
+  parseWorkerAssignment,
+  type DispatchRecord,
+  type LaunchFailureMessage,
+  type RunRecord,
+  type TaskRecord,
+  type WorkerAssignment,
+  type WorkerMessage
+} from "./lifecycle.js";
+import {
+  type CurrentWorktreeApproval,
+  type ReadyWorktreePlacement,
+  type WorktreePlacement,
+  type WorktreePlacementPort
+} from "./worktree-placement.js";
+
+type MaybePromise<T> = T | Promise<T>;
+
+export type AuthorizedProposal = Readonly<{
+  authorization: "authorized";
+  proposal: ExecutionProposal;
+  project: ProjectRegistryEntry;
+  currentWorktreeApproval?: CurrentWorktreeApproval | undefined;
+}>;
+
+export interface OrcaExecutionPort {
+  execute(operation: OrcaOperation): Promise<OrcaReceipt>;
+}
+
+export type EditingLeaseRequest = Readonly<{
+  lockKey: string;
+  commandId: string;
+  taskId: string;
+  projectKey: string;
+  worktreePath: string;
+  branch: string;
+  dispatchId: string;
+}>;
+
+export type EditingLockAcquireResult =
+  | Readonly<{ kind: "acquired"; lease?: unknown }>
+  | Readonly<{ kind: "conflict"; lease: Readonly<{ dispatchId: string }> }>
+  | Readonly<{
+      kind: "review_required";
+      reason: string;
+      lease?: Readonly<{ dispatchId: string }> | undefined;
+    }>;
+
+export type EditingLockReleaseResult =
+  | Readonly<{ kind: "released" }>
+  | Readonly<{ kind: "not_found" }>
+  | Readonly<{ kind: "conflict"; lease: Readonly<{ dispatchId: string }> }>;
+
+export interface EditingLockPort {
+  acquire(input: EditingLeaseRequest): MaybePromise<EditingLockAcquireResult>;
+  release(input: Readonly<{ lockKey: string; dispatchId: string }>): MaybePromise<EditingLockReleaseResult>;
+}
+
+export type ExecutionReviewRequired = WorktreePlacement & { kind: "review_required" } | Readonly<{
+  kind: "review_required";
+  reason: "editing_lock_conflict";
+  dispatchId: string;
+}> | Readonly<{
+  kind: "review_required";
+  reason: "editing_lock_reconciliation_required";
+  dispatchId?: string | undefined;
+}> | Readonly<{
+  kind: "review_required";
+  reason: "l0_requires_investigation_tasks";
+}>;
+
+export type ExecutionStart = ExecutionReviewRequired | Readonly<{
+  kind: "started";
+  runId: string;
+  localRunId: string;
+  taskIds: readonly string[];
+  dispatchIds: readonly string[];
+}>;
+
+export type WorkerMessageResult =
+  | Readonly<{ kind: "duplicate" }>
+  | Readonly<{
+      kind: "recorded";
+      verificationRequired?: true | undefined;
+      dispatched?: readonly string[] | undefined;
+    }>
+  | ExecutionReviewRequired;
+
+export interface LaunchFailureInput {
+  readonly dispatchId: string;
+  readonly failureId: string;
+  readonly evidence: LaunchFailureMessage["evidence"];
+}
+
+export type LaunchFailureResult =
+  | Readonly<{ kind: "duplicate" }>
+  | Readonly<{
+      kind: "retried";
+      dispatchId: string;
+      retryOf: string;
+    }>
+  | Readonly<{
+      kind: "intervention_required";
+      reason: "launch_retry_exhausted" | "replacement_not_conflict_free";
+      dispatchId: string;
+    }>;
+
+interface DispatchContext {
+  readonly localId: string;
+  readonly attempt: number;
+  readonly assignment: WorkerAssignment;
+  placement: ReadyWorktreePlacement;
+  orcaDispatchId?: string;
+}
+
+interface TaskContext {
+  readonly task: ExecutionTask;
+  readonly localId: string;
+  readonly initialAssignment: WorkerAssignment;
+  readonly dispatches: DispatchContext[];
+  orcaTaskId?: string;
+}
+
+interface RunContext {
+  readonly authorized: AuthorizedProposal;
+  readonly proposal: ExecutionProposal;
+  readonly project: ProjectRegistryEntry;
+  readonly localId: string;
+  readonly tasks: readonly TaskContext[];
+  readonly tasksByProposalId: ReadonlyMap<string, TaskContext>;
+  placement: ReadyWorktreePlacement;
+  orcaRunId?: string;
+}
+
+interface DispatchLookup {
+  readonly run: RunContext;
+  readonly task: TaskContext;
+  readonly dispatch: DispatchContext;
+}
+
+function runLocalId(proposalId: string): string {
+  return `run:${proposalId}`;
+}
+
+function taskLocalId(proposalId: string, localId: string): string {
+  return `task:${proposalId}:${localId}`;
+}
+
+function dispatchLocalId(proposalId: string, localId: string, attempt: number): string {
+  return `dispatch:${proposalId}:${localId}:${attempt}`;
+}
+
+function objectiveFor(proposal: ExecutionProposal): string {
+  return `${proposal.proposalId}: ${proposal.tasks.map(({ title }) => title).join("; ")}`;
+}
+
+function topologicalTasks(tasks: readonly ExecutionTask[]): readonly ExecutionTask[] {
+  if (tasks.length === 0) throw new TypeError("execution proposal must contain at least one Task");
+  const byId = new Map<string, ExecutionTask>();
+  for (const task of tasks) {
+    if (byId.has(task.localId)) throw new TypeError(`duplicate Task localId: ${task.localId}`);
+    byId.set(task.localId, task);
+  }
+  for (const task of tasks) {
+    const seenDependencies = new Set<string>();
+    for (const dependency of task.dependsOn) {
+      if (dependency === task.localId) throw new TypeError(`Task ${task.localId} depends on itself`);
+      if (!byId.has(dependency)) {
+        throw new TypeError(`Task ${task.localId} has unknown dependency ${dependency}`);
+      }
+      if (seenDependencies.has(dependency)) {
+        throw new TypeError(`Task ${task.localId} repeats dependency ${dependency}`);
+      }
+      seenDependencies.add(dependency);
+    }
+  }
+
+  const indegree = new Map(tasks.map((task) => [task.localId, task.dependsOn.length]));
+  const dependents = new Map<string, string[]>();
+  for (const task of tasks) {
+    for (const dependency of task.dependsOn) {
+      const values = dependents.get(dependency) ?? [];
+      values.push(task.localId);
+      dependents.set(dependency, values);
+    }
+  }
+  const orderById = new Map(tasks.map((task, index) => [task.localId, index]));
+  const ready = tasks.filter((task) => task.dependsOn.length === 0).map(({ localId }) => localId);
+  const sorted: ExecutionTask[] = [];
+  while (ready.length > 0) {
+    ready.sort((left, right) => (orderById.get(left) ?? 0) - (orderById.get(right) ?? 0));
+    const currentId = ready.shift();
+    if (currentId === undefined) break;
+    const current = byId.get(currentId);
+    if (current === undefined) throw new Error("Task DAG changed during sorting");
+    sorted.push(current);
+    for (const dependentId of dependents.get(currentId) ?? []) {
+      const next = (indegree.get(dependentId) ?? 0) - 1;
+      indegree.set(dependentId, next);
+      if (next === 0) ready.push(dependentId);
+    }
+  }
+  if (sorted.length !== tasks.length) throw new TypeError("execution proposal Task dependencies contain a cycle");
+  return Object.freeze(sorted);
+}
+
+function immutableStrings(values: readonly string[]): readonly string[] {
+  return Object.freeze([...values]);
+}
+
+function assignmentFor(
+  proposal: ExecutionProposal,
+  project: ProjectRegistryEntry,
+  task: ExecutionTask,
+  placement: ReadyWorktreePlacement,
+  attempt: number
+): WorkerAssignment {
+  const localTaskId = taskLocalId(proposal.proposalId, task.localId);
+  return parseWorkerAssignment({
+    protocol: 1,
+    project: {
+      projectKey: project.projectKey,
+      orcaProjectId: project.orcaProjectId
+    },
+    repo: {
+      repoId: project.repoId ?? project.orcaProjectId,
+      repositoryPath: project.absolutePath
+    },
+    worktree: placement.worktree,
+    base: {
+      ref: placement.baseRef,
+      commit: placement.baseCommit
+    },
+    title: task.title,
+    role: task.role,
+    preferredAgent: task.preferredAgent,
+    fileScope: proposal.allowedScope,
+    acceptanceCommands: proposal.acceptanceCommands,
+    prohibitedEffects: proposal.prohibitedEffects,
+    taskId: localTaskId,
+    dispatchId: dispatchLocalId(proposal.proposalId, task.localId, attempt),
+    permissions: placement.permissions,
+    nestedWorkers: "forbidden"
+  });
+}
+
+function runIdFrom(receipt: OrcaReceipt): string {
+  const result = receipt.result as { runId?: unknown; run?: { id?: unknown } };
+  const value = typeof result.runId === "string" ? result.runId : result.run?.id;
+  if (typeof value !== "string" || value.length === 0) throw new Error("validated Run receipt has no Run ID");
+  return value;
+}
+
+function taskIdFrom(receipt: OrcaReceipt): string {
+  const result = receipt.result as { taskId?: unknown; task?: { id?: unknown } };
+  const value = typeof result.taskId === "string" ? result.taskId : result.task?.id;
+  if (typeof value !== "string" || value.length === 0) throw new Error("validated Task receipt has no Task ID");
+  return value;
+}
+
+function dispatchIdFrom(receipt: OrcaReceipt): string {
+  const result = receipt.result as { dispatchId?: unknown };
+  if (typeof result.dispatchId !== "string" || result.dispatchId.length === 0) {
+    throw new Error("validated Dispatch receipt has no Dispatch ID");
+  }
+  return result.dispatchId;
+}
+
+function taskSpec(task: TaskContext): string {
+  return JSON.stringify({
+    protocol: 1,
+    task: {
+      taskId: task.localId,
+      localId: task.task.localId,
+      title: task.task.title,
+      role: task.task.role,
+      dependsOn: task.task.dependsOn
+    },
+    assignment: task.initialAssignment,
+    dispatchLinkage: {
+      kind: "hq_receipt_linked_dispatch",
+      taskId: task.localId
+    }
+  });
+}
+
+function lockBranch(placement: ReadyWorktreePlacement): string {
+  return placement.worktree.branch ?? `detached:${placement.worktree.head}`;
+}
+
+function lockReview(result: Exclude<EditingLockAcquireResult, { kind: "acquired" }>): ExecutionReviewRequired {
+  if (result.kind === "conflict") {
+    return Object.freeze({
+      kind: "review_required",
+      reason: "editing_lock_conflict",
+      dispatchId: result.lease.dispatchId
+    });
+  }
+  return Object.freeze({
+    kind: "review_required",
+    reason: "editing_lock_reconciliation_required",
+    ...(result.lease === undefined ? {} : { dispatchId: result.lease.dispatchId })
+  });
+}
+
+export class ExecutionService {
+  readonly #orca: OrcaExecutionPort;
+  readonly #placements: WorktreePlacementPort;
+  readonly #locks: EditingLockPort;
+  readonly #lifecycle: ExecutionLifecycle;
+  readonly #dispatchLookup = new Map<string, DispatchLookup>();
+  readonly #runs = new Map<string, RunContext>();
+
+  constructor(options: Readonly<{
+    orca: Pick<OrcaClient, "execute"> | OrcaExecutionPort;
+    placements: WorktreePlacementPort;
+    locks: EditingLockPort;
+    lifecycle: ExecutionLifecycle;
+  }>) {
+    this.#orca = options.orca;
+    this.#placements = options.placements;
+    this.#locks = options.locks;
+    this.#lifecycle = options.lifecycle;
+  }
+
+  async start(input: AuthorizedProposal): Promise<ExecutionStart> {
+    if (input.authorization !== "authorized") throw new TypeError("proposal is not authorized");
+    const proposal = ExecutionProposalSchema.parse(input.proposal);
+    const project = ProjectRegistryEntrySchema.parse(input.project);
+    if (proposal.selectedProjectKey !== project.projectKey) {
+      throw new TypeError("authorized proposal project does not match the Registry entry");
+    }
+    if (!project.allowedOperations.includes(proposal.riskLevel)) {
+      throw new TypeError("authorized proposal risk is not permitted by the Registry entry");
+    }
+    const sortedTasks = topologicalTasks(proposal.tasks);
+    if (proposal.riskLevel === "L0" && sortedTasks.some(({ role }) => role !== "investigate")) {
+      return Object.freeze({ kind: "review_required", reason: "l0_requires_investigation_tasks" });
+    }
+    if (this.#runs.has(proposal.proposalId)) {
+      throw new Error(`proposal ${proposal.proposalId} has already started`);
+    }
+
+    const placement = await this.#placements.resolve({
+      proposalId: proposal.proposalId,
+      riskLevel: proposal.riskLevel,
+      repositoryPath: project.absolutePath,
+      baseRef: proposal.baseRef ?? project.defaultBaseRef,
+      currentWorktreeApproval: input.currentWorktreeApproval,
+      attempt: 1
+    });
+    if (placement.kind !== "ready") return placement;
+
+    const context = this.#context(input, proposal, project, sortedTasks, placement);
+    await this.#planRunAndTasks(context);
+    const initialTasks = this.#readyPendingTasks(context);
+    const permittedInitialTasks = placement.requiresEditingLease ? initialTasks.slice(0, 1) : initialTasks;
+    const initialDispatches: DispatchContext[] = [];
+    for (const task of permittedInitialTasks) {
+      initialDispatches.push(await this.#planDispatch(context, task, placement, 1));
+    }
+
+    let editingDispatch: DispatchContext | undefined;
+    if (placement.requiresEditingLease) {
+      editingDispatch = initialDispatches[0];
+      if (editingDispatch === undefined) throw new Error("editing execution has no ready root Task");
+      const acquired = await this.#locks.acquire(this.#lease(context, editingDispatch));
+      if (acquired.kind !== "acquired") return lockReview(acquired);
+    }
+
+    try {
+      if (placement.worktree.kind === "isolated") {
+        const materialized = await this.#placements.createWorktree(placement);
+        if (materialized.kind !== "ready") {
+          if (editingDispatch !== undefined) await this.#release(context, editingDispatch);
+          return materialized;
+        }
+      }
+      await this.#createRunAndTasks(context);
+      const dispatchIds: string[] = [];
+      for (const dispatch of initialDispatches) {
+        dispatchIds.push(await this.#launch(context, this.#taskForDispatch(context, dispatch), dispatch));
+      }
+      this.#runs.set(proposal.proposalId, context);
+      return Object.freeze({
+        kind: "started",
+        runId: context.orcaRunId as string,
+        localRunId: context.localId,
+        taskIds: immutableStrings(context.tasks.map(({ orcaTaskId }) => orcaTaskId as string)),
+        dispatchIds: immutableStrings(dispatchIds)
+      });
+    } catch (error) {
+      if (editingDispatch !== undefined) await this.#release(context, editingDispatch);
+      throw error;
+    }
+  }
+
+  async recordWorkerMessage(message: WorkerMessage): Promise<WorkerMessageResult> {
+    const lookup = this.#dispatchLookup.get(message.dispatchId);
+    if (lookup === undefined) throw new Error(`Dispatch ${message.dispatchId} is not known`);
+    const recorded = await this.#lifecycle.recordWorkerMessage(message, lookup.dispatch.localId);
+    if (recorded.kind === "duplicate") return recorded;
+    if (message.kind !== "worker_done") return recorded;
+
+    if (lookup.dispatch.placement.requiresEditingLease) {
+      const released = await this.#release(lookup.run, lookup.dispatch);
+      if (released.kind === "conflict") {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "editing_lock_conflict",
+          dispatchId: released.lease.dispatchId
+        });
+      }
+    }
+
+    const ready = this.#readyPendingTasks(lookup.run);
+    const permitted = lookup.run.placement.requiresEditingLease ? ready.slice(0, 1) : ready;
+    const dispatched: string[] = [];
+    for (const task of permitted) {
+      const dispatch = await this.#planDispatch(lookup.run, task, lookup.run.placement, 1);
+      if (dispatch.placement.requiresEditingLease) {
+        const acquired = await this.#locks.acquire(this.#lease(lookup.run, dispatch));
+        if (acquired.kind !== "acquired") return lockReview(acquired);
+      }
+      dispatched.push(await this.#launch(lookup.run, task, dispatch));
+    }
+
+    if (this.#allTasksDone(lookup.run)) {
+      await this.#lifecycle.transitionRun(lookup.run.localId, "awaiting_verification");
+    }
+    return Object.freeze({
+      kind: "recorded",
+      verificationRequired: true,
+      ...(dispatched.length === 0 ? {} : { dispatched: immutableStrings(dispatched) })
+    });
+  }
+
+  async recordLaunchFailure(input: LaunchFailureInput): Promise<LaunchFailureResult> {
+    const lookup = this.#dispatchLookup.get(input.dispatchId);
+    if (lookup === undefined) throw new Error(`Dispatch ${input.dispatchId} is not known`);
+    if (this.#lifecycle.dispatch(lookup.dispatch.localId).state !== "running") {
+      return Object.freeze({ kind: "duplicate" });
+    }
+    const message: LaunchFailureMessage = Object.freeze({
+      kind: "launch_failure",
+      messageId: input.failureId,
+      dispatchId: input.dispatchId,
+      evidence: Object.freeze({ ...input.evidence })
+    });
+    const recorded = await this.#lifecycle.recordLaunchFailure(message, lookup.dispatch.localId);
+    if (recorded === "duplicate") return Object.freeze({ kind: "duplicate" });
+    if (lookup.dispatch.placement.requiresEditingLease) await this.#release(lookup.run, lookup.dispatch);
+
+    if (lookup.dispatch.attempt >= 2) {
+      await this.#lifecycle.transitionDispatch(lookup.dispatch.localId, "intervention_required");
+      await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
+      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+      return Object.freeze({
+        kind: "intervention_required",
+        reason: "launch_retry_exhausted",
+        dispatchId: input.dispatchId
+      });
+    }
+
+    const replacement = await this.#placements.resolve({
+      proposalId: lookup.run.proposal.proposalId,
+      riskLevel: lookup.run.proposal.riskLevel,
+      repositoryPath: lookup.run.project.absolutePath,
+      baseRef: lookup.run.proposal.baseRef ?? lookup.run.project.defaultBaseRef,
+      currentWorktreeApproval: lookup.run.authorized.currentWorktreeApproval,
+      attempt: 2
+    });
+    if (replacement.kind !== "ready") {
+      await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
+      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+      return Object.freeze({
+        kind: "intervention_required",
+        reason: "replacement_not_conflict_free",
+        dispatchId: input.dispatchId
+      });
+    }
+
+    const retry = await this.#planDispatch(lookup.run, lookup.task, replacement, 2, input.dispatchId);
+    if (replacement.requiresEditingLease) {
+      const acquired = await this.#locks.acquire(this.#lease(lookup.run, retry));
+      if (acquired.kind !== "acquired") {
+        await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
+        await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+        return Object.freeze({
+          kind: "intervention_required",
+          reason: "replacement_not_conflict_free",
+          dispatchId: input.dispatchId
+        });
+      }
+    }
+    if (replacement.worktree.kind === "isolated") {
+      let materialized: WorktreePlacement;
+      try {
+        materialized = await this.#placements.createWorktree(replacement);
+      } catch (error) {
+        if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
+        throw error;
+      }
+      if (materialized.kind !== "ready") {
+        if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
+        await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
+        await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+        return Object.freeze({
+          kind: "intervention_required",
+          reason: "replacement_not_conflict_free",
+          dispatchId: input.dispatchId
+        });
+      }
+    }
+    const dispatchId = await this.#launch(lookup.run, lookup.task, retry, input.dispatchId);
+    lookup.run.placement = replacement;
+    return Object.freeze({ kind: "retried", dispatchId, retryOf: input.dispatchId });
+  }
+
+  #context(
+    authorized: AuthorizedProposal,
+    proposal: ExecutionProposal,
+    project: ProjectRegistryEntry,
+    tasks: readonly ExecutionTask[],
+    placement: ReadyWorktreePlacement
+  ): RunContext {
+    const taskContexts = tasks.map((task): TaskContext => ({
+      task,
+      localId: taskLocalId(proposal.proposalId, task.localId),
+      initialAssignment: assignmentFor(proposal, project, task, placement, 1),
+      dispatches: []
+    }));
+    return {
+      authorized,
+      proposal,
+      project,
+      localId: runLocalId(proposal.proposalId),
+      tasks: taskContexts,
+      tasksByProposalId: new Map(taskContexts.map((task) => [task.task.localId, task])),
+      placement
+    };
+  }
+
+  async #planRunAndTasks(context: RunContext): Promise<void> {
+    const run: RunRecord = Object.freeze({
+      id: context.localId,
+      proposalId: context.proposal.proposalId,
+      commandId: context.proposal.commandId,
+      objective: objectiveFor(context.proposal),
+      state: "planned"
+    });
+    await this.#lifecycle.planRun(run);
+    for (const task of context.tasks) {
+      const record: TaskRecord = Object.freeze({
+        id: task.localId,
+        runId: context.localId,
+        localId: task.task.localId,
+        title: task.task.title,
+        role: task.task.role,
+        preferredAgent: task.task.preferredAgent,
+        dependsOn: immutableStrings(task.task.dependsOn.map((dependency) =>
+          taskLocalId(context.proposal.proposalId, dependency)
+        )),
+        state: "planned"
+      });
+      await this.#lifecycle.planTask(record);
+    }
+  }
+
+  async #planDispatch(
+    context: RunContext,
+    task: TaskContext,
+    placement: ReadyWorktreePlacement,
+    attempt: number,
+    retryOf?: string
+  ): Promise<DispatchContext> {
+    const localId = dispatchLocalId(context.proposal.proposalId, task.task.localId, attempt);
+    const dispatch: DispatchContext = {
+      localId,
+      attempt,
+      assignment: attempt === 1 && placement === context.placement
+        ? task.initialAssignment
+        : assignmentFor(context.proposal, context.project, task.task, placement, attempt),
+      placement
+    };
+    const record: DispatchRecord = Object.freeze({
+      id: localId,
+      taskId: task.localId,
+      attempt,
+      state: "planned",
+      assignment: dispatch.assignment,
+      ...(retryOf === undefined ? {} : { retryOf })
+    });
+    await this.#lifecycle.planDispatch(record);
+    task.dispatches.push(dispatch);
+    this.#dispatchLookup.set(localId, { run: context, task, dispatch });
+    return dispatch;
+  }
+
+  async #createRunAndTasks(context: RunContext): Promise<void> {
+    await this.#lifecycle.transitionRun(context.localId, "creating");
+    const runReceipt = await this.#orca.execute({
+      kind: "create_run",
+      objective: objectiveFor(context.proposal)
+    });
+    context.orcaRunId = runIdFrom(runReceipt);
+    await this.#lifecycle.transitionRun(context.localId, "active", {
+      orcaRunId: context.orcaRunId,
+      receipt: runReceipt
+    });
+
+    for (const task of context.tasks) {
+      await this.#lifecycle.transitionTask(task.localId, "creating");
+      const dependencyIds = task.task.dependsOn.map((dependency) => {
+        const dependencyTask = context.tasksByProposalId.get(dependency);
+        if (dependencyTask?.orcaTaskId === undefined) {
+          throw new Error(`dependency Task ${dependency} has no Orca receipt`);
+        }
+        return dependencyTask.orcaTaskId;
+      });
+      const taskReceipt = await this.#orca.execute({
+        kind: "create_task",
+        spec: taskSpec(task),
+        ...(dependencyIds.length === 0 ? {} : { dependencies: dependencyIds })
+      });
+      task.orcaTaskId = taskIdFrom(taskReceipt);
+      await this.#lifecycle.transitionTask(task.localId, "ready", {
+        orcaTaskId: task.orcaTaskId,
+        receipt: taskReceipt
+      });
+    }
+  }
+
+  async #launch(
+    context: RunContext,
+    task: TaskContext,
+    dispatch: DispatchContext,
+    retryOf?: string
+  ): Promise<string> {
+    if (task.orcaTaskId === undefined) throw new Error(`Task ${task.localId} has no Orca receipt`);
+    await this.#lifecycle.transitionDispatch(dispatch.localId, "launching");
+    const dispatchReceipt = await this.#orca.execute({
+      kind: "dispatch_worker",
+      taskId: task.orcaTaskId,
+      worktree: dispatch.placement.worktree.path,
+      agent: task.task.preferredAgent,
+      name: task.task.localId,
+      setup: context.project.setupPolicy,
+      ...(retryOf === undefined ? {} : { retryOf })
+    });
+    dispatch.orcaDispatchId = dispatchIdFrom(dispatchReceipt);
+    await this.#lifecycle.transitionDispatch(dispatch.localId, "running", {
+      orcaDispatchId: dispatch.orcaDispatchId,
+      receipt: dispatchReceipt
+    });
+    await this.#lifecycle.transitionTask(task.localId, "running");
+    const lookup = { run: context, task, dispatch };
+    this.#dispatchLookup.set(dispatch.localId, lookup);
+    this.#dispatchLookup.set(dispatch.orcaDispatchId, lookup);
+    return dispatch.orcaDispatchId;
+  }
+
+  #readyPendingTasks(context: RunContext): TaskContext[] {
+    return context.tasks.filter((task) => {
+      if (task.dispatches.length > 0) return false;
+      return task.task.dependsOn.every((dependency) => {
+        const dependencyTask = context.tasksByProposalId.get(dependency);
+        return dependencyTask !== undefined
+          && this.#lifecycle.task(dependencyTask.localId).state === "worker_done";
+      });
+    });
+  }
+
+  #allTasksDone(context: RunContext): boolean {
+    return context.tasks.every((task) => this.#lifecycle.task(task.localId).state === "worker_done");
+  }
+
+  #taskForDispatch(context: RunContext, dispatch: DispatchContext): TaskContext {
+    const task = context.tasks.find((candidate) => candidate.dispatches.includes(dispatch));
+    if (task === undefined) throw new Error(`Dispatch ${dispatch.localId} has no Task`);
+    return task;
+  }
+
+  #lease(context: RunContext, dispatch: DispatchContext): EditingLeaseRequest {
+    return Object.freeze({
+      lockKey: context.project.lockKey,
+      commandId: context.proposal.commandId,
+      taskId: dispatch.assignment.taskId,
+      projectKey: context.project.projectKey,
+      worktreePath: dispatch.placement.worktree.path,
+      branch: lockBranch(dispatch.placement),
+      dispatchId: dispatch.localId
+    });
+  }
+
+  #release(context: RunContext, dispatch: DispatchContext): Promise<EditingLockReleaseResult> {
+    return Promise.resolve(this.#locks.release({
+      lockKey: context.project.lockKey,
+      dispatchId: dispatch.localId
+    }));
+  }
+}
