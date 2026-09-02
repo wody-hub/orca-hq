@@ -17,6 +17,7 @@ import {
   CodexEventSchema,
   CodexPortError,
   HQ_TOOL_NAMES,
+  HqQueueClaimSchema,
   HqModelConfigurationSchema,
   PolicyPreviewResultSchema,
   TerraAssistanceSchema,
@@ -26,6 +27,7 @@ import {
   type CodexToolResponse,
   type HqFailureReason,
   type HqModelConfiguration,
+  type HqQueueTerminalRecord,
   type HqResult,
   type OrderedCommandQueuePort,
   type PolicyPreviewPort,
@@ -52,6 +54,11 @@ export interface CodexHqSessionOptions {
 interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
+}
+
+interface PendingQueueRecord {
+  readonly disposition: "complete" | "defer";
+  readonly record: HqQueueTerminalRecord;
 }
 
 type ModelTerminal =
@@ -115,6 +122,7 @@ export class CodexHqSession {
   readonly #waiting = new Map<string, Deferred<HqResult>>();
   readonly #submittedCommandIds = new Set<string>();
   #drainTail: Promise<void> = Promise.resolve();
+  #pendingRecord: PendingQueueRecord | undefined;
   #codexUnavailable = false;
 
   constructor(options: CodexHqSessionOptions) {
@@ -148,25 +156,42 @@ export class CodexHqSession {
       return failure("queue_unavailable");
     }
 
-    this.#scheduleDrain();
+    void this.#scheduleDrain();
     return waiting.promise;
   }
 
-  #scheduleDrain(): void {
+  /** Retries a paused durable queue drain after the queue adapter reports recovery. */
+  async resume(): Promise<void> {
+    await this.#scheduleDrain();
+  }
+
+  #scheduleDrain(): Promise<void> {
     const nextDrain = this.#drainTail.then(async () => this.#drain());
     this.#drainTail = nextDrain.catch(() => undefined);
+    return this.#drainTail;
   }
 
   async #drain(): Promise<void> {
     while (true) {
-      let commandInput: unknown;
+      const pendingRecord = this.#pendingRecord;
+      if (pendingRecord !== undefined) {
+        if (!await this.#persist(pendingRecord)) return;
+        this.#pendingRecord = undefined;
+        this.#resolve(pendingRecord.record.commandId, pendingRecord.record.result);
+        continue;
+      }
+
+      let claimInput: unknown;
       try {
-        commandInput = await this.#queue.claimNext();
+        claimInput = await this.#queue.claimNext();
       } catch {
-        this.#resolveAllWaiting(failure("queue_unavailable"));
         return;
       }
-      if (commandInput === undefined) return;
+      if (claimInput === undefined) return;
+      const parsedClaim = HqQueueClaimSchema.safeParse(claimInput);
+      if (!parsedClaim.success) return;
+      const claim = parsedClaim.data;
+      const commandInput = claim.command;
 
       const parsedCommand = CommandEnvelopeSchema.safeParse(commandInput);
       if (!parsedCommand.success) {
@@ -177,8 +202,10 @@ export class CodexHqSession {
           && typeof commandInput.commandId === "string"
           ? commandInput.commandId
           : "invalid-command";
-        await this.#record(commandId, invalid, false);
-        this.#resolve(commandId, invalid);
+        this.#pendingRecord = {
+          disposition: "complete",
+          record: Object.freeze({ claimToken: claim.claimToken, commandId, result: invalid })
+        };
         continue;
       }
 
@@ -188,18 +215,24 @@ export class CodexHqSession {
         : await this.#coordinate(command);
       if (result.kind === "degraded") this.#codexUnavailable = true;
 
-      const recorded = await this.#record(command.commandId, result, result.kind === "degraded");
-      this.#resolve(command.commandId, recorded);
+      this.#pendingRecord = {
+        disposition: result.kind === "degraded" ? "defer" : "complete",
+        record: Object.freeze({
+          claimToken: claim.claimToken,
+          commandId: command.commandId,
+          result
+        })
+      };
     }
   }
 
-  async #record(commandId: string, result: HqResult, retain: boolean): Promise<HqResult> {
+  async #persist(record: PendingQueueRecord): Promise<boolean> {
     try {
-      if (retain) await this.#queue.defer(commandId, result);
-      else await this.#queue.complete(commandId, result);
-      return result;
+      if (record.disposition === "defer") await this.#queue.defer(record.record);
+      else await this.#queue.complete(record.record);
+      return true;
     } catch {
-      return failure("queue_unavailable");
+      return false;
     }
   }
 
@@ -207,11 +240,6 @@ export class CodexHqSession {
     const waiting = this.#waiting.get(commandId);
     this.#waiting.delete(commandId);
     waiting?.resolve(result);
-  }
-
-  #resolveAllWaiting(result: HqResult): void {
-    for (const waiting of this.#waiting.values()) waiting.resolve(result);
-    this.#waiting.clear();
   }
 
   async #coordinate(command: CommandEnvelope): Promise<HqResult> {

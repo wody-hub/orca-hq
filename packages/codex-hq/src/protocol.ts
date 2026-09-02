@@ -90,6 +90,20 @@ export const HqResultSchema = z.discriminatedUnion("kind", [
 export type HqFailureReason = z.infer<typeof HqFailureReasonSchema>;
 export type HqResult = z.infer<typeof HqResultSchema>;
 
+export const HqQueueClaimSchema = z.object({
+  claimToken: z.string().min(1),
+  command: z.unknown()
+}).strict();
+
+export const HqQueueTerminalRecordSchema = z.object({
+  claimToken: z.string().min(1),
+  commandId: z.string().min(1),
+  result: HqResultSchema
+}).strict();
+
+export type HqQueueClaim = z.infer<typeof HqQueueClaimSchema>;
+export type HqQueueTerminalRecord = z.infer<typeof HqQueueTerminalRecordSchema>;
+
 export const HQ_TOOL_NAMES = Object.freeze([
   "searchProjects",
   "inspectProject",
@@ -197,12 +211,12 @@ export class CodexPortError extends Error {
 export interface OrderedCommandQueuePort {
   /** Atomically persists commands in invocation order. */
   enqueue(command: CommandEnvelope): Promise<void>;
-  /** Claims but never runs more than the current FIFO head. */
+  /** Reserves the FIFO head under a stable token until a terminal record is persisted. */
   claimNext(): Promise<unknown | undefined>;
-  /** Atomically records a terminal result and removes the current claim. */
-  complete(commandId: string, result: HqResult): Promise<void>;
-  /** Records degraded state, releases this drain's claim, and retains recovery FIFO order. */
-  defer(commandId: string, result: HqResult): Promise<void>;
+  /** Idempotently records this exact result by claim token and removes the current claim. */
+  complete(record: HqQueueTerminalRecord): Promise<void>;
+  /** Idempotently records this exact degraded result and retains recovery FIFO order. */
+  defer(record: HqQueueTerminalRecord): Promise<void>;
 }
 
 export interface RegistryQueryPort {

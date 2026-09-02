@@ -12,6 +12,8 @@ import {
   type CodexCliPort,
   type CodexCliTurn,
   type CodexTurnRequest,
+  type HqQueueClaim,
+  type HqQueueTerminalRecord,
   type HqResult,
   type OrderedCommandQueuePort,
   type PolicyPreviewPort,
@@ -87,23 +89,103 @@ class MemoryQueue implements OrderedCommandQueuePort {
   readonly enqueued: CommandEnvelope[] = [];
   readonly completed: Array<{ commandId: string; result: HqResult }> = [];
   readonly deferred: Array<{ commandId: string; result: HqResult }> = [];
-  readonly #ready: CommandEnvelope[] = [];
+  readonly #ready: HqQueueClaim[] = [];
+  readonly #settled = new Map<
+    string,
+    { disposition: "complete" | "defer"; record: HqQueueTerminalRecord }
+  >();
+  #active: HqQueueClaim | undefined;
+  #nextClaim = 1;
+
+  constructor(initialCommands: readonly unknown[] = []) {
+    for (const initialCommand of initialCommands) this.#enqueueClaim(initialCommand);
+  }
 
   async enqueue(value: CommandEnvelope): Promise<void> {
     this.enqueued.push(value);
-    this.#ready.push(value);
+    this.#enqueueClaim(value);
   }
 
-  async claimNext(): Promise<CommandEnvelope | undefined> {
-    return this.#ready.shift();
+  async claimNext(): Promise<HqQueueClaim | undefined> {
+    this.#active ??= this.#ready[0];
+    return this.#active;
   }
 
-  async complete(commandId: string, result: HqResult): Promise<void> {
-    this.completed.push({ commandId, result });
+  async complete(record: HqQueueTerminalRecord): Promise<void> {
+    this.#settle("complete", record);
   }
 
-  async defer(commandId: string, result: HqResult): Promise<void> {
-    this.deferred.push({ commandId, result });
+  async defer(record: HqQueueTerminalRecord): Promise<void> {
+    this.#settle("defer", record);
+  }
+
+  #enqueueClaim(command: unknown): void {
+    this.#ready.push(Object.freeze({
+      claimToken: `claim-${this.#nextClaim++}`,
+      command
+    }));
+  }
+
+  #settle(
+    disposition: "complete" | "defer",
+    record: HqQueueTerminalRecord
+  ): void {
+    const existing = this.#settled.get(record.claimToken);
+    if (existing !== undefined) {
+      if (
+        existing.disposition !== disposition
+        || JSON.stringify(existing.record) !== JSON.stringify(record)
+      ) throw new Error("conflicting terminal record for claim token");
+      return;
+    }
+    if (this.#active?.claimToken !== record.claimToken) {
+      throw new Error("terminal record does not match the active claim");
+    }
+
+    this.#settled.set(record.claimToken, { disposition, record });
+    if (disposition === "complete") {
+      this.completed.push({ commandId: record.commandId, result: record.result });
+    } else {
+      this.deferred.push({ commandId: record.commandId, result: record.result });
+    }
+    this.#ready.shift();
+    this.#active = undefined;
+  }
+}
+
+class OneFailureRecoveryGate {
+  readonly failed: Promise<void>;
+  readonly retryBlocked: Promise<void>;
+  #signalFailed: (() => void) | undefined;
+  #signalRetryBlocked: (() => void) | undefined;
+  #releaseRetry: (() => void) | undefined;
+  readonly #recovery: Promise<void>;
+  #attempts = 0;
+
+  constructor() {
+    this.failed = new Promise<void>((resolve) => {
+      this.#signalFailed = resolve;
+    });
+    this.retryBlocked = new Promise<void>((resolve) => {
+      this.#signalRetryBlocked = resolve;
+    });
+    this.#recovery = new Promise<void>((resolve) => {
+      this.#releaseRetry = resolve;
+    });
+  }
+
+  recover(): void {
+    this.#releaseRetry?.();
+  }
+
+  async beforeOperation(): Promise<void> {
+    this.#attempts += 1;
+    if (this.#attempts === 1) {
+      this.#signalFailed?.();
+      throw new Error("queue temporarily unavailable");
+    }
+    this.#signalRetryBlocked?.();
+    await this.#recovery;
   }
 }
 
@@ -716,18 +798,6 @@ describe("Codex HQ session", () => {
 
   it("records a malformed persisted queue value and continues to the next command", async () => {
     // Break caught: corrupt durable JSON could crash the drain and strand every later FIFO command.
-    class MalformedFirstQueue extends MemoryQueue {
-      #malformedPending = true;
-
-      override async claimNext(): Promise<CommandEnvelope | undefined> {
-        if (this.#malformedPending) {
-          this.#malformedPending = false;
-          return null as never;
-        }
-        return super.claimNext();
-      }
-    }
-
     const codex: CodexCliPort = {
       openTurn: vi.fn(async () => turnFor([
         {
@@ -739,7 +809,7 @@ describe("Codex HQ session", () => {
         }
       ]))
     };
-    const queue = new MalformedFirstQueue();
+    const queue = new MemoryQueue([null]);
     const session = new CodexHqSession({
       ...dependencies(codex, queue),
       models: { authorityModel: CODEX_HQ_MODEL }
@@ -896,5 +966,196 @@ describe("Codex HQ session", () => {
       ok: false,
       error: { code: "invalid_tool_input" }
     });
+  });
+
+  it("keeps a command pending when claim fails and resumes it without reordering", async () => {
+    // Break caught: a transient claim failure could publish queue_unavailable while the durable row stays pending.
+    class RecoverableClaimQueue extends MemoryQueue {
+      readonly recovery = new OneFailureRecoveryGate();
+
+      override async claimNext(): Promise<HqQueueClaim | undefined> {
+        await this.recovery.beforeOperation();
+        return super.claimNext();
+      }
+    }
+
+    const codex: CodexCliPort = {
+      openTurn: vi.fn(async () => turnFor([
+        {
+          type: "tool_call",
+          model: CODEX_HQ_MODEL,
+          callId: "call-1",
+          tool: "submitProposal",
+          input: proposal
+        }
+      ]))
+    };
+    const queue = new RecoverableClaimQueue();
+    const session = new CodexHqSession({
+      ...dependencies(codex, queue),
+      models: { authorityModel: CODEX_HQ_MODEL }
+    });
+    let resolved = false;
+
+    const resultPromise = session.plan(command).then((result) => {
+      resolved = true;
+      return result;
+    });
+    await queue.recovery.failed;
+
+    const resumePromise = session.resume();
+    await queue.recovery.retryBlocked;
+    expect(resolved).toBe(false);
+    expect(codex.openTurn).not.toHaveBeenCalled();
+
+    queue.recovery.recover();
+    await resumePromise;
+    await expect(resultPromise).resolves.toEqual({ kind: "proposal", proposal });
+    expect(codex.openTurn).toHaveBeenCalledOnce();
+    expect(queue.completed).toEqual([
+      { commandId: command.commandId, result: { kind: "proposal", proposal } }
+    ]);
+  });
+
+  it("retries the same proposal record before resolving or advancing FIFO", async () => {
+    // Break caught: a failed complete could lose a computed proposal, resolve a false failure, then run later work.
+    class RecoverableCompleteQueue extends MemoryQueue {
+      readonly completeAttempts: HqQueueTerminalRecord[] = [];
+      readonly recovery = new OneFailureRecoveryGate();
+
+      override async complete(record: HqQueueTerminalRecord): Promise<void> {
+        this.completeAttempts.push(record);
+        await this.recovery.beforeOperation();
+        await super.complete(record);
+      }
+    }
+
+    const firstCommand = commandFor("command-complete-a");
+    const secondCommand = commandFor("command-complete-b");
+    const opened: string[] = [];
+    const codex: CodexCliPort = {
+      openTurn: vi.fn(async (request) => {
+        opened.push(request.command.commandId);
+        return turnFor([
+          {
+            type: "tool_call",
+            model: CODEX_HQ_MODEL,
+            callId: `call-${request.command.commandId}`,
+            tool: "submitProposal",
+            input: proposalFor(request.command)
+          }
+        ]);
+      })
+    };
+    const queue = new RecoverableCompleteQueue();
+    const session = new CodexHqSession({
+      ...dependencies(codex, queue),
+      models: { authorityModel: CODEX_HQ_MODEL }
+    });
+    let firstResolved = false;
+    let secondResolved = false;
+
+    const firstResult = session.plan(firstCommand).then((result) => {
+      firstResolved = true;
+      return result;
+    });
+    await queue.recovery.failed;
+    const secondResult = session.plan(secondCommand).then((result) => {
+      secondResolved = true;
+      return result;
+    });
+    const resumePromise = session.resume();
+    await queue.recovery.retryBlocked;
+
+    expect(firstResolved).toBe(false);
+    expect(secondResolved).toBe(false);
+    expect(opened).toEqual([firstCommand.commandId]);
+    expect(queue.completed).toEqual([]);
+
+    queue.recovery.recover();
+    await resumePromise;
+    await expect(Promise.all([firstResult, secondResult])).resolves.toEqual([
+      { kind: "proposal", proposal: proposalFor(firstCommand) },
+      { kind: "proposal", proposal: proposalFor(secondCommand) }
+    ]);
+    expect(opened).toEqual([firstCommand.commandId, secondCommand.commandId]);
+    expect(opened.filter((commandId) => commandId === firstCommand.commandId)).toHaveLength(1);
+    const firstAttempts = queue.completeAttempts.filter(
+      (attempt) => attempt.commandId === firstCommand.commandId
+    );
+    expect(firstAttempts).toHaveLength(2);
+    expect(firstAttempts[0]?.claimToken).toMatch(/^claim-/);
+    expect(firstAttempts[1]).toBe(firstAttempts[0]);
+    expect(firstAttempts[1]?.result).toBe(firstAttempts[0]?.result);
+    expect(queue.completed.map((item) => item.commandId)).toEqual([
+      firstCommand.commandId,
+      secondCommand.commandId
+    ]);
+  });
+
+  it("retries the same degraded record before resolving or advancing FIFO", async () => {
+    // Break caught: a failed defer could publish queue_unavailable and lose the exact degraded outcome.
+    class RecoverableDeferQueue extends MemoryQueue {
+      readonly deferAttempts: HqQueueTerminalRecord[] = [];
+      readonly recovery = new OneFailureRecoveryGate();
+
+      override async defer(record: HqQueueTerminalRecord): Promise<void> {
+        this.deferAttempts.push(record);
+        await this.recovery.beforeOperation();
+        await super.defer(record);
+      }
+    }
+
+    const firstCommand = commandFor("command-defer-a");
+    const secondCommand = commandFor("command-defer-b");
+    const codex: CodexCliPort = {
+      openTurn: vi.fn(async () => {
+        throw new CodexPortError("authentication_required");
+      })
+    };
+    const queue = new RecoverableDeferQueue();
+    const session = new CodexHqSession({
+      ...dependencies(codex, queue),
+      models: { authorityModel: CODEX_HQ_MODEL }
+    });
+    let firstResolved = false;
+    let secondResolved = false;
+
+    const firstResult = session.plan(firstCommand).then((result) => {
+      firstResolved = true;
+      return result;
+    });
+    await queue.recovery.failed;
+    const secondResult = session.plan(secondCommand).then((result) => {
+      secondResolved = true;
+      return result;
+    });
+    const resumePromise = session.resume();
+    await queue.recovery.retryBlocked;
+
+    expect(firstResolved).toBe(false);
+    expect(secondResolved).toBe(false);
+    expect(codex.openTurn).toHaveBeenCalledOnce();
+    expect(queue.deferred).toEqual([]);
+
+    queue.recovery.recover();
+    await resumePromise;
+    const degraded = { kind: "degraded", reason: "codex_unavailable" } as const;
+    await expect(Promise.all([firstResult, secondResult])).resolves.toEqual([
+      degraded,
+      degraded
+    ]);
+    expect(codex.openTurn).toHaveBeenCalledOnce();
+    const firstAttempts = queue.deferAttempts.filter(
+      (attempt) => attempt.commandId === firstCommand.commandId
+    );
+    expect(firstAttempts).toHaveLength(2);
+    expect(firstAttempts[0]?.claimToken).toMatch(/^claim-/);
+    expect(firstAttempts[1]).toBe(firstAttempts[0]);
+    expect(firstAttempts[1]?.result).toBe(firstAttempts[0]?.result);
+    expect(queue.deferred).toEqual([
+      { commandId: firstCommand.commandId, result: degraded },
+      { commandId: secondCommand.commandId, result: degraded }
+    ]);
   });
 });
