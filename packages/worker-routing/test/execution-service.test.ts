@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import type { ExecutionProposal } from "@orca-hq/core";
 import type { OrcaOperation, OrcaReceipt } from "../../orca-adapter/src/index.js";
 import type { ProjectRegistryEntry } from "../../project-registry/src/index.js";
+import { ControlStore, openDatabase } from "../../persistence/src/index.js";
 import {
   createSandboxRepo,
   type SandboxRepo
@@ -43,7 +44,12 @@ import {
   type WorkerLaunchPolicy,
   type WorkerMessage,
   type WorkerProvider,
-  type WorkerProviderRegistryPort
+  type WorkerProviderRegistryPort,
+  VerificationService,
+  type VerificationCommit,
+  type VerificationLifecycleStore,
+  type VerificationReport,
+  type VerificationTask
 } from "../src/index.js";
 
 const project: ProjectRegistryEntry = {
@@ -223,6 +229,7 @@ class RecordingOrca {
   readonly calls: OrcaOperation[] = [];
   releaseError: Error | undefined;
   dispatchErrorOnCall: number | undefined;
+  createTaskErrorOnCall: number | undefined;
   malformedDispatchId: string | undefined;
   dispatchTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
@@ -246,6 +253,9 @@ class RecordingOrca {
         return receipt("run-receipt", { runId: "orca-run-1" });
       case "create_task": {
         this.#task += 1;
+        if (this.createTaskErrorOnCall === this.#task) {
+          throw new Error(`synthetic create_task failure ${this.#task}`);
+        }
         return receipt(`task-receipt-${this.#task}`, {
           taskId: `orca-task-${this.#task}`,
           runId: "orca-run-1",
@@ -425,6 +435,59 @@ class MemoryLifecycleStore implements LifecycleStore {
   }
 }
 
+class MemoryVerificationLifecycleStore implements VerificationLifecycleStore {
+  readonly tasks: VerificationTask[] = [];
+  readonly commits: VerificationCommit[] = [];
+
+  saveVerificationTask(task: VerificationTask): void {
+    this.tasks.push(structuredClone(task));
+  }
+
+  commitVerification(commit: VerificationCommit): void {
+    this.commits.push(structuredClone(commit));
+  }
+}
+
+function executionVerificationHarness(collectImplementation = () => ({
+  changedFiles: ["src/api.ts"],
+  gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+  testReceipts: [{
+    command: "pnpm test",
+    exitCode: 0,
+    summary: "implementation suite passed",
+    auditReference: "audit:implementation:test"
+  }],
+  auditReferences: ["audit:implementation:dispatch"]
+})) {
+  const store = new MemoryVerificationLifecycleStore();
+  const verifierCommands = [{
+    command: "pnpm test",
+    exitCode: 0,
+    summary: "verification suite passed",
+    auditReference: "audit:verifier:test"
+  }];
+  const service = new VerificationService({
+    store,
+    completionTarget: {
+      commandId: proposal.commandId,
+      channel: "slack",
+      destination: "C123",
+      nextAttemptAt: "2026-09-02T00:00:00.000Z"
+    }
+  });
+  return {
+    store,
+    verifierCommands,
+    verification: {
+      service,
+      evidence: {
+        collectImplementation,
+        collectVerifierCommands: () => verifierCommands
+      }
+    }
+  };
+}
+
 class RecordingMessageSink implements LifecycleMessageSink {
   readonly messages: UserVisibleLifecycleMessage[] = [];
 
@@ -551,7 +614,8 @@ function setup(
   git = new MemoryGit(),
   providerCapabilities?: ProviderCapabilities,
   providerFactory?: (orca: RecordingOrca) => WorkerProviderRegistryPort,
-  workerLaunchPolicy?: WorkerLaunchPolicy
+  workerLaunchPolicy?: WorkerLaunchPolicy,
+  verification?: unknown
 ): {
   service: ExecutionService;
   orca: RecordingOrca;
@@ -587,8 +651,9 @@ function setup(
       assignmentArtifacts: artifacts,
       providerCapabilities: providerCapabilities ?? supportedCapabilities,
       ...(workerLaunchPolicy === undefined ? {} : { workerLaunchPolicy }),
-      ...(providerFactory === undefined ? {} : { providers: providerFactory(orca) })
-    }),
+      ...(providerFactory === undefined ? {} : { providers: providerFactory(orca) }),
+      ...(verification === undefined ? {} : { verification })
+    } as never),
     orca,
     git,
     locks,
@@ -1743,6 +1808,555 @@ describe("Git worktree placement", () => {
 });
 
 describe("worker lifecycle", () => {
+  it("dispatches one opposite-family verifier for every implementation Task", async () => {
+    // Break caught: verifying only the final worker_done leaves earlier implementation output unchecked.
+    const harness = executionVerificationHarness();
+    const { service, store } = setup(
+      new MemoryGit(), undefined, undefined, undefined, harness.verification
+    );
+    const multiTaskProposal: ExecutionProposal = {
+      ...proposal,
+      tasks: [
+        proposal.tasks[0]!,
+        {
+          localId: "implement-client",
+          title: "Implement the client change",
+          dependsOn: [],
+          role: "implement",
+          preferredAgent: "claude"
+        }
+      ]
+    };
+    await service.start(authorized(multiTaskProposal));
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "multi-implementation-1",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "server implementation complete"
+    });
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "multi-implementation-2",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "client implementation complete"
+    })).resolves.toMatchObject({
+      dispatched: ["orca-dispatch-3", "orca-dispatch-4"]
+    });
+
+    expect(harness.store.tasks).toHaveLength(2);
+    expect(harness.store.tasks.map((task) => ({
+      implementationTaskId: task.implementationTaskId,
+      implementationProvider: task.implementationProvider,
+      verifierProvider: task.preferredAgent
+    }))).toEqual([
+      {
+        implementationTaskId: "task:proposal-1:implement",
+        implementationProvider: "codex",
+        verifierProvider: "claude"
+      },
+      {
+        implementationTaskId: "task:proposal-1:implement-client",
+        implementationProvider: "claude",
+        verifierProvider: "codex"
+      }
+    ]);
+    expect([...store.dispatches.values()].slice(2).map(({ assignment }) => ({
+      role: assignment.role,
+      provider: assignment.preferredAgent,
+      permissions: assignment.permissions
+    }))).toEqual([
+      { role: "verify", provider: "claude", permissions: "read-only" },
+      { role: "verify", provider: "codex", permissions: "read-only" }
+    ]);
+  });
+
+  it("dispatches a separate Fix Task and the next-cycle verifier after a failed report", async () => {
+    // Break caught: persisting a Fix Task without public-Orca dispatch makes bounded cycles dead code.
+    const harness = executionVerificationHarness();
+    const { service, orca, store } = setup(
+      new MemoryGit(), undefined, undefined, undefined, harness.verification
+    );
+    await service.start(authorized());
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "fix-cycle-implementation",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    });
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "fix-cycle-verifier",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "verification found a defect"
+    });
+    const task = harness.store.tasks[0];
+    if (task === undefined) throw new Error("verifier Task was not created");
+    const failedReport: VerificationReport = {
+      reportId: "report:fix-cycle:0",
+      runId: task.runId,
+      verificationTaskId: task.taskId,
+      implementationTaskId: task.implementationTaskId,
+      implementationDispatchId: task.implementationDispatchId,
+      cycle: task.cycle,
+      verdict: "fail",
+      projectRoute: task.projectRoute,
+      changedFiles: task.changedFiles,
+      diffSha256: task.gitDiff.sha256,
+      diffSummary: task.gitDiff.summary,
+      commands: harness.verifierCommands,
+      implementationProvider: task.implementationProvider,
+      verifierProvider: task.preferredAgent,
+      findings: ["acceptance behavior is incomplete"],
+      evidence: ["audit:verifier:test"],
+      auditReferences: [...task.auditReferences, "audit:verifier:test"],
+      verifierEffects: {
+        filesModified: false,
+        committed: false,
+        pushed: false,
+        pullRequestChanged: false,
+        merged: false,
+        deployed: false,
+        secretsAccessed: false,
+        productionAccessed: false
+      }
+    };
+
+    await expect(service.recordVerificationReport(failedReport)).resolves.toEqual({
+      kind: "create_fix_task",
+      findings: ["acceptance behavior is incomplete"],
+      nextCycle: 1
+    });
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")[2]).toMatchObject({
+      kind: "dispatch_worker",
+      taskId: "orca-task-3",
+      agent: "codex"
+    });
+    expect([...store.dispatches.values()][2]).toMatchObject({
+      assignment: { role: "implement", permissions: "read-write" }
+    });
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "fix-cycle-fix-done",
+      dispatchId: "orca-dispatch-3",
+      outcome: "completed",
+      summary: "fix complete"
+    })).resolves.toMatchObject({ dispatched: ["orca-dispatch-4"] });
+    expect(harness.store.tasks[1]).toMatchObject({
+      role: "verify",
+      cycle: 1,
+      preferredAgent: "claude"
+    });
+  });
+
+  it("resumes verifier dispatch when worker_done redelivery follows a collector failure", async () => {
+    // Break caught: durable worker_done dedupe must not strand later verification side effects.
+    let attempts = 0;
+    const harness = executionVerificationHarness(() => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("synthetic evidence collector failure");
+      return {
+        changedFiles: ["src/api.ts"],
+        gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+        testReceipts: [{
+          command: "pnpm test",
+          exitCode: 0,
+          summary: "implementation suite passed",
+          auditReference: "audit:implementation:test"
+        }],
+        auditReferences: ["audit:implementation:dispatch"]
+      };
+    });
+    const { service, orca } = setup(
+      new MemoryGit(), undefined, undefined, undefined, harness.verification
+    );
+    await service.start(authorized());
+    const done: WorkerMessage = {
+      kind: "worker_done",
+      messageId: "resume-verification-after-collector",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    };
+
+    await expect(service.recordWorkerMessage(done))
+      .rejects.toThrow("synthetic evidence collector failure");
+    await expect(service.recordWorkerMessage(done)).resolves.toMatchObject({
+      kind: "recorded",
+      dispatched: ["orca-dispatch-2"]
+    });
+    expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toHaveLength(1);
+    expect(harness.store.tasks).toHaveLength(1);
+  });
+
+  it("resumes the same verifier Task when worker_done redelivery follows create_task failure", async () => {
+    // Break caught: durable worker_done must resume a partially-created verifier without duplicating its identity.
+    const harness = executionVerificationHarness();
+    const { service, orca } = setup(
+      new MemoryGit(), undefined, undefined, undefined, harness.verification
+    );
+    await service.start(authorized());
+    orca.createTaskErrorOnCall = 2;
+    const done: WorkerMessage = {
+      kind: "worker_done",
+      messageId: "resume-verifier-create-task",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    };
+
+    await expect(service.recordWorkerMessage(done)).rejects.toThrow("synthetic create_task failure");
+    await expect(service.recordWorkerMessage(done)).resolves.toMatchObject({
+      dispatched: ["orca-dispatch-2"]
+    });
+    expect(harness.store.tasks).toHaveLength(1);
+    expect(orca.calls.filter(({ kind }) => kind === "create_task")).toHaveLength(3);
+  });
+
+  it("dispatches an opposite-family read-only verifier after the implementation finishes", async () => {
+    // Break caught: stopping at awaiting_verification leaves VerificationService as dead production code.
+    const verificationStore = new MemoryVerificationLifecycleStore();
+    const verificationService = new VerificationService({
+      store: verificationStore,
+      completionTarget: {
+        commandId: proposal.commandId,
+        channel: "slack",
+        destination: "C123",
+        nextAttemptAt: "2026-09-02T00:00:00.000Z"
+      }
+    });
+    const { service, orca, store } = setup(
+      new MemoryGit(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        service: verificationService,
+        evidence: {
+          collectImplementation: () => ({
+            changedFiles: ["src/api.ts"],
+            gitDiff: {
+              sha256: "a".repeat(64),
+              summary: "1 file changed"
+            },
+            testReceipts: [{
+              command: "pnpm test",
+              exitCode: 0,
+              summary: "28 tests passed",
+              auditReference: "audit:implementation:test:1"
+            }],
+            auditReferences: ["audit:implementation:dispatch:1"]
+          })
+        }
+      }
+    );
+    await service.start(authorized());
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "done-before-verification-dispatch",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).resolves.toMatchObject({
+      kind: "recorded",
+      verificationRequired: true,
+      dispatched: ["orca-dispatch-2"]
+    });
+
+    expect(verificationStore.tasks).toHaveLength(1);
+    expect(verificationStore.tasks[0]).toMatchObject({
+      role: "verify",
+      preferredAgent: "claude",
+      permissions: "read-only",
+      nestedWorkers: "forbidden",
+      implementationDispatchId: "dispatch:proposal-1:implement:1"
+    });
+    const verifierTaskCall = orca.calls.filter(({ kind }) => kind === "create_task")[1];
+    expect(verifierTaskCall).toMatchObject({
+      kind: "create_task",
+      dependencies: ["orca-task-1"]
+    });
+    expect(JSON.parse(verifierTaskCall?.kind === "create_task" ? verifierTaskCall.spec : "{}"))
+      .toMatchObject({
+        task: {
+          role: "verify",
+          preferredAgent: "claude"
+        },
+        authorization: {
+          permissions: "read-only",
+          nestedWorkers: "forbidden"
+        }
+      });
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")[1]).toMatchObject({
+      kind: "dispatch_worker",
+      taskId: "orca-task-2",
+      agent: "claude"
+    });
+    expect([...store.dispatches.values()][1]).toMatchObject({
+      state: "running",
+      providerId: "claude",
+      assignment: {
+        role: "verify",
+        preferredAgent: "claude",
+        permissions: "read-only"
+      }
+    });
+  });
+
+  it("accepts a verification report only after its exact verifier Dispatch evidence is durable", async () => {
+    // Break caught: a caller-shaped report must not complete a Run before the assigned verifier finishes.
+    const verificationStore = new MemoryVerificationLifecycleStore();
+    const verificationService = new VerificationService({
+      store: verificationStore,
+      completionTarget: {
+        commandId: proposal.commandId,
+        channel: "slack",
+        destination: "C123",
+        nextAttemptAt: "2026-09-02T00:00:00.000Z"
+      }
+    });
+    const verifierCommands = [{
+      command: "pnpm test",
+      exitCode: 0,
+      summary: "52 tests passed",
+      auditReference: "audit:verifier:command:1"
+    }];
+    const { service, store } = setup(
+      new MemoryGit(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        service: verificationService,
+        evidence: {
+          collectImplementation: () => ({
+            changedFiles: ["src/api.ts"],
+            gitDiff: {
+              sha256: "a".repeat(64),
+              summary: "1 file changed"
+            },
+            testReceipts: [{
+              command: "pnpm test",
+              exitCode: 0,
+              summary: "28 tests passed",
+              auditReference: "audit:implementation:test:1"
+            }],
+            auditReferences: ["audit:implementation:dispatch:1"]
+          }),
+          collectVerifierCommands: () => verifierCommands
+        }
+      }
+    );
+    await service.start(authorized());
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "implementation-done-for-report",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    });
+    const verificationTask = verificationStore.tasks[0];
+    if (verificationTask === undefined) throw new Error("verifier Task was not created");
+    const report: VerificationReport = {
+      reportId: "report:execution-service:1",
+      runId: verificationTask.runId,
+      verificationTaskId: verificationTask.taskId,
+      implementationTaskId: verificationTask.implementationTaskId,
+      implementationDispatchId: verificationTask.implementationDispatchId,
+      cycle: verificationTask.cycle,
+      verdict: "pass",
+      projectRoute: verificationTask.projectRoute,
+      changedFiles: verificationTask.changedFiles,
+      diffSha256: verificationTask.gitDiff.sha256,
+      diffSummary: verificationTask.gitDiff.summary,
+      commands: verifierCommands,
+      implementationProvider: verificationTask.implementationProvider,
+      verifierProvider: verificationTask.preferredAgent,
+      findings: [],
+      evidence: ["audit:verifier:command:1"],
+      auditReferences: [
+        ...verificationTask.auditReferences,
+        "audit:verifier:command:1"
+      ],
+      verifierEffects: {
+        filesModified: false,
+        committed: false,
+        pushed: false,
+        pullRequestChanged: false,
+        merged: false,
+        deployed: false,
+        secretsAccessed: false,
+        productionAccessed: false
+      }
+    };
+    const verificationExecution = service as unknown as {
+      recordVerificationReport(value: VerificationReport): Promise<unknown>;
+    };
+
+    await expect(Promise.resolve().then(() => verificationExecution.recordVerificationReport(report)))
+      .rejects.toThrow("worker_done");
+
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "verifier-done-for-report",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "verification complete"
+    });
+    await expect(verificationExecution.recordVerificationReport(report)).resolves.toEqual({
+      kind: "verified_success",
+      evidence: ["audit:verifier:command:1"]
+    });
+    const transitionCount = store.transitions.length;
+    await expect(verificationExecution.recordVerificationReport(structuredClone(report)))
+      .resolves.toEqual({
+        kind: "verified_success",
+        evidence: ["audit:verifier:command:1"]
+      });
+    expect([...store.dispatches.values()][1]).toMatchObject({
+      state: "worker_done",
+      verificationCommands: verifierCommands
+    });
+    expect(store.transitions).toHaveLength(transitionCount);
+    expect(verificationStore.commits).toHaveLength(1);
+  });
+
+  it("completes the fake-Orca execution and verification chain through one durable ControlStore", async () => {
+    // Break caught: separate in-memory lifecycle data leaves the SQLite completion gate unable to authenticate workers.
+    const database = openDatabase(":memory:");
+    try {
+      const now = "2026-09-02T00:00:00.000Z";
+      database.prepare(`
+        INSERT INTO principals (id, payload_json, created_at, updated_at)
+        VALUES ('owner', '{}', ?, ?)
+      `).run(now, now);
+      database.prepare(`
+        INSERT INTO commands (
+          id, idempotency_key, channel, external_message_id, principal_id,
+          received_at, payload_json, created_at
+        ) VALUES ('command-1', 'test:durable-chain', 'slack', '171.002', 'owner', ?, '{}', ?)
+      `).run(now, now);
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const lifecycle = new ExecutionLifecycle({ store, messages: new RecordingMessageSink() });
+      const verification = new VerificationService({
+        store,
+        completionTarget: {
+          commandId: proposal.commandId,
+          channel: "slack",
+          destination: "C123",
+          nextAttemptAt: now
+        }
+      });
+      const verifierCommands = [{
+        command: "pnpm test",
+        exitCode: 0,
+        summary: "durable suite passed",
+        auditReference: "audit:durable:verifier:test"
+      }];
+      const service = new ExecutionService({
+        orca,
+        placements: new GitWorktreePlacementService(new MemoryGit()),
+        locks: new RecordingLocks(),
+        lifecycle,
+        assignmentArtifacts: new MemoryAssignmentArtifactStore(),
+        providerCapabilities: {
+          codex: { worker: "available", hq: "available" },
+          claude: { worker: "available", hq: "unavailable" },
+          providerChildEnvironmentIsolation: {
+            kind: "verified_effective_allowlist",
+            effectiveEnvironmentKeys: ["HOME", "PATH"]
+          },
+          assignmentArtifactAccess: { kind: "same_host" }
+        },
+        verification: {
+          service: verification,
+          evidence: {
+            collectImplementation: () => ({
+              changedFiles: ["src/api.ts"],
+              gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+              testReceipts: [{
+                command: "pnpm test",
+                exitCode: 0,
+                summary: "implementation suite passed",
+                auditReference: "audit:durable:implementation:test"
+              }],
+              auditReferences: ["audit:durable:implementation:dispatch"]
+            }),
+            collectVerifierCommands: () => verifierCommands
+          }
+        }
+      });
+
+      await service.start(authorized());
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-implementation-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      });
+      const verificationTask = store.listTasks().find(({ role }) => role === "verify")
+        ?.payload as VerificationTask | undefined;
+      if (verificationTask === undefined) throw new Error("durable verifier Task was not created");
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-verifier-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "verification complete"
+      });
+      const report: VerificationReport = {
+        reportId: "report:durable:1",
+        runId: verificationTask.runId,
+        verificationTaskId: verificationTask.taskId,
+        implementationTaskId: verificationTask.implementationTaskId,
+        implementationDispatchId: verificationTask.implementationDispatchId,
+        cycle: verificationTask.cycle,
+        verdict: "pass",
+        projectRoute: verificationTask.projectRoute,
+        changedFiles: verificationTask.changedFiles,
+        diffSha256: verificationTask.gitDiff.sha256,
+        diffSummary: verificationTask.gitDiff.summary,
+        commands: verifierCommands,
+        implementationProvider: verificationTask.implementationProvider,
+        verifierProvider: verificationTask.preferredAgent,
+        findings: [],
+        evidence: ["audit:durable:verifier:test"],
+        auditReferences: [
+          ...verificationTask.auditReferences,
+          "audit:durable:verifier:test"
+        ],
+        verifierEffects: {
+          filesModified: false,
+          committed: false,
+          pushed: false,
+          pullRequestChanged: false,
+          merged: false,
+          deployed: false,
+          secretsAccessed: false,
+          productionAccessed: false
+        }
+      };
+
+      await expect(service.recordVerificationReport(report)).resolves.toEqual({
+        kind: "verified_success",
+        evidence: ["audit:durable:verifier:test"]
+      });
+      expect(database.prepare("SELECT state FROM runs WHERE id = ?").get(report.runId))
+        .toEqual({ state: "verified_success" });
+      expect(store.listOutbox()).toContainEqual(expect.objectContaining({ template: "success" }));
+    } finally {
+      database.close();
+    }
+  });
+
   it("persists questions and escalations but never publishes worker_done as success", async () => {
     // Break caught: treating a worker completion report as accepted success bypasses verification.
     const { service, orca, store, messages, artifacts } = setup();

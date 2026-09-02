@@ -18,6 +18,7 @@ import type {
   ProviderStartReceipt,
   WorkerProviderId
 } from "./providers.js";
+import type { VerificationCommandReceipt } from "./verifier.js";
 
 const NonBlankStringSchema = z.string().trim().min(1);
 const AbsolutePathSchema = NonBlankStringSchema.refine(isAbsolute, "must be an absolute path");
@@ -165,6 +166,7 @@ export type DispatchRecord = Readonly<{
   launchFailureId?: string | undefined;
   releaseReceipt?: OrcaReceipt | undefined;
   releaseFailure?: WorkerReleaseFailure | undefined;
+  verificationCommands?: readonly VerificationCommandReceipt[] | undefined;
 }>;
 
 export type WorkerReleaseFailure = Readonly<{
@@ -414,6 +416,29 @@ export class ExecutionLifecycle {
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
     const updated = Object.freeze({ ...current, ...outcome, orcaDispatchId });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordVerificationCommands(
+    localDispatchId: string,
+    commands: readonly VerificationCommandReceipt[]
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (current.state !== "worker_done" || current.assignment.role !== "verify") {
+      throw new Error(`verification Dispatch ${localDispatchId} is not worker_done`);
+    }
+    if (
+      JSON.stringify(commands.map(({ command }) => command))
+      !== JSON.stringify(current.assignment.acceptanceCommands)
+    ) {
+      throw new TypeError("verifier command evidence does not match its assigned acceptance commands");
+    }
+    const updated = Object.freeze({
+      ...current,
+      verificationCommands: Object.freeze(commands.map((command) => Object.freeze({ ...command })))
+    });
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);
     return updated;

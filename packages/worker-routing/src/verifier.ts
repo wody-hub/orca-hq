@@ -22,10 +22,10 @@ const GitDiffEvidenceSchema = z.object({
 }).strict();
 
 export const VerificationCommandReceiptSchema = z.object({
-  command: NonBlankStringSchema,
+  command: NonBlankStringSchema.max(2_048),
   exitCode: z.number().int(),
-  result: NonBlankStringSchema,
-  auditReference: NonBlankStringSchema
+  summary: NonBlankStringSchema.max(512),
+  auditReference: NonBlankStringSchema.max(256)
 }).strict();
 
 const WorkerResultSchema = z.object({
@@ -100,6 +100,7 @@ export const VerificationReportSchema = z.object({
   verdict: z.enum(["pass", "fail"]),
   projectRoute: ProjectRouteSchema,
   changedFiles: StringListSchema,
+  diffSha256: Sha256Schema,
   diffSummary: NonBlankStringSchema,
   commands: z.array(VerificationCommandReceiptSchema).min(1),
   implementationProvider: WorkerProviderIdSchema,
@@ -178,9 +179,9 @@ export type VerificationOutboxMessage = Readonly<{
   template: "success" | "intervention_required";
   payload: Readonly<Record<string, unknown>>;
   commandId?: string | undefined;
-  channel?: "slack" | "telegram" | "tailscale-web" | undefined;
-  destination?: string | undefined;
-  nextAttemptAt?: string | undefined;
+  channel: "slack" | "telegram" | "tailscale-web";
+  destination: string;
+  nextAttemptAt: string;
 }>;
 
 export type VerificationCompletionTarget = Readonly<{
@@ -202,6 +203,7 @@ export type VerificationAudit = Readonly<{
     cycle: number;
     verdict: "pass" | "fail";
     projectKey: string;
+    diffSha256: string;
     implementationProvider: WorkerProviderId;
     verifierProvider: WorkerProviderId;
     commandAuditReferences: readonly string[];
@@ -304,6 +306,7 @@ function reportMatchesTask(report: VerificationReport, task: VerificationTask): 
     && report.cycle === task.cycle
     && report.implementationProvider === task.implementationProvider
     && report.verifierProvider === task.preferredAgent
+    && report.diffSha256 === task.gitDiff.sha256
     && report.diffSummary === task.gitDiff.summary
     && JSON.stringify(report.projectRoute) === JSON.stringify(task.projectRoute)
     && JSON.stringify(report.changedFiles) === JSON.stringify(task.changedFiles)
@@ -333,6 +336,7 @@ function auditFor(
       cycle: report.cycle,
       verdict: report.verdict,
       projectKey: report.projectRoute.projectKey,
+      diffSha256: report.diffSha256,
       implementationProvider: report.implementationProvider,
       verifierProvider: report.verifierProvider,
       commandAuditReferences: report.commands.map(({ auditReference }) => auditReference),
@@ -346,9 +350,9 @@ function auditFor(
 function outboxFor(
   report: VerificationReport,
   decision: CompletionDecision,
-  target?: VerificationCompletionTarget
+  target: VerificationCompletionTarget
 ): VerificationOutboxMessage | undefined {
-  const route = target === undefined ? {} : {
+  const route = {
     ...(target.commandId === undefined ? {} : { commandId: target.commandId }),
     channel: target.channel,
     destination: target.destination,
@@ -381,6 +385,7 @@ function outboxFor(
       projectRoute: report.projectRoute,
       changedFiles: [...report.changedFiles],
       diffSummary: report.diffSummary,
+      diffSha256: report.diffSha256,
       commands: report.commands,
       implementationProvider: report.implementationProvider,
       verifierProvider: report.verifierProvider,
@@ -392,24 +397,33 @@ function outboxFor(
 
 export class VerificationService {
   readonly #store: VerificationLifecycleStore;
-  readonly #completionTarget: VerificationCompletionTarget | undefined;
+  readonly #completionTarget: VerificationCompletionTarget;
   readonly #tasks = new Map<string, VerificationTask>();
-  readonly #completed = new Set<string>();
+  readonly #completed = new Map<string, Readonly<{
+    report: VerificationReport;
+    decision: CompletionDecision;
+  }>>();
+  readonly #fixTasks = new Map<string, FixTask>();
 
   constructor(options: Readonly<{
     store: VerificationLifecycleStore;
-    completionTarget?: VerificationCompletionTarget | undefined;
+    completionTarget: VerificationCompletionTarget;
   }>) {
     this.#store = options.store;
-    this.#completionTarget = options.completionTarget === undefined
-      ? undefined
-      : deepFreeze({ ...options.completionTarget });
+    if (options.completionTarget === undefined) {
+      throw new TypeError("verification completion target is required");
+    }
+    this.#completionTarget = deepFreeze({ ...options.completionTarget });
   }
 
   async start(input: VerificationInput): Promise<VerificationTask> {
     const task = createVerifierTask(input);
-    if (this.#tasks.has(task.taskId)) {
-      throw new Error(`Verification Task ${task.taskId} is already started`);
+    const existing = this.#tasks.get(task.taskId);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) !== JSON.stringify(task)) {
+        throw new Error(`conflicting verification start replay: ${task.taskId}`);
+      }
+      return existing;
     }
     await this.#store.saveVerificationTask(task);
     this.#tasks.set(task.taskId, task);
@@ -422,8 +436,12 @@ export class VerificationService {
     if (task === undefined) {
       throw new Error(`Verification Task ${report.verificationTaskId} is not known`);
     }
-    if (this.#completed.has(report.verificationTaskId)) {
-      throw new Error(`Verification Task ${report.verificationTaskId} is already complete`);
+    const completed = this.#completed.get(report.verificationTaskId);
+    if (completed !== undefined) {
+      if (JSON.stringify(completed.report) !== JSON.stringify(report)) {
+        throw new Error("conflicting verification completion replay");
+      }
+      return completed.decision;
     }
     if (!reportMatchesTask(report, task)) {
       throw new TypeError("verification report does not match its immutable Task");
@@ -441,7 +459,12 @@ export class VerificationService {
       ...(outboxMessage === undefined ? {} : { outboxMessage })
     }) as VerificationCommit;
     await this.#store.commitVerification(commit);
-    this.#completed.add(report.verificationTaskId);
+    if (fixTask !== undefined) this.#fixTasks.set(report.verificationTaskId, fixTask);
+    this.#completed.set(report.verificationTaskId, deepFreeze({ report, decision }));
     return decision;
+  }
+
+  fixTaskFor(verificationTaskId: string): FixTask | undefined {
+    return this.#fixTasks.get(verificationTaskId);
   }
 }

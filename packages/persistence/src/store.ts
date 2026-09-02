@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   ChannelMessageJsonSchema,
@@ -95,6 +96,46 @@ const WorktreeReleaseUpdateSchema = z.object({
   releasedAt: z.string().datetime()
 }).strict();
 
+const LifecycleRunStoreSchema = z.object({
+  id: z.string().min(1),
+  proposalId: z.string().min(1),
+  commandId: z.string().min(1),
+  state: z.string().min(1)
+}).passthrough();
+
+const LifecycleTaskStoreSchema = z.object({
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  state: z.string().min(1)
+}).passthrough();
+
+const LifecycleDispatchStoreSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  state: z.string().min(1)
+}).passthrough();
+
+const LifecycleTransitionStoreSchema = z.object({
+  entity: z.enum(["run", "task", "dispatch"]),
+  entityId: z.string().min(1),
+  from: z.string().min(1),
+  to: z.string().min(1),
+  at: z.string().datetime()
+}).passthrough();
+
+const LifecycleMessageStoreSchema = z.object({
+  kind: z.string().min(1),
+  messageId: z.string().min(1),
+  dispatchId: z.string().min(1)
+}).passthrough();
+
+const WorkerDoneCommitStoreSchema = z.object({
+  message: LifecycleMessageStoreSchema,
+  dispatch: LifecycleDispatchStoreSchema,
+  task: LifecycleTaskStoreSchema,
+  transitions: z.array(LifecycleTransitionStoreSchema).length(2)
+}).strict();
+
 export type InboxEvent = z.infer<typeof InboxEventSchema>;
 export type EnqueueOutboxMessage = z.infer<typeof EnqueueOutboxMessageSchema>;
 export type OutboxMessage = z.infer<typeof OutboxMessageSchema>;
@@ -169,12 +210,13 @@ const VerificationReportStoreSchema = z.object({
     repositoryPath: z.string().min(1)
   }).strict(),
   changedFiles: z.array(z.string().min(1)),
+  diffSha256: z.string().regex(/^[a-f0-9]{64}$/),
   diffSummary: z.string().min(1),
   commands: z.array(z.object({
     command: z.string().min(1),
     exitCode: z.number().int(),
-    result: z.string().min(1),
-    auditReference: z.string().min(1)
+    summary: z.string().min(1).max(512),
+    auditReference: z.string().min(1).max(256)
   }).strict()).min(1),
   implementationProvider: z.enum(["codex", "claude"]),
   verifierProvider: z.enum(["codex", "claude"]),
@@ -244,6 +286,7 @@ const VerificationAuditDataStoreSchema = z.object({
   cycle: z.number().int().min(0).max(2),
   verdict: z.enum(["pass", "fail"]),
   projectKey: z.string().min(1),
+  diffSha256: z.string().regex(/^[a-f0-9]{64}$/),
   implementationProvider: z.enum(["codex", "claude"]),
   verifierProvider: z.enum(["codex", "claude"]),
   commandAuditReferences: z.array(z.string().min(1)),
@@ -293,6 +336,74 @@ const VerificationCommitStoreSchema = z.object({
   }).strict().optional()
 }).strict();
 
+const ProviderStartEvidenceStoreSchema = z.object({
+  kind: z.literal("provider_start"),
+  protocol: z.literal(1),
+  provider: z.enum(["codex", "claude"]),
+  assignmentTaskId: z.string().min(1),
+  assignmentDispatchId: z.string().min(1),
+  orcaTaskId: z.string().min(1),
+  orcaDispatchId: z.string().min(1),
+  promptArtifact: z.object({
+    protocol: z.literal(1),
+    artifactId: z.string().regex(/^assignment:[a-f0-9]{64}$/u),
+    path: z.string().min(1),
+    version: z.number().int().positive(),
+    ownerDispatchId: z.string().min(1),
+    content: z.string().min(1),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/u)
+  }).strict(),
+  boundary: z.object({
+    lifecycleAuthority: z.literal("orca_worker_start"),
+    promptDelivery: z.literal("prestart_atomic_assignment_artifact"),
+    attemptContext: z.literal("orca_injected_task_spec_and_prestart_assignment"),
+    credentialSource: z.literal("provider_authenticated_cli"),
+    postStartMail: z.literal(false),
+    providerChildEnvironmentIsolation: z.object({ kind: z.string().min(1) }).passthrough(),
+    assignmentArtifactAccess: z.object({ kind: z.literal("same_host") }).strict()
+  }).strict(),
+  orcaReceipt: z.object({
+    id: z.string().min(1),
+    ok: z.literal(true),
+    result: z.object({
+      dispatchId: z.string().min(1),
+      taskId: z.string().min(1)
+    }).passthrough()
+  }).passthrough()
+}).strict();
+
+const ProviderInspectEvidenceStoreSchema = z.object({
+  kind: z.literal("provider_inspect"),
+  protocol: z.literal(1),
+  provider: z.enum(["codex", "claude"]),
+  dispatchId: z.string().min(1),
+  workerState: z.string().min(1),
+  showReceipt: z.object({
+    id: z.string().min(1),
+    ok: z.literal(true),
+    result: z.object({
+      dispatch: z.object({ id: z.string().min(1) }).passthrough(),
+      worker: z.object({ dispatch_id: z.string().min(1) }).passthrough(),
+      observation: z.object({ exactWorker: z.literal(true) }).passthrough(),
+      terminalResource: z.object({ id: z.string().min(1) }).passthrough()
+    }).passthrough()
+  }).passthrough(),
+  readReceipt: z.object({
+    id: z.string().min(1),
+    ok: z.literal(true),
+    result: z.object({ dispatchId: z.string().min(1) }).passthrough()
+  }).passthrough()
+}).strict();
+
+const ProviderTerminalEvidenceStoreSchema = z.object({
+  id: z.string().min(1),
+  ok: z.literal(true),
+  result: z.object({
+    dispatchId: z.string().min(1),
+    verdict: z.enum(["released", "stopped"])
+  }).passthrough()
+}).passthrough();
+
 export type StoredTaskRecord = Readonly<{
   id: string;
   taskId: string;
@@ -311,6 +422,13 @@ interface CommandRow {
 
 interface CommandIdentityRow {
   id: string;
+}
+
+interface StoredDispatchRow {
+  id: string;
+  task_id: string;
+  state: string;
+  payload_json: string;
 }
 
 type CommandInsertResult = Readonly<{
@@ -373,6 +491,68 @@ function parseJson(value: string): unknown {
   return JSON.parse(value) as unknown;
 }
 
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function verificationDecisionFor(
+  report: z.infer<typeof VerificationReportStoreSchema>
+): z.infer<typeof VerificationDecisionStoreSchema> {
+  if (report.verdict === "pass") {
+    return { kind: "verified_success", evidence: [...report.evidence] };
+  }
+  if (report.cycle < 2) {
+    return {
+      kind: "create_fix_task",
+      findings: [...report.findings],
+      nextCycle: report.cycle + 1
+    };
+  }
+  return { kind: "intervention_required", findings: [...report.findings] };
+}
+
+function hasBoundProviderReceipts(
+  payload: Record<string, unknown>,
+  provider: "codex" | "claude",
+  taskId: string,
+  dispatchId: string
+): boolean {
+  const startResult = ProviderStartEvidenceStoreSchema.safeParse(payload.providerStartReceipt);
+  const inspectionsResult = z.array(ProviderInspectEvidenceStoreSchema).min(1)
+    .safeParse(payload.providerInspectReceipts);
+  const terminalResult = ProviderTerminalEvidenceStoreSchema.safeParse(
+    payload.releaseReceipt ?? payload.fenceReceipt
+  );
+  if (!startResult.success || !inspectionsResult.success || !terminalResult.success) return false;
+  const start = startResult.data;
+  const startReceiptResult = start.orcaReceipt.result;
+  const orcaDispatchId = start.orcaDispatchId;
+  const terminal = terminalResult.data.result;
+  const assignment = objectValue(payload.assignment);
+  return payload.providerId === provider
+    && payload.id === dispatchId
+    && payload.taskId === taskId
+    && assignment?.taskId === taskId
+    && assignment.dispatchId === dispatchId
+    && start.provider === provider
+    && start.assignmentTaskId === taskId
+    && start.assignmentDispatchId === dispatchId
+    && startReceiptResult.dispatchId === orcaDispatchId
+    && startReceiptResult.taskId === start.orcaTaskId
+    && inspectionsResult.data.every((inspection) => {
+      return inspection.provider === provider
+        && inspection.dispatchId === orcaDispatchId
+        && inspection.showReceipt.result.dispatch.id === orcaDispatchId
+        && inspection.showReceipt.result.worker.dispatch_id === orcaDispatchId
+        && inspection.readReceipt.result.dispatchId === orcaDispatchId;
+    })
+    && terminal.dispatchId === orcaDispatchId
+    && payload.releaseFailure === undefined
+    && payload.fenceFailure === undefined;
+}
+
 function outboxMessageFromRow(row: OutboxMessageRow): OutboxMessage {
   const candidate = {
     id: row.id,
@@ -414,6 +594,167 @@ function worktreeLeaseFromRow(row: WorktreeLockRow): WorktreeLease {
 
 export class ControlStore implements CommandIngress {
   constructor(private readonly database: Database.Database) {}
+
+  saveRun(recordInput: unknown): void {
+    const payload = JsonValueSchema.parse(recordInput);
+    const record = LifecycleRunStoreSchema.parse(payload);
+    const now = new Date().toISOString();
+    const existing = this.database.prepare(`
+      SELECT command_id
+      FROM runs
+      WHERE id = ?
+    `).get(record.id) as { command_id: string } | undefined;
+    if (existing === undefined) {
+      this.database.prepare(`
+        INSERT INTO runs (
+          id, command_id, execution_proposal_id, state, payload_json, created_at, updated_at
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+      `).run(record.id, record.commandId, record.state, JSON.stringify(payload), now, now);
+      return;
+    }
+    if (existing.command_id !== record.commandId) {
+      throw new Error(`Run ${record.id} belongs to another Command`);
+    }
+    this.database.prepare(`
+      UPDATE runs SET state = ?, payload_json = ?, updated_at = ? WHERE id = ?
+    `).run(record.state, JSON.stringify(payload), now, record.id);
+  }
+
+  saveTask(recordInput: unknown): void {
+    const payload = JsonValueSchema.parse(recordInput);
+    const record = LifecycleTaskStoreSchema.parse(payload);
+    const now = new Date().toISOString();
+    const existing = this.database.prepare(`
+      SELECT run_id, payload_json
+      FROM tasks
+      WHERE id = ?
+    `).get(record.id) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+    if (existing === undefined) {
+      this.database.prepare(`
+        INSERT INTO tasks (id, run_id, state, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(record.id, record.runId, record.state, JSON.stringify(payload), now, now);
+      return;
+    }
+    if (existing.run_id !== record.runId) {
+      throw new Error(`Task ${record.id} belongs to another Run`);
+    }
+    const existingPayload = objectValue(parseJson(existing.payload_json));
+    const merged = JsonValueSchema.parse({ ...(existingPayload ?? {}), ...record });
+    this.database.prepare(`
+      UPDATE tasks SET state = ?, payload_json = ?, updated_at = ? WHERE id = ?
+    `).run(record.state, JSON.stringify(merged), now, record.id);
+  }
+
+  saveDispatch(recordInput: unknown): void {
+    const payload = JsonValueSchema.parse(recordInput);
+    const record = LifecycleDispatchStoreSchema.parse(payload);
+    const now = new Date().toISOString();
+    const existing = this.database.prepare(`
+      SELECT task_id
+      FROM dispatches
+      WHERE id = ?
+    `).get(record.id) as { task_id: string } | undefined;
+    if (existing === undefined) {
+      this.database.prepare(`
+        INSERT INTO dispatches (id, task_id, state, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(record.id, record.taskId, record.state, JSON.stringify(payload), now, now);
+      return;
+    }
+    if (existing.task_id !== record.taskId) {
+      throw new Error(`Dispatch ${record.id} belongs to another Task`);
+    }
+    this.database.prepare(`
+      UPDATE dispatches SET state = ?, payload_json = ?, updated_at = ? WHERE id = ?
+    `).run(record.state, JSON.stringify(payload), now, record.id);
+  }
+
+  appendTransition(transitionInput: unknown): void {
+    const transition = LifecycleTransitionStoreSchema.parse(
+      JsonValueSchema.parse(transitionInput)
+    );
+    this.database.prepare(`
+      INSERT INTO audit_events (id, subject_id, event_type, data_json, created_at)
+      VALUES (?, ?, 'lifecycle.transition', ?, ?)
+    `).run(
+      `transition:${randomUUID()}`,
+      transition.entityId,
+      JSON.stringify(transition),
+      transition.at
+    );
+  }
+
+  appendMessageOnce(messageInput: unknown): "inserted" | "duplicate" {
+    const message = LifecycleMessageStoreSchema.parse(JsonValueSchema.parse(messageInput));
+    const result = this.database.prepare(`
+      INSERT INTO audit_events (id, subject_id, event_type, data_json, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      `worker-message:${message.messageId}`,
+      message.dispatchId,
+      `worker.${message.kind}`,
+      JSON.stringify(message),
+      new Date().toISOString()
+    );
+    return result.changes === 1 ? "inserted" : "duplicate";
+  }
+
+  commitWorkerDone(inputValue: unknown): "inserted" | "duplicate" {
+    const input = WorkerDoneCommitStoreSchema.parse(JsonValueSchema.parse(inputValue));
+    return this.database.transaction(() => {
+      const messageId = `worker-message:${input.message.messageId}`;
+      const existing = this.database.prepare(`
+        SELECT id FROM audit_events WHERE id = ?
+      `).get(messageId) as { id: string } | undefined;
+      if (existing !== undefined) return "duplicate" as const;
+      const dispatchUpdate = this.database.prepare(`
+        UPDATE dispatches SET state = ?, payload_json = ?, updated_at = ?
+        WHERE id = ? AND task_id = ? AND state = 'running'
+      `).run(
+        input.dispatch.state,
+        JSON.stringify(input.dispatch),
+        new Date().toISOString(),
+        input.dispatch.id,
+        input.dispatch.taskId
+      );
+      if (dispatchUpdate.changes !== 1) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during worker_done`);
+      }
+      const taskRow = this.database.prepare(`
+        SELECT run_id, payload_json FROM tasks WHERE id = ?
+      `).get(input.task.id) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+      if (taskRow === undefined || taskRow.run_id !== input.task.runId) {
+        throw new Error(`Task ${input.task.id} is not persisted for worker_done`);
+      }
+      const taskPayload = objectValue(parseJson(taskRow.payload_json));
+      const mergedTask = JsonValueSchema.parse({ ...(taskPayload ?? {}), ...input.task });
+      const taskUpdate = this.database.prepare(`
+        UPDATE tasks SET state = ?, payload_json = ?, updated_at = ?
+        WHERE id = ? AND state = 'running'
+      `).run(
+        input.task.state,
+        JSON.stringify(mergedTask),
+        new Date().toISOString(),
+        input.task.id
+      );
+      if (taskUpdate.changes !== 1) {
+        throw new Error(`Task ${input.task.id} changed during worker_done`);
+      }
+      this.database.prepare(`
+        INSERT INTO audit_events (id, subject_id, event_type, data_json, created_at)
+        VALUES (?, ?, 'worker.worker_done', ?, ?)
+      `).run(
+        messageId,
+        input.message.dispatchId,
+        JSON.stringify(input.message),
+        new Date().toISOString()
+      );
+      for (const transition of input.transitions) this.appendTransition(transition);
+      return "inserted" as const;
+    }).immediate();
+  }
 
   async accept(input: CommandEnvelope): Promise<Readonly<{
     kind: "accepted" | "duplicate";
@@ -599,10 +940,13 @@ export class ControlStore implements CommandIngress {
       WHERE id = ?
     `).get(task.taskId) as Omit<StoredTaskRow, "id"> | undefined;
     if (existing !== undefined) {
+      const existingPayload = objectValue(parseJson(existing.payload_json));
       if (
         existing.run_id !== task.runId
-        || existing.state !== "planned"
-        || existing.payload_json !== JSON.stringify(payload)
+        || existingPayload === undefined
+        || Object.entries(objectValue(payload) ?? {}).some(([key, value]) =>
+          !isDeepStrictEqual(existingPayload[key], value)
+        )
       ) {
         throw new Error(`Task ${task.taskId} already exists with different verification inputs`);
       }
@@ -647,6 +991,10 @@ export class ControlStore implements CommandIngress {
     if (report.implementationProvider === report.verifierProvider) {
       throw new TypeError("verification report must use the opposite model family");
     }
+    const recomputedDecision = verificationDecisionFor(report);
+    if (JSON.stringify(decision) !== JSON.stringify(recomputedDecision)) {
+      throw new TypeError("verification decision does not match the recomputed completion gate");
+    }
     const expectedAuditEvent = decision.kind === "verified_success"
       ? "verification.passed"
       : decision.kind === "intervention_required"
@@ -665,6 +1013,7 @@ export class ControlStore implements CommandIngress {
       || audit.data.implementationProvider !== report.implementationProvider
       || audit.data.verifierProvider !== report.verifierProvider
       || audit.data.projectKey !== report.projectRoute.projectKey
+      || audit.data.diffSha256 !== report.diffSha256
       || audit.data.findingCount !== report.findings.length
       || JSON.stringify(audit.data.commandAuditReferences)
         !== JSON.stringify(report.commands.map(({ auditReference }) => auditReference))
@@ -712,6 +1061,7 @@ export class ControlStore implements CommandIngress {
         payload.implementationProvider !== report.implementationProvider
         || payload.verifierProvider !== report.verifierProvider
         || payload.diffSummary !== report.diffSummary
+        || payload.diffSha256 !== report.diffSha256
         || JSON.stringify(payload.projectRoute) !== JSON.stringify(report.projectRoute)
         || JSON.stringify(payload.changedFiles) !== JSON.stringify(report.changedFiles)
         || JSON.stringify(payload.commands) !== JSON.stringify(report.commands)
@@ -737,12 +1087,98 @@ export class ControlStore implements CommandIngress {
     }
 
     this.database.transaction(() => {
-      const row = this.database.prepare(`
-        SELECT run_id, payload_json
+      const completionOwner = this.database.prepare(`
+        SELECT id, run_id, state, payload_json
         FROM tasks
         WHERE id = ?
-      `).get(report.verificationTaskId) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
-      if (row === undefined || row.run_id !== report.runId) {
+      `).get(report.verificationTaskId) as StoredTaskRow | undefined;
+      if (
+        completionOwner !== undefined
+        && ["verified_success", "verification_failed", "intervention_required"]
+          .includes(completionOwner.state)
+      ) {
+        const payload = objectValue(parseJson(completionOwner.payload_json));
+        const expectedState = decision.kind === "verified_success"
+          ? "verified_success"
+          : decision.kind === "intervention_required"
+            ? "intervention_required"
+            : "verification_failed";
+        if (
+          completionOwner.run_id === report.runId
+          && completionOwner.state === expectedState
+          && JSON.stringify(payload?.report) === JSON.stringify(report)
+          && JSON.stringify(payload?.completionDecision) === JSON.stringify(decision)
+          && objectValue(payload?.completionStatus)?.ownerReportId === report.reportId
+          && objectValue(payload?.completionStatus)?.status === "complete"
+        ) return;
+        throw new Error(`conflicting verification completion replay: ${report.verificationTaskId}`);
+      }
+      const runRow = this.database.prepare(`
+        SELECT id, state
+        FROM runs
+        WHERE id = ?
+      `).get(report.runId) as TaskRow | undefined;
+      if (runRow === undefined || runRow.state !== "awaiting_verification") {
+        throw new Error(`Run ${report.runId} is not awaiting_verification`);
+      }
+      const implementationTask = this.database.prepare(`
+        SELECT id, run_id, state, payload_json
+        FROM tasks
+        WHERE id = ?
+      `).get(report.implementationTaskId) as StoredTaskRow | undefined;
+      const implementationTaskPayload = objectValue(
+        implementationTask === undefined ? undefined : parseJson(implementationTask.payload_json)
+      );
+      if (
+        implementationTask === undefined
+        || implementationTask.run_id !== report.runId
+        || implementationTask.state !== "worker_done"
+        || implementationTaskPayload?.role !== "implement"
+        || implementationTaskPayload.preferredAgent !== report.implementationProvider
+      ) {
+        throw new Error(
+          `implementation Task ${report.implementationTaskId} is not durably worker_done`
+        );
+      }
+      const implementationDispatch = this.database.prepare(`
+        SELECT id, task_id, state, payload_json
+        FROM dispatches
+        WHERE id = ?
+      `).get(report.implementationDispatchId) as StoredDispatchRow | undefined;
+      if (
+        implementationDispatch === undefined
+        || implementationDispatch.task_id !== report.implementationTaskId
+        || implementationDispatch.state !== "worker_done"
+      ) {
+        throw new Error(
+          `implementation Dispatch ${report.implementationDispatchId} is not durably worker_done`
+        );
+      }
+      const implementationDispatchPayload = objectValue(parseJson(
+        implementationDispatch.payload_json
+      ));
+      if (
+        implementationDispatchPayload === undefined
+        || !hasBoundProviderReceipts(
+          implementationDispatchPayload,
+          report.implementationProvider,
+          report.implementationTaskId,
+          report.implementationDispatchId
+        )
+        || objectValue(implementationDispatchPayload.assignment)?.preferredAgent
+          !== report.implementationProvider
+      ) {
+        throw new TypeError("implementation Dispatch provider evidence is not durably bound");
+      }
+      const row = this.database.prepare(`
+        SELECT run_id, state, payload_json
+        FROM tasks
+        WHERE id = ?
+      `).get(report.verificationTaskId) as Pick<
+        StoredTaskRow,
+        "run_id" | "state" | "payload_json"
+      > | undefined;
+      if (row === undefined || row.run_id !== report.runId || row.state !== "worker_done") {
         throw new Error(`Verification Task ${report.verificationTaskId} is not persisted for its Run`);
       }
       const taskPayload = StoredGeneratedTaskSchema.parse(parseJson(row.payload_json));
@@ -757,6 +1193,7 @@ export class ControlStore implements CommandIngress {
         || typeof taskPayload.gitDiff !== "object"
         || taskPayload.gitDiff === null
         || (taskPayload.gitDiff as { summary?: unknown }).summary !== report.diffSummary
+        || (taskPayload.gitDiff as { sha256?: unknown }).sha256 !== report.diffSha256
         || JSON.stringify(taskPayload.projectRoute) !== JSON.stringify(report.projectRoute)
         || JSON.stringify(taskPayload.changedFiles) !== JSON.stringify(report.changedFiles)
         || JSON.stringify(
@@ -775,6 +1212,37 @@ export class ControlStore implements CommandIngress {
       ) {
         throw new TypeError("verification report does not own the persisted Task");
       }
+      const verifierDispatchRows = this.database.prepare(`
+        SELECT id, task_id, state, payload_json
+        FROM dispatches
+        WHERE task_id = ?
+      `).all(report.verificationTaskId) as StoredDispatchRow[];
+      if (verifierDispatchRows.length !== 1) {
+        throw new Error(`Verification Task ${report.verificationTaskId} has no exact Dispatch`);
+      }
+      const verifierDispatch = verifierDispatchRows[0] as StoredDispatchRow;
+      const verifierDispatchPayload = objectValue(parseJson(verifierDispatch.payload_json));
+      const verifierAssignment = objectValue(verifierDispatchPayload?.assignment);
+      if (
+        verifierDispatch.state !== "worker_done"
+        || verifierDispatchPayload === undefined
+        || verifierAssignment?.role !== "verify"
+        || verifierAssignment.preferredAgent !== report.verifierProvider
+        || verifierAssignment.permissions !== "read-only"
+        || verifierAssignment.nestedWorkers !== "forbidden"
+        || JSON.stringify(verifierAssignment.acceptanceCommands)
+          !== JSON.stringify(report.commands.map(({ command }) => command))
+        || JSON.stringify(verifierDispatchPayload.verificationCommands)
+          !== JSON.stringify(report.commands)
+        || !hasBoundProviderReceipts(
+          verifierDispatchPayload,
+          report.verifierProvider,
+          report.verificationTaskId,
+          verifierDispatch.id
+        )
+      ) {
+        throw new TypeError("verification report is not bound to durable verifier Dispatch evidence");
+      }
       if (fixTask !== undefined && (
         JSON.stringify(fixTask.requestedScope) !== JSON.stringify(taskPayload.requestedScope)
         || JSON.stringify(fixTask.prohibitedEffects)
@@ -787,13 +1255,24 @@ export class ControlStore implements CommandIngress {
         : intervening
           ? "intervention_required"
           : "verification_failed";
-      const durablePayload = JsonValueSchema.parse({ ...taskPayload, report });
+      const durablePayload = JsonValueSchema.parse({
+        ...taskPayload,
+        report,
+        completionDecision: decision,
+        completionStatus: {
+          ownerReportId: report.reportId,
+          status: "complete"
+        }
+      });
       const now = new Date().toISOString();
-      this.database.prepare(`
+      const taskUpdate = this.database.prepare(`
         UPDATE tasks
         SET state = ?, payload_json = ?, updated_at = ?
-        WHERE id = ? AND run_id = ?
+        WHERE id = ? AND run_id = ? AND state = 'worker_done'
       `).run(taskState, JSON.stringify(durablePayload), now, report.verificationTaskId, report.runId);
+      if (taskUpdate.changes !== 1) {
+        throw new Error(`Verification Task ${report.verificationTaskId} changed during completion`);
+      }
 
       if (fixTask !== undefined) {
         const fixPayload = JsonValueSchema.parse(fixTask);
@@ -803,9 +1282,32 @@ export class ControlStore implements CommandIngress {
         `).run(fixTask.taskId, fixTask.runId, JSON.stringify(fixPayload), now, now);
       }
 
-      const runState = passing ? "verified_success" : intervening ? "intervention_required" : "active";
+      const outstanding = this.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM tasks
+        WHERE run_id = ?
+          AND (
+            (
+              json_extract(payload_json, '$.role') = 'verify'
+              AND state NOT IN ('verified_success', 'verification_failed', 'intervention_required')
+            )
+            OR (
+              json_extract(payload_json, '$.sourceVerificationTaskId') IS NOT NULL
+              AND state NOT IN ('worker_done', 'intervention_required')
+            )
+          )
+      `).get(report.runId) as { count: number };
+      const finalPassingReport = passing && outstanding.count === 0;
+      const runState = finalPassingReport
+        ? "verified_success"
+        : intervening
+          ? "intervention_required"
+          : fixing
+            ? "active"
+            : "awaiting_verification";
       const runUpdate = this.database.prepare(`
-        UPDATE runs SET state = ?, updated_at = ? WHERE id = ?
+        UPDATE runs SET state = ?, updated_at = ?
+        WHERE id = ? AND state = 'awaiting_verification'
       `).run(runState, now, report.runId);
       if (runUpdate.changes !== 1) throw new Error(`Run ${report.runId} is not persisted`);
 
@@ -815,7 +1317,7 @@ export class ControlStore implements CommandIngress {
         eventType: audit.eventType,
         data: audit.data
       });
-      if (outboxMessage !== undefined) {
+      if (outboxMessage !== undefined && (!passing || finalPassingReport)) {
         this.enqueueOutbox({
           id: outboxMessage.id,
           ...(outboxMessage.commandId === undefined ? {} : { commandId: outboxMessage.commandId }),
