@@ -21,7 +21,8 @@ import {
   type RunRecord,
   type TaskRecord,
   type WorkerAssignment,
-  type WorkerMessage
+  type WorkerMessage,
+  type WorkerReleaseFailure
 } from "./lifecycle.js";
 import {
   type CurrentWorktreeApproval,
@@ -83,6 +84,10 @@ export type ExecutionReviewRequired = WorktreePlacement & { kind: "review_requir
 }> | Readonly<{
   kind: "review_required";
   reason: "l0_requires_investigation_tasks";
+}> | Readonly<{
+  kind: "review_required";
+  reason: "worker_release_failed";
+  dispatchId: string;
 }>;
 
 export type ExecutionStart = ExecutionReviewRequired | Readonly<{
@@ -127,6 +132,7 @@ interface DispatchContext {
   readonly assignment: WorkerAssignment;
   placement: ReadyWorktreePlacement;
   orcaDispatchId?: string;
+  editingLeaseHeld: boolean;
 }
 
 interface TaskContext {
@@ -282,7 +288,38 @@ function dispatchIdFrom(receipt: OrcaReceipt): string {
   return result.dispatchId;
 }
 
+function releaseDispatchIdFrom(receipt: OrcaReceipt): string {
+  const result = receipt.result as { dispatchId?: unknown };
+  if (typeof result.dispatchId !== "string" || result.dispatchId.length === 0) {
+    throw Object.assign(new Error("validated release receipt has no Dispatch ID"), {
+      code: "orca_release_receipt_invalid",
+      retryable: false
+    });
+  }
+  return result.dispatchId;
+}
+
+function releaseFailure(error: unknown): WorkerReleaseFailure {
+  const value = error as { code?: unknown; retryable?: unknown };
+  return Object.freeze({
+    code: typeof value?.code === "string" && value.code.trim().length > 0
+      ? value.code
+      : "orca_release_failed",
+    retryable: value?.retryable === true
+  });
+}
+
 function taskSpec(task: TaskContext): string {
+  const {
+    project,
+    repo,
+    base,
+    fileScope,
+    acceptanceCommands,
+    prohibitedEffects,
+    permissions,
+    nestedWorkers
+  } = task.initialAssignment;
   return JSON.stringify({
     protocol: 1,
     task: {
@@ -290,9 +327,19 @@ function taskSpec(task: TaskContext): string {
       localId: task.task.localId,
       title: task.task.title,
       role: task.task.role,
+      preferredAgent: task.task.preferredAgent,
       dependsOn: task.task.dependsOn
     },
-    assignment: task.initialAssignment,
+    authorization: {
+      project,
+      repo,
+      base,
+      fileScope,
+      acceptanceCommands,
+      prohibitedEffects,
+      permissions,
+      nestedWorkers
+    },
     dispatchLinkage: {
       kind: "hq_receipt_linked_dispatch",
       taskId: task.localId
@@ -368,34 +415,63 @@ export class ExecutionService {
     if (placement.kind !== "ready") return placement;
 
     const context = this.#context(input, proposal, project, sortedTasks, placement);
-    await this.#planRunAndTasks(context);
-    const initialTasks = this.#readyPendingTasks(context);
+    const initialTasks = context.tasks.filter(({ task }) => task.dependsOn.length === 0);
     const permittedInitialTasks = placement.requiresEditingLease ? initialTasks.slice(0, 1) : initialTasks;
-    const initialDispatches: DispatchContext[] = [];
-    for (const task of permittedInitialTasks) {
-      initialDispatches.push(await this.#planDispatch(context, task, placement, 1));
-    }
+    const initialDispatches = permittedInitialTasks.map((task) =>
+      this.#prepareDispatch(context, task, placement, 1)
+    );
 
     let editingDispatch: DispatchContext | undefined;
     if (placement.requiresEditingLease) {
       editingDispatch = initialDispatches[0];
       if (editingDispatch === undefined) throw new Error("editing execution has no ready root Task");
-      const acquired = await this.#locks.acquire(this.#lease(context, editingDispatch));
+      const acquired = await this.#acquire(context, editingDispatch);
       if (acquired.kind !== "acquired") return lockReview(acquired);
     }
 
     try {
+      await this.#planRunAndTasks(context);
+      for (const dispatch of initialDispatches) {
+        await this.#persistDispatch(
+          context,
+          this.#taskForPreparedDispatch(context, dispatch),
+          dispatch
+        );
+      }
       if (placement.worktree.kind === "isolated") {
-        const materialized = await this.#placements.createWorktree(placement);
+        let materialized: WorktreePlacement;
+        try {
+          materialized = await this.#placements.createWorktree(placement);
+        } catch (error) {
+          if (editingDispatch !== undefined) {
+            await this.#markIntervention(
+              context,
+              this.#taskForPreparedDispatch(context, editingDispatch),
+              editingDispatch
+            );
+          }
+          throw error;
+        }
         if (materialized.kind !== "ready") {
-          if (editingDispatch !== undefined) await this.#release(context, editingDispatch);
+          if (editingDispatch !== undefined) {
+            await this.#markIntervention(
+              context,
+              this.#taskForPreparedDispatch(context, editingDispatch),
+              editingDispatch
+            );
+            await this.#release(context, editingDispatch);
+          }
           return materialized;
         }
       }
       await this.#createRunAndTasks(context);
       const dispatchIds: string[] = [];
       for (const dispatch of initialDispatches) {
-        dispatchIds.push(await this.#launch(context, this.#taskForDispatch(context, dispatch), dispatch));
+        dispatchIds.push(await this.#launchWithIntervention(
+          context,
+          this.#taskForDispatch(context, dispatch),
+          dispatch
+        ));
       }
       this.#runs.set(proposal.proposalId, context);
       return Object.freeze({
@@ -418,6 +494,9 @@ export class ExecutionService {
     if (recorded.kind === "duplicate") return recorded;
     if (message.kind !== "worker_done") return recorded;
 
+    const workerReleaseReview = await this.#releaseOrcaWorker(lookup);
+    if (workerReleaseReview !== undefined) return workerReleaseReview;
+
     if (lookup.dispatch.placement.requiresEditingLease) {
       const released = await this.#release(lookup.run, lookup.dispatch);
       if (released.kind === "conflict") {
@@ -433,12 +512,22 @@ export class ExecutionService {
     const permitted = lookup.run.placement.requiresEditingLease ? ready.slice(0, 1) : ready;
     const dispatched: string[] = [];
     for (const task of permitted) {
-      const dispatch = await this.#planDispatch(lookup.run, task, lookup.run.placement, 1);
+      const dispatch = this.#prepareDispatch(lookup.run, task, lookup.run.placement, 1);
       if (dispatch.placement.requiresEditingLease) {
-        const acquired = await this.#locks.acquire(this.#lease(lookup.run, dispatch));
-        if (acquired.kind !== "acquired") return lockReview(acquired);
+        const acquired = await this.#acquire(lookup.run, dispatch);
+        if (acquired.kind !== "acquired") {
+          await this.#lifecycle.transitionTask(task.localId, "intervention_required");
+          await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+          return lockReview(acquired);
+        }
       }
-      dispatched.push(await this.#launch(lookup.run, task, dispatch));
+      try {
+        await this.#persistDispatch(lookup.run, task, dispatch);
+      } catch (error) {
+        if (dispatch.placement.requiresEditingLease) await this.#release(lookup.run, dispatch);
+        throw error;
+      }
+      dispatched.push(await this.#launchWithIntervention(lookup.run, task, dispatch));
     }
 
     if (this.#allTasksDone(lookup.run)) {
@@ -483,6 +572,7 @@ export class ExecutionService {
       riskLevel: lookup.run.proposal.riskLevel,
       repositoryPath: lookup.run.project.absolutePath,
       baseRef: lookup.run.proposal.baseRef ?? lookup.run.project.defaultBaseRef,
+      pinnedBaseCommit: lookup.task.initialAssignment.base.commit,
       currentWorktreeApproval: lookup.run.authorized.currentWorktreeApproval,
       attempt: 2
     });
@@ -496,9 +586,9 @@ export class ExecutionService {
       });
     }
 
-    const retry = await this.#planDispatch(lookup.run, lookup.task, replacement, 2, input.dispatchId);
+    const retry = this.#prepareDispatch(lookup.run, lookup.task, replacement, 2);
     if (replacement.requiresEditingLease) {
-      const acquired = await this.#locks.acquire(this.#lease(lookup.run, retry));
+      const acquired = await this.#acquire(lookup.run, retry);
       if (acquired.kind !== "acquired") {
         await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
         await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
@@ -509,18 +599,27 @@ export class ExecutionService {
         });
       }
     }
+    try {
+      await this.#persistDispatch(lookup.run, lookup.task, retry, input.dispatchId);
+    } catch (error) {
+      if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
+      throw error;
+    }
     if (replacement.worktree.kind === "isolated") {
       let materialized: WorktreePlacement;
       try {
         materialized = await this.#placements.createWorktree(replacement);
       } catch (error) {
-        if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
+        try {
+          await this.#markIntervention(lookup.run, lookup.task, retry);
+        } finally {
+          if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
+        }
         throw error;
       }
       if (materialized.kind !== "ready") {
+        await this.#markIntervention(lookup.run, lookup.task, retry);
         if (replacement.requiresEditingLease) await this.#release(lookup.run, retry);
-        await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
-        await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
         return Object.freeze({
           kind: "intervention_required",
           reason: "replacement_not_conflict_free",
@@ -528,7 +627,12 @@ export class ExecutionService {
         });
       }
     }
-    const dispatchId = await this.#launch(lookup.run, lookup.task, retry, input.dispatchId);
+    const dispatchId = await this.#launchWithIntervention(
+      lookup.run,
+      lookup.task,
+      retry,
+      input.dispatchId
+    );
     lookup.run.placement = replacement;
     return Object.freeze({ kind: "retried", dispatchId, retryOf: input.dispatchId });
   }
@@ -583,34 +687,41 @@ export class ExecutionService {
     }
   }
 
-  async #planDispatch(
+  #prepareDispatch(
     context: RunContext,
     task: TaskContext,
     placement: ReadyWorktreePlacement,
-    attempt: number,
-    retryOf?: string
-  ): Promise<DispatchContext> {
+    attempt: number
+  ): DispatchContext {
     const localId = dispatchLocalId(context.proposal.proposalId, task.task.localId, attempt);
-    const dispatch: DispatchContext = {
+    return {
       localId,
       attempt,
       assignment: attempt === 1 && placement === context.placement
         ? task.initialAssignment
         : assignmentFor(context.proposal, context.project, task.task, placement, attempt),
-      placement
+      placement,
+      editingLeaseHeld: false
     };
+  }
+
+  async #persistDispatch(
+    context: RunContext,
+    task: TaskContext,
+    dispatch: DispatchContext,
+    retryOf?: string
+  ): Promise<void> {
     const record: DispatchRecord = Object.freeze({
-      id: localId,
+      id: dispatch.localId,
       taskId: task.localId,
-      attempt,
+      attempt: dispatch.attempt,
       state: "planned",
       assignment: dispatch.assignment,
       ...(retryOf === undefined ? {} : { retryOf })
     });
     await this.#lifecycle.planDispatch(record);
     task.dispatches.push(dispatch);
-    this.#dispatchLookup.set(localId, { run: context, task, dispatch });
-    return dispatch;
+    this.#dispatchLookup.set(dispatch.localId, { run: context, task, dispatch });
   }
 
   async #createRunAndTasks(context: RunContext): Promise<void> {
@@ -676,6 +787,34 @@ export class ExecutionService {
     return dispatch.orcaDispatchId;
   }
 
+  async #launchWithIntervention(
+    context: RunContext,
+    task: TaskContext,
+    dispatch: DispatchContext,
+    retryOf?: string
+  ): Promise<string> {
+    try {
+      return await this.#launch(context, task, dispatch, retryOf);
+    } catch (error) {
+      try {
+        await this.#markIntervention(context, task, dispatch);
+      } finally {
+        if (dispatch.placement.requiresEditingLease) await this.#release(context, dispatch);
+      }
+      throw error;
+    }
+  }
+
+  async #markIntervention(
+    context: RunContext,
+    task: TaskContext,
+    dispatch: DispatchContext
+  ): Promise<void> {
+    await this.#lifecycle.transitionDispatch(dispatch.localId, "intervention_required");
+    await this.#lifecycle.transitionTask(task.localId, "intervention_required");
+    await this.#lifecycle.transitionRun(context.localId, "intervention_required");
+  }
+
   #readyPendingTasks(context: RunContext): TaskContext[] {
     return context.tasks.filter((task) => {
       if (task.dispatches.length > 0) return false;
@@ -697,6 +836,12 @@ export class ExecutionService {
     return task;
   }
 
+  #taskForPreparedDispatch(context: RunContext, dispatch: DispatchContext): TaskContext {
+    const task = context.tasks.find((candidate) => candidate.localId === dispatch.assignment.taskId);
+    if (task === undefined) throw new Error(`Prepared Dispatch ${dispatch.localId} has no Task`);
+    return task;
+  }
+
   #lease(context: RunContext, dispatch: DispatchContext): EditingLeaseRequest {
     return Object.freeze({
       lockKey: context.project.lockKey,
@@ -709,10 +854,56 @@ export class ExecutionService {
     });
   }
 
-  #release(context: RunContext, dispatch: DispatchContext): Promise<EditingLockReleaseResult> {
-    return Promise.resolve(this.#locks.release({
+  async #acquire(
+    context: RunContext,
+    dispatch: DispatchContext
+  ): Promise<EditingLockAcquireResult> {
+    const result = await this.#locks.acquire(this.#lease(context, dispatch));
+    if (result.kind === "acquired") dispatch.editingLeaseHeld = true;
+    return result;
+  }
+
+  async #release(
+    context: RunContext,
+    dispatch: DispatchContext
+  ): Promise<EditingLockReleaseResult> {
+    if (!dispatch.editingLeaseHeld) return Object.freeze({ kind: "not_found" });
+    const result = await this.#locks.release({
       lockKey: context.project.lockKey,
       dispatchId: dispatch.localId
-    }));
+    });
+    dispatch.editingLeaseHeld = false;
+    return result;
+  }
+
+  async #releaseOrcaWorker(lookup: DispatchLookup): Promise<ExecutionReviewRequired | undefined> {
+    const dispatchId = lookup.dispatch.orcaDispatchId;
+    if (dispatchId === undefined) throw new Error(`Dispatch ${lookup.dispatch.localId} has no Orca receipt`);
+
+    let receipt: OrcaReceipt;
+    try {
+      receipt = await this.#orca.execute({ kind: "release_worker", dispatchId });
+      if (releaseDispatchIdFrom(receipt) !== dispatchId) {
+        throw Object.assign(new Error("release receipt does not match the exact Dispatch"), {
+          code: "orca_release_receipt_mismatch",
+          retryable: false
+        });
+      }
+    } catch (error) {
+      await this.#lifecycle.recordWorkerRelease(lookup.dispatch.localId, {
+        releaseFailure: releaseFailure(error)
+      });
+      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+      return Object.freeze({
+        kind: "review_required",
+        reason: "worker_release_failed",
+        dispatchId
+      });
+    }
+
+    await this.#lifecycle.recordWorkerRelease(lookup.dispatch.localId, {
+      releaseReceipt: receipt
+    });
+    return undefined;
   }
 }

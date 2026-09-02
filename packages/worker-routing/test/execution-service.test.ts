@@ -26,6 +26,7 @@ import {
   type RunRecord,
   type TaskRecord,
   type UserVisibleLifecycleMessage,
+  type WorkerDoneCommit,
   type WorkerMessage
 } from "../src/index.js";
 
@@ -83,6 +84,8 @@ function authorized(
 
 class RecordingOrca {
   readonly calls: OrcaOperation[] = [];
+  releaseError: Error | undefined;
+  dispatchErrorOnCall: number | undefined;
   #task = 0;
   #dispatch = 0;
 
@@ -101,6 +104,9 @@ class RecordingOrca {
       }
       case "dispatch_worker": {
         this.#dispatch += 1;
+        if (this.dispatchErrorOnCall === this.#dispatch) {
+          throw new Error(`synthetic worker-start failure ${this.#dispatch}`);
+        }
         return receipt(`dispatch-receipt-${this.#dispatch}`, {
           dispatchId: `orca-dispatch-${this.#dispatch}`,
           taskId: operation.taskId,
@@ -111,6 +117,13 @@ class RecordingOrca {
           effects: []
         });
       }
+      case "release_worker":
+        if (this.releaseError !== undefined) throw this.releaseError;
+        return receipt(`release-receipt-${operation.dispatchId}`, {
+          dispatchId: operation.dispatchId,
+          state: "released",
+          verdict: "released"
+        });
       default:
         throw new Error(`unexpected operation ${operation.kind}`);
     }
@@ -129,6 +142,7 @@ class MemoryLifecycleStore implements LifecycleStore {
   readonly messages: LifecycleMessage[] = [];
   readonly #messageIds = new Set<string>();
   readonly #doneDispatches = new Set<string>();
+  failWorkerDoneCommitOnce = false;
 
   async saveRun(record: RunRecord): Promise<void> {
     this.runs.set(record.id, structuredClone(record));
@@ -153,12 +167,17 @@ class MemoryLifecycleStore implements LifecycleStore {
     return "inserted";
   }
 
-  async recordWorkerDoneOnce(message: LifecycleMessage & { kind: "worker_done" }): Promise<
-    "inserted" | "duplicate"
-  > {
-    if (this.#doneDispatches.has(message.dispatchId)) return "duplicate";
-    this.#doneDispatches.add(message.dispatchId);
-    this.messages.push(structuredClone(message));
+  async commitWorkerDone(input: WorkerDoneCommit): Promise<"inserted" | "duplicate"> {
+    if (this.#doneDispatches.has(input.message.dispatchId)) return "duplicate";
+    if (this.failWorkerDoneCommitOnce) {
+      this.failWorkerDoneCommitOnce = false;
+      throw new Error("synthetic worker_done transaction failure");
+    }
+    this.#doneDispatches.add(input.message.dispatchId);
+    this.messages.push(structuredClone(input.message));
+    this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
+    this.tasks.set(input.task.id, structuredClone(input.task));
+    this.transitions.push(...structuredClone(input.transitions));
     return "inserted";
   }
 }
@@ -209,8 +228,8 @@ class MemoryGit implements GitWorktreePort {
     return structuredClone(this.status);
   }
 
-  async resolveRevision(_repositoryPath: string, _ref: string): Promise<string> {
-    return this.baseCommit;
+  async resolveRevision(_repositoryPath: string, ref: string): Promise<string> {
+    return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(ref) ? ref : this.baseCommit;
   }
 
   async branchOccupancy(_repositoryPath: string): Promise<readonly GitWorktreeOccupancy[]> {
@@ -273,6 +292,59 @@ afterEach(async () => {
 });
 
 describe("ExecutionService preflight and dispatch", () => {
+  it.each([
+    {
+      name: "duplicate Task IDs",
+      tasks: [proposal.tasks[0]!, { ...proposal.tasks[0]!, title: "Duplicate ID" }],
+      error: "duplicate Task localId: implement"
+    },
+    {
+      name: "an unknown dependency",
+      tasks: [{ ...proposal.tasks[0]!, dependsOn: ["missing"] }],
+      error: "Task implement has unknown dependency missing"
+    },
+    {
+      name: "a repeated dependency",
+      tasks: [
+        proposal.tasks[0]!,
+        {
+          ...proposal.tasks[0]!,
+          localId: "follow-up",
+          dependsOn: ["implement", "implement"]
+        }
+      ],
+      error: "Task follow-up repeats dependency implement"
+    },
+    {
+      name: "a self dependency",
+      tasks: [{ ...proposal.tasks[0]!, dependsOn: ["implement"] }],
+      error: "Task implement depends on itself"
+    },
+    {
+      name: "a general cycle",
+      tasks: [
+        { ...proposal.tasks[0]!, localId: "first", dependsOn: ["second"] },
+        { ...proposal.tasks[0]!, localId: "second", dependsOn: ["first"] }
+      ],
+      error: "execution proposal Task dependencies contain a cycle"
+    }
+  ])("rejects $name before any persistence, lock, Git, or Orca mutation", async ({ tasks, error }) => {
+    // Break caught: malformed graphs must fail before acquiring edit authority or creating public records.
+    const setupResult = setup();
+    const invalidProposal: ExecutionProposal = { ...proposal, tasks };
+
+    await expect(setupResult.service.start(authorized(invalidProposal))).rejects.toThrow(error);
+
+    expect(setupResult.store.runs.size).toBe(0);
+    expect(setupResult.store.tasks.size).toBe(0);
+    expect(setupResult.store.dispatches.size).toBe(0);
+    expect(setupResult.store.transitions).toEqual([]);
+    expect(setupResult.locks.acquired).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
+    expect(setupResult.git.created).toEqual([]);
+    expect(setupResult.orca.calls).toEqual([]);
+  });
+
   it("creates the Run and every Task before dispatching only the ready dependency root", async () => {
     // Break caught: dispatching while the DAG is only partially persisted can orphan dependency records.
     const { service, orca } = setup();
@@ -363,6 +435,29 @@ describe("ExecutionService preflight and dispatch", () => {
     });
   });
 
+  it("blocks an approved current checkout whose HEAD is not the resolved base commit", async () => {
+    // Break caught: approval for a dirty checkout does not authorize running from a stale base.
+    const git = new MemoryGit();
+    git.status = { ...git.status, dirty: true };
+    git.baseCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const { service, orca, locks } = setup(git);
+
+    await expect(service.start(authorized(proposal, project, {
+      approvalId: "approval-current-1",
+      worktreePath: project.absolutePath,
+      head: git.status.head
+    }))).resolves.toEqual({
+      kind: "review_required",
+      reason: "current_worktree_base_mismatch",
+      path: project.absolutePath,
+      head: git.status.head,
+      baseCommit: git.baseCommit
+    });
+
+    expect(orca.calls).toEqual([]);
+    expect(locks.acquired).toEqual([]);
+  });
+
   it("runs L0 investigation in the existing checkout without a worktree or editing lease", async () => {
     // Break caught: a read-only investigation must not acquire edit authority or mutate Git placement.
     const { service, git, locks, orca, store } = setup();
@@ -408,6 +503,35 @@ describe("ExecutionService preflight and dispatch", () => {
     });
   });
 
+  it("blocks L0 investigation when the existing checkout HEAD is not the resolved base commit", async () => {
+    // Break caught: read-only execution still must inspect the exact authorized revision.
+    const git = new MemoryGit();
+    git.baseCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const { service, orca, locks } = setup(git);
+    const readOnlyProposal: ExecutionProposal = {
+      ...proposal,
+      riskLevel: "L0",
+      tasks: [{
+        ...proposal.tasks[0]!,
+        localId: "investigate",
+        title: "Inspect current status",
+        role: "investigate"
+      }]
+    };
+
+    await expect(service.start(authorized(readOnlyProposal))).resolves.toEqual({
+      kind: "review_required",
+      reason: "current_worktree_base_mismatch",
+      path: project.absolutePath,
+      head: git.status.head,
+      baseCommit: git.baseCommit
+    });
+
+    expect(orca.calls).toEqual([]);
+    expect(locks.acquired).toEqual([]);
+    expect(git.created).toEqual([]);
+  });
+
   it("blocks a conflicting editing lock before creating a worktree or mutating Orca", async () => {
     // Break caught: checking the lease after worker start allows two editors into the same project.
     const setupResult = setup();
@@ -423,6 +547,16 @@ describe("ExecutionService preflight and dispatch", () => {
     });
     expect(setupResult.git.created).toEqual([]);
     expect(setupResult.orca.calls).toEqual([]);
+    expect(setupResult.store.runs.size).toBe(0);
+    expect(setupResult.store.tasks.size).toBe(0);
+    expect(setupResult.store.dispatches.size).toBe(0);
+    expect(setupResult.store.transitions).toEqual([]);
+
+    setupResult.locks.acquireResult = { kind: "acquired" };
+    await expect(setupResult.service.start(authorized())).resolves.toMatchObject({
+      kind: "started",
+      runId: "orca-run-1"
+    });
   });
 
   it("releases the editing lease when isolated worktree creation fails", async () => {
@@ -438,6 +572,26 @@ describe("ExecutionService preflight and dispatch", () => {
       dispatchId: "dispatch:proposal-1:implement:1"
     }]);
     expect(orca.calls).toEqual([]);
+  });
+
+  it("releases the exact initial lease and persists intervention when worker-start fails", async () => {
+    // Break caught: an Orca start rejection must not leave either edit authority or an active-looking Run.
+    const setupResult = setup();
+    setupResult.orca.dispatchErrorOnCall = 1;
+
+    await expect(setupResult.service.start(authorized()))
+      .rejects.toThrow("synthetic worker-start failure 1");
+
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1")?.state)
+      .toBe("intervention_required");
+    expect(setupResult.store.tasks.get("task:proposal-1:implement")?.state)
+      .toBe("intervention_required");
+    expect(setupResult.store.runs.get("run:proposal-1")?.state)
+      .toBe("intervention_required");
   });
 
   it("persists immutable inputs, public receipts, and every lifecycle transition", async () => {
@@ -513,7 +667,7 @@ describe("Git worktree placement", () => {
 describe("worker lifecycle", () => {
   it("persists questions and escalations but never publishes worker_done as success", async () => {
     // Break caught: treating a worker completion report as accepted success bypasses verification.
-    const { service, store, messages } = setup();
+    const { service, orca, store, messages } = setup();
     await service.start(authorized());
 
     const question: WorkerMessage = {
@@ -538,6 +692,7 @@ describe("worker lifecycle", () => {
 
     await expect(service.recordWorkerMessage(question)).resolves.toMatchObject({ kind: "recorded" });
     await expect(service.recordWorkerMessage(escalation)).resolves.toMatchObject({ kind: "recorded" });
+    expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toEqual([]);
     await expect(service.recordWorkerMessage(done)).resolves.toMatchObject({
       kind: "recorded",
       verificationRequired: true
@@ -546,6 +701,99 @@ describe("worker lifecycle", () => {
     expect(store.messages).toEqual([question, escalation, done]);
     expect(messages.messages).toEqual([question, escalation]);
     expect(messages.messages).not.toContainEqual(expect.objectContaining({ kind: "success" }));
+    expect(orca.calls.at(-1)).toEqual({
+      kind: "release_worker",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")).toMatchObject({
+      state: "worker_done",
+      releaseReceipt: {
+        id: "release-receipt-orca-dispatch-1",
+        result: { dispatchId: "orca-dispatch-1", verdict: "released" }
+      }
+    });
+  });
+
+  it("atomically rolls back worker_done dedupe and lifecycle transitions before redelivery", async () => {
+    // Break caught: reserving the completion key before its state transitions loses a redelivered completion.
+    const { service, orca, store } = setup();
+    const withDependency: ExecutionProposal = {
+      ...proposal,
+      tasks: [
+        proposal.tasks[0]!,
+        {
+          localId: "follow-up",
+          title: "Continue after implementation",
+          dependsOn: ["implement"],
+          role: "implement",
+          preferredAgent: "claude"
+        }
+      ]
+    };
+    await service.start(authorized(withDependency));
+    const done: WorkerMessage = {
+      kind: "worker_done",
+      messageId: "done-transaction-1",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    };
+    const transitionCount = store.transitions.length;
+    store.failWorkerDoneCommitOnce = true;
+
+    await expect(service.recordWorkerMessage(done))
+      .rejects.toThrow("synthetic worker_done transaction failure");
+    expect(store.messages).not.toContainEqual(done);
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")?.state).toBe("running");
+    expect(store.tasks.get("task:proposal-1:implement")?.state).toBe("running");
+    expect(store.transitions).toHaveLength(transitionCount);
+    expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toEqual([]);
+
+    await expect(service.recordWorkerMessage(done)).resolves.toMatchObject({
+      kind: "recorded",
+      dispatched: ["orca-dispatch-2"]
+    });
+    expect(store.messages.filter(({ kind }) => kind === "worker_done")).toEqual([done]);
+    expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toHaveLength(1);
+  });
+
+  it("persists an exact worker release failure and requires review without releasing its edit lease", async () => {
+    // Break caught: losing a worker-release failure can free the project while its terminal ownership is uncertain.
+    const { service, orca, locks, store } = setup();
+    orca.releaseError = Object.assign(new Error("synthetic Orca release failure"), {
+      code: "orca_release_unavailable",
+      retryable: true
+    });
+    await service.start(authorized());
+    const done: WorkerMessage = {
+      kind: "worker_done",
+      messageId: "done-release-failure",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    };
+
+    await expect(service.recordWorkerMessage(done)).resolves.toEqual({
+      kind: "review_required",
+      reason: "worker_release_failed",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(orca.calls.at(-1)).toEqual({
+      kind: "release_worker",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")).toMatchObject({
+      state: "worker_done",
+      releaseFailure: {
+        code: "orca_release_unavailable",
+        retryable: true
+      }
+    });
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+    expect(locks.released).toEqual([]);
+
+    await expect(service.recordWorkerMessage(done)).resolves.toEqual({ kind: "duplicate" });
+    expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toHaveLength(1);
   });
 
   it("persists worker_done once and dispatches each newly unblocked dependency once", async () => {
@@ -589,15 +837,100 @@ describe("worker lifecycle", () => {
       "create_task",
       "create_task",
       "dispatch_worker",
+      "release_worker",
       "dispatch_worker"
     ]);
     expect(store.messages.filter(({ kind }) => kind === "worker_done")).toHaveLength(1);
+  });
+
+  it("releases the exact dependency lease and persists intervention when worker-start fails", async () => {
+    // Break caught: a newly unblocked Task owns a new lease that must not leak on start rejection.
+    const { service, orca, locks, store } = setup();
+    const withDependency: ExecutionProposal = {
+      ...proposal,
+      tasks: [
+        proposal.tasks[0]!,
+        {
+          localId: "follow-up",
+          title: "Continue after implementation",
+          dependsOn: ["implement"],
+          role: "implement",
+          preferredAgent: "claude"
+        }
+      ]
+    };
+    await service.start(authorized(withDependency));
+    orca.dispatchErrorOnCall = 2;
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "done-before-dependent-start-failure",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).rejects.toThrow("synthetic worker-start failure 2");
+
+    expect(locks.released).toEqual([
+      {
+        lockKey: project.lockKey,
+        dispatchId: "dispatch:proposal-1:implement:1"
+      },
+      {
+        lockKey: project.lockKey,
+        dispatchId: "dispatch:proposal-1:follow-up:1"
+      }
+    ]);
+    expect(store.dispatches.get("dispatch:proposal-1:follow-up:1")?.state)
+      .toBe("intervention_required");
+    expect(store.tasks.get("task:proposal-1:follow-up")?.state)
+      .toBe("intervention_required");
+    expect(store.runs.get("run:proposal-1")?.state)
+      .toBe("intervention_required");
+  });
+
+  it("does not persist a dependency Dispatch before its editing lease is acquired", async () => {
+    // Break caught: a denied dependency lease must not leave a phantom planned attempt.
+    const { service, orca, locks, store } = setup();
+    const withDependency: ExecutionProposal = {
+      ...proposal,
+      tasks: [
+        proposal.tasks[0]!,
+        {
+          localId: "follow-up",
+          title: "Continue after implementation",
+          dependsOn: ["implement"],
+          role: "implement",
+          preferredAgent: "claude"
+        }
+      ]
+    };
+    await service.start(authorized(withDependency));
+    locks.acquireResult = { kind: "conflict", lease: { dispatchId: "dispatch-other" } };
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "done-before-dependent-lock-conflict",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).resolves.toEqual({
+      kind: "review_required",
+      reason: "editing_lock_conflict",
+      dispatchId: "dispatch-other"
+    });
+
+    expect(store.dispatches.has("dispatch:proposal-1:follow-up:1")).toBe(false);
+    expect(store.tasks.get("task:proposal-1:follow-up")?.state).toBe("intervention_required");
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
   });
 
   it("permits one conflict-free replacement launch and requires intervention after its failure", async () => {
     // Break caught: an unbounded launch loop can duplicate workers and edits after partial startup.
     const { service, orca, git, store } = setup();
     await service.start(authorized());
+    const authorizedBaseCommit = git.baseCommit;
+    git.baseCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     await expect(service.recordLaunchFailure({
       dispatchId: "orca-dispatch-1",
@@ -611,10 +944,71 @@ describe("worker lifecycle", () => {
 
     const dispatchCalls = orca.calls.filter(({ kind }) => kind === "dispatch_worker");
     expect(dispatchCalls).toHaveLength(2);
-    expect(dispatchCalls[1]).toMatchObject({ retryOf: "orca-dispatch-1" });
+    expect(dispatchCalls[1]).toMatchObject({
+      taskId: "orca-task-1",
+      retryOf: "orca-dispatch-1"
+    });
     expect(git.created).toHaveLength(2);
     expect(git.created[1]?.worktreePath).not.toBe(git.created[0]?.worktreePath);
-    expect([...store.dispatches.values()]).toHaveLength(2);
+    expect(git.created.map(({ baseCommit }) => baseCommit)).toEqual([
+      authorizedBaseCommit,
+      authorizedBaseCommit
+    ]);
+    const persistedDispatches = [...store.dispatches.values()];
+    expect(persistedDispatches).toHaveLength(2);
+    expect(persistedDispatches[0]).toMatchObject({
+      id: "dispatch:proposal-1:implement:1",
+      orcaDispatchId: "orca-dispatch-1",
+      assignment: {
+        worktree: { path: git.created[0]?.worktreePath },
+        dispatchId: "dispatch:proposal-1:implement:1"
+      }
+    });
+    expect(persistedDispatches[1]).toMatchObject({
+      id: "dispatch:proposal-1:implement:2",
+      retryOf: "orca-dispatch-1",
+      orcaDispatchId: "orca-dispatch-2",
+      assignment: {
+        worktree: { path: git.created[1]?.worktreePath },
+        base: { ref: "main", commit: authorizedBaseCommit },
+        dispatchId: "dispatch:proposal-1:implement:2"
+      }
+    });
+
+    const createTask = orca.calls.find(({ kind }) => kind === "create_task");
+    if (createTask?.kind !== "create_task") throw new Error("expected one Orca Task");
+    expect(orca.calls.filter(({ kind }) => kind === "create_task")).toHaveLength(1);
+    expect(JSON.parse(createTask.spec)).toEqual({
+      protocol: 1,
+      task: {
+        taskId: "task:proposal-1:implement",
+        localId: "implement",
+        title: "Implement the requested API change",
+        role: "implement",
+        preferredAgent: "codex",
+        dependsOn: []
+      },
+      authorization: {
+        project: {
+          projectKey: project.projectKey,
+          orcaProjectId: project.orcaProjectId
+        },
+        repo: {
+          repoId: project.repoId,
+          repositoryPath: project.absolutePath
+        },
+        base: { ref: "main", commit: authorizedBaseCommit },
+        fileScope: proposal.allowedScope,
+        acceptanceCommands: proposal.acceptanceCommands,
+        prohibitedEffects: proposal.prohibitedEffects,
+        permissions: "read-write",
+        nestedWorkers: "forbidden"
+      },
+      dispatchLinkage: {
+        kind: "hq_receipt_linked_dispatch",
+        taskId: "task:proposal-1:implement"
+      }
+    });
 
     await expect(service.recordLaunchFailure({
       dispatchId: "orca-dispatch-1",
@@ -653,5 +1047,52 @@ describe("worker lifecycle", () => {
       dispatchId: "dispatch:proposal-1:implement:2"
     });
     expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+  });
+
+  it("does not persist a retry Dispatch before its editing lease is acquired", async () => {
+    // Break caught: a denied replacement lease must not become the current attempt for Task 4.
+    const { service, orca, git, locks, store } = setup();
+    await service.start(authorized());
+    locks.acquireResult = { kind: "conflict", lease: { dispatchId: "dispatch-other" } };
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-before-retry-lock-conflict",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).resolves.toEqual({
+      kind: "intervention_required",
+      reason: "replacement_not_conflict_free",
+      dispatchId: "orca-dispatch-1"
+    });
+
+    expect(store.dispatches.has("dispatch:proposal-1:implement:2")).toBe(false);
+    expect(store.tasks.get("task:proposal-1:implement")?.state).toBe("intervention_required");
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+    expect(git.created).toHaveLength(1);
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+  });
+
+  it("releases the exact retry lease and persists intervention when replacement worker-start fails", async () => {
+    // Break caught: attempt two must own its cleanup and cannot leave the Run active after start rejection.
+    const { service, orca, locks, store } = setup();
+    await service.start(authorized());
+    orca.dispatchErrorOnCall = 2;
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-before-retry-start",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).rejects.toThrow("synthetic worker-start failure 2");
+
+    expect(locks.released.at(-1)).toEqual({
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:2"
+    });
+    expect(store.dispatches.get("dispatch:proposal-1:implement:2")?.state)
+      .toBe("intervention_required");
+    expect(store.tasks.get("task:proposal-1:implement")?.state)
+      .toBe("intervention_required");
+    expect(store.runs.get("run:proposal-1")?.state)
+      .toBe("intervention_required");
   });
 });

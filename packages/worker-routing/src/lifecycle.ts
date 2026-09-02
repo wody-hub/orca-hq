@@ -140,6 +140,13 @@ export type DispatchRecord = Readonly<{
   orcaDispatchId?: string | undefined;
   receipt?: OrcaReceipt | undefined;
   launchFailureId?: string | undefined;
+  releaseReceipt?: OrcaReceipt | undefined;
+  releaseFailure?: WorkerReleaseFailure | undefined;
+}>;
+
+export type WorkerReleaseFailure = Readonly<{
+  code: string;
+  retryable: boolean;
 }>;
 
 export type LifecycleTransition = Readonly<{
@@ -188,6 +195,13 @@ export type LaunchFailureMessage = Readonly<{
 export type LifecycleMessage = WorkerMessage | LaunchFailureMessage;
 export type UserVisibleLifecycleMessage = WorkerQuestion | WorkerEscalation;
 
+export type WorkerDoneCommit = Readonly<{
+  message: WorkerDone;
+  dispatch: DispatchRecord;
+  task: TaskRecord;
+  transitions: readonly [LifecycleTransition, LifecycleTransition];
+}>;
+
 type MaybePromise<T> = T | Promise<T>;
 
 export interface LifecycleStore {
@@ -196,7 +210,7 @@ export interface LifecycleStore {
   saveDispatch(record: DispatchRecord): MaybePromise<void>;
   appendTransition(transition: LifecycleTransition): MaybePromise<void>;
   appendMessageOnce(message: LifecycleMessage): MaybePromise<"inserted" | "duplicate">;
-  recordWorkerDoneOnce(message: WorkerDone): MaybePromise<"inserted" | "duplicate">;
+  commitWorkerDone(input: WorkerDoneCommit): MaybePromise<"inserted" | "duplicate">;
 }
 
 export interface LifecycleMessageSink {
@@ -285,7 +299,7 @@ export class ExecutionLifecycle {
     state: DispatchState,
     patch: Readonly<Partial<Pick<
       DispatchRecord,
-      "orcaDispatchId" | "receipt" | "launchFailureId"
+      "orcaDispatchId" | "receipt" | "launchFailureId" | "releaseReceipt" | "releaseFailure"
     >>> = {}
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", id);
@@ -304,10 +318,23 @@ export class ExecutionLifecycle {
     | { kind: "duplicate" }
   >> {
     if (message.kind === "worker_done") {
-      const result = await this.#store.recordWorkerDoneOnce(message);
+      const currentDispatch = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+      const currentTask = this.#required(this.#tasks, "Task", currentDispatch.taskId);
+      const dispatch = Object.freeze({ ...currentDispatch, state: "worker_done" as const });
+      const task = Object.freeze({ ...currentTask, state: "worker_done" as const });
+      const transitions = Object.freeze([
+        this.#newTransition("dispatch", dispatch.id, currentDispatch.state, dispatch.state),
+        this.#newTransition("task", task.id, currentTask.state, task.state)
+      ] as const);
+      const result = await this.#store.commitWorkerDone(Object.freeze({
+        message,
+        dispatch,
+        task,
+        transitions
+      }));
       if (result === "duplicate") return Object.freeze({ kind: "duplicate" });
-      const dispatch = await this.transitionDispatch(localDispatchId, "worker_done");
-      await this.transitionTask(dispatch.taskId, "worker_done");
+      this.#dispatches.set(dispatch.id, dispatch);
+      this.#tasks.set(task.id, task);
       return Object.freeze({ kind: "recorded", verificationRequired: true });
     }
 
@@ -329,6 +356,20 @@ export class ExecutionLifecycle {
     return "recorded";
   }
 
+  async recordWorkerRelease(
+    localDispatchId: string,
+    outcome: Readonly<
+      | { releaseReceipt: OrcaReceipt }
+      | { releaseFailure: WorkerReleaseFailure }
+    >
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const updated = Object.freeze({ ...current, ...outcome });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
   run(id: string): RunRecord {
     return this.#required(this.#runs, "Run", id);
   }
@@ -348,18 +389,34 @@ export class ExecutionLifecycle {
     to: LifecycleTransition["to"],
     receiptId?: string
   ): Promise<void> {
+    await this.#store.appendTransition(this.#newTransition(
+      entity,
+      entityId,
+      from,
+      to,
+      receiptId
+    ));
+  }
+
+  #newTransition(
+    entity: LifecycleTransition["entity"],
+    entityId: string,
+    from: LifecycleTransition["from"],
+    to: LifecycleTransition["to"],
+    receiptId?: string
+  ): LifecycleTransition {
     const now = this.#clock.now();
     if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
       throw new TypeError("lifecycle clock must return a valid Date");
     }
-    await this.#store.appendTransition(Object.freeze({
+    return Object.freeze({
       entity,
       entityId,
       from,
       to,
       at: now.toISOString(),
       ...(receiptId === undefined ? {} : { receiptId })
-    }));
+    });
   }
 
   #required<RecordType>(

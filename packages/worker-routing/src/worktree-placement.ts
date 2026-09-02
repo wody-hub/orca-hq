@@ -52,6 +52,7 @@ export interface WorktreePlacementRequest {
   readonly riskLevel: RiskLevel;
   readonly repositoryPath: string;
   readonly baseRef?: string | undefined;
+  readonly pinnedBaseCommit?: string | undefined;
   readonly currentWorktreeApproval?: CurrentWorktreeApproval | undefined;
   readonly attempt: number;
 }
@@ -103,6 +104,13 @@ export type WorktreePlacementReview =
       kind: "review_required";
       reason: "current_worktree_approval_mismatch";
       path: string;
+    }>
+  | Readonly<{
+      kind: "review_required";
+      reason: "current_worktree_base_mismatch";
+      path: string;
+      head: string;
+      baseCommit: string;
     }>
   | Readonly<{
       kind: "review_required";
@@ -181,12 +189,25 @@ export class GitWorktreePlacementService implements WorktreePlacementPort {
     const status = await this.git.repositoryStatus(repositoryPath);
     const baseRef = input.baseRef?.trim() || status.branch || (input.riskLevel === "L0" ? status.head : "");
     if (baseRef.length === 0) return Object.freeze({ kind: "review_required", reason: "base_ref_required" });
+    const pinnedBaseCommit = input.pinnedBaseCommit?.trim();
     const [baseCommit, occupancies] = await Promise.all([
-      this.git.resolveRevision(repositoryPath, baseRef),
+      this.git.resolveRevision(repositoryPath, pinnedBaseCommit || baseRef),
       this.git.branchOccupancy(repositoryPath)
     ]);
+    if (pinnedBaseCommit !== undefined && pinnedBaseCommit.length > 0 && baseCommit !== pinnedBaseCommit) {
+      throw new TypeError("pinned base commit did not resolve exactly");
+    }
 
     if (input.riskLevel === "L0") {
+      if (status.head !== baseCommit) {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "current_worktree_base_mismatch",
+          path: repositoryPath,
+          head: status.head,
+          baseCommit
+        });
+      }
       return Object.freeze({
         kind: "ready",
         repositoryPath,
@@ -221,6 +242,15 @@ export class GitWorktreePlacementService implements WorktreePlacementPort {
           kind: "review_required",
           reason: "current_worktree_approval_mismatch",
           path: repositoryPath
+        });
+      }
+      if (status.head !== baseCommit) {
+        return Object.freeze({
+          kind: "review_required",
+          reason: "current_worktree_base_mismatch",
+          path: repositoryPath,
+          head: status.head,
+          baseCommit
         });
       }
       return Object.freeze({
