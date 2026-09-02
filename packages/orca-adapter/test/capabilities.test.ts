@@ -33,11 +33,12 @@ async function fakeOrca(): Promise<FakeOrca> {
 
 async function enqueueStartup(
   fake: FakeOrca,
-  status: unknown = statusFixture
+  status: unknown = statusFixture,
+  connectionArgs: readonly string[] = []
 ): Promise<void> {
-  await fake.enqueueJson(["status", "--json"], status);
+  await fake.enqueueJson(["status", ...connectionArgs, "--json"], status);
   for (const name of ["orca-cli", "orchestration"] as const) {
-    await fake.enqueueJson(["skills", "get", name, "--json"], {
+    await fake.enqueueJson(["skills", "get", name, ...connectionArgs, "--json"], {
       name,
       full: false,
       markdown: officialSkillText[name]
@@ -52,6 +53,7 @@ function clientFor(
     timeoutMs?: number;
     terminationGraceMs?: number;
     expectedVersionRange?: string;
+    connectionTarget?: { kind: "saved_environment"; name: string };
   } = {}
 ): OrcaClient {
   return new OrcaClient({
@@ -61,7 +63,10 @@ function clientFor(
     ...(options.terminationGraceMs === undefined
       ? {}
       : { terminationGraceMs: options.terminationGraceMs }),
-    expectedVersionRange: options.expectedVersionRange ?? ">=1.4.194"
+    expectedVersionRange: options.expectedVersionRange ?? ">=1.4.194",
+    ...(options.connectionTarget === undefined
+      ? {}
+      : { connectionTarget: options.connectionTarget })
   });
 }
 
@@ -100,6 +105,8 @@ describe("Orca CLI capability adapter", () => {
       TELEGRAM_BOT_TOKEN: "telegram-secret",
       TAILSCALE_AUTH_KEY: "tailscale-secret",
       OPENAI_API_KEY: "voice-secret",
+      ORCA_ENVIRONMENT: "saved-runtime",
+      ORCA_PAIRING_CODE: "orca://pair?secret",
       ARBITRARY_MODEL_ENV: "must-not-pass"
     })).toEqual({
       HOME: "/Users/operator",
@@ -126,6 +133,11 @@ describe("Orca CLI capability adapter", () => {
         "orchestration.worker-launch-preferences.v1"
       ]),
       missingCapabilities: [],
+      providerChildEnvironmentIsolation: {
+        kind: "unsupported",
+        reason: "public_worker_start_has_no_child_environment_contract"
+      },
+      assignmentArtifactAccess: { kind: "same_host" },
       skills: [
         {
           name: "orca-cli",
@@ -148,6 +160,29 @@ describe("Orca CLI capability adapter", () => {
       ["status", "--json"],
       ["skills", "get", "orca-cli", "--json"],
       ["skills", "get", "orchestration", "--json"]
+    ]);
+  });
+
+  it("targets a saved runtime with the documented non-secret common CLI argument", async () => {
+    // Break caught: filtering ORCA_ENVIRONMENT without an explicit replacement disconnects HQ.
+    const fake = await fakeOrca();
+    const connectionArgs = ["--environment", "worker-host"] as const;
+    await enqueueStartup(fake, statusFixture, connectionArgs);
+    const client = clientFor(fake, {
+      connectionTarget: { kind: "saved_environment", name: "worker-host" }
+    });
+
+    await expect(client.health()).resolves.toMatchObject({
+      compatible: true,
+      assignmentArtifactAccess: {
+        kind: "unsupported",
+        reason: "saved_environment_has_no_assignment_artifact_transport"
+      }
+    });
+    await expect(fake.calls()).resolves.toEqual([
+      ["status", ...connectionArgs, "--json"],
+      ["skills", "get", "orca-cli", ...connectionArgs, "--json"],
+      ["skills", "get", "orchestration", ...connectionArgs, "--json"]
     ]);
   });
 
@@ -503,6 +538,31 @@ describe("Orca CLI capability adapter", () => {
       ["skills", "get", "orchestration", "--json"],
       ...cases.map((entry) => [...entry.args])
     ]);
+  });
+
+  it("marks a malformed worker-start receipt uncertain and preserves its Dispatch ID", async () => {
+    // Break caught: operation-specific parsing must not erase a worker that may already be live.
+    const fake = await fakeOrca();
+    await enqueueStartup(fake);
+    await fake.enqueueJson([
+      "orchestration", "worker-start", "--task", "task-1",
+      "--worktree", "current", "--agent", "codex", "--json"
+    ], {
+      id: "malformed-worker-start",
+      ok: true,
+      result: { dispatchId: "dispatch-1" }
+    });
+
+    await expect(clientFor(fake).execute({
+      kind: "dispatch_worker",
+      taskId: "task-1",
+      worktree: "current",
+      agent: "codex"
+    })).rejects.toMatchObject({
+      code: "invalid_orca_receipt",
+      workerMayBeLive: true,
+      orcaDispatchId: "dispatch-1"
+    });
   });
 
   it("rejects an empty result for every exposed orchestration operation", async () => {

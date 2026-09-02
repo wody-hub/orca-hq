@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { OrcaOperation, OrcaReceipt } from "../../orca-adapter/src/index.js";
 import { describe, expect, it } from "vitest";
 
@@ -8,7 +10,9 @@ import {
   parseWorkerAssignment,
   selectProvider,
   workerPrompt,
+  type AssignmentArtifact,
   type ProviderCapabilities,
+  type ProviderStartContext,
   type WorkerAssignment,
   type WorkerProviderId
 } from "../src/index.js";
@@ -55,7 +59,9 @@ class FakeProviderOrca {
   readonly calls: OrcaOperation[] = [];
   failure: Error | undefined;
   malformedStart = false;
+  malformedStartWithDispatch = false;
   staleObservation = false;
+  effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
 
   async execute(operation: OrcaOperation): Promise<OrcaReceipt> {
     this.calls.push(structuredClone(operation));
@@ -63,7 +69,9 @@ class FakeProviderOrca {
     switch (operation.kind) {
       case "dispatch_worker":
         return this.malformedStart
-          ? receipt("malformed-start", {})
+          ? receipt("malformed-start", this.malformedStartWithDispatch
+              ? { dispatchId: "orca-dispatch-2" }
+              : {})
           : receipt("worker-start-1", {
               dispatchId: "orca-dispatch-2",
               taskId: operation.taskId,
@@ -71,7 +79,13 @@ class FakeProviderOrca {
               state: "ready",
               stage: "ready",
               setup: { state: "running" },
-              effects: []
+              effects: [],
+              launch: {
+                providerEnvironment: {
+                  kind: "verified_effective_allowlist",
+                  effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
+                }
+              }
             });
       case "show_worker":
         return receipt("worker-show-1", {
@@ -128,8 +142,45 @@ function providers(orca: FakeProviderOrca): WorkerProviderRegistry {
 
 const availableCapabilities: ProviderCapabilities = {
   codex: { worker: "available", hq: "available" },
-  claude: { worker: "available", hq: "unavailable" }
+  claude: { worker: "available", hq: "unavailable" },
+  providerChildEnvironmentIsolation: {
+    kind: "verified_effective_allowlist",
+    effectiveEnvironmentKeys: ["HOME", "PATH"]
+  },
+  assignmentArtifactAccess: { kind: "same_host" }
 };
+
+const verifiedEnvironmentIsolation = availableCapabilities.providerChildEnvironmentIsolation;
+
+function artifactFor(currentAssignment: WorkerAssignment): AssignmentArtifact {
+  const content = workerPrompt(currentAssignment);
+  const artifactDigest = createHash("sha256")
+    .update(currentAssignment.taskId)
+    .digest("hex");
+  return {
+    protocol: 1,
+    artifactId: `assignment:${artifactDigest}`,
+    path: `/var/run/orca-hq/assignments/${artifactDigest}.json`,
+    version: 2,
+    ownerDispatchId: currentAssignment.dispatchId,
+    content,
+    sha256: createHash("sha256").update(content).digest("hex")
+  };
+}
+
+function startContext(
+  currentAssignment: WorkerAssignment,
+  overrides: Partial<ProviderStartContext> = {}
+): ProviderStartContext {
+  return {
+    orcaTaskId: "orca-task-1",
+    setup: "run",
+    assignmentArtifact: artifactFor(currentAssignment),
+    providerEnvironmentIsolation: verifiedEnvironmentIsolation,
+    assignmentArtifactAccess: { kind: "same_host" },
+    ...overrides
+  };
+}
 
 describe("Orca-backed worker providers", () => {
   it.each(["codex", "claude"] as const)(
@@ -139,12 +190,13 @@ describe("Orca-backed worker providers", () => {
       const orca = new FakeProviderOrca();
       const currentAssignment = assignment(providerId);
 
-      const started = await providers(orca).get(providerId).start(currentAssignment, {
-        orcaTaskId: "orca-task-1",
+      const started = await providers(orca).get(providerId).start(currentAssignment, startContext(
+        currentAssignment,
+        {
         name: "implement",
-        setup: "run",
         retryOf: "orca-dispatch-1"
-      });
+        }
+      ));
 
       expect(orca.calls).toEqual([{
         kind: "dispatch_worker",
@@ -166,11 +218,15 @@ describe("Orca-backed worker providers", () => {
         orcaReceipt: { id: "worker-start-1", ok: true },
         boundary: {
           lifecycleAuthority: "orca_worker_start",
-          promptDelivery: "persisted_launch_artifact",
-          attemptContext: "orca_injected_preamble_and_persisted_assignment",
-          credentialSource: "provider_authenticated_cli",
-          postStartMail: false,
-          forwardedEnvironmentKeys: []
+        promptDelivery: "prestart_atomic_assignment_artifact",
+        attemptContext: "orca_injected_task_spec_and_prestart_assignment",
+        credentialSource: "provider_authenticated_cli",
+        postStartMail: false,
+        providerChildEnvironmentIsolation: {
+          kind: "verified_effective_allowlist",
+          effectiveEnvironmentKeys: ["HOME", "PATH"]
+        },
+        assignmentArtifactAccess: { kind: "same_host" }
         }
       });
       expect(JSON.parse(started.promptArtifact.content)).toEqual({
@@ -214,10 +270,10 @@ describe("Orca-backed worker providers", () => {
       nestedWorkers: "allowed"
     } as unknown as WorkerAssignment;
 
-    await expect(providers(orca).get("codex").start(nestedRequest, {
-      orcaTaskId: "orca-task-1",
-      setup: "run"
-    })).rejects.toThrow();
+    await expect(providers(orca).get("codex").start(
+      nestedRequest,
+      startContext(assignment())
+    )).rejects.toThrow();
     expect(orca.calls).toEqual([]);
   });
 
@@ -225,10 +281,11 @@ describe("Orca-backed worker providers", () => {
     // Break caught: a registry lookup bug must not silently turn a Codex assignment into Claude work.
     const orca = new FakeProviderOrca();
 
-    await expect(providers(orca).get("claude").start(assignment("codex"), {
-      orcaTaskId: "orca-task-1",
-      setup: "run"
-    })).rejects.toMatchObject({ code: "provider_mismatch", provider: "claude" });
+    const currentAssignment = assignment("codex");
+    await expect(providers(orca).get("claude").start(
+      currentAssignment,
+      startContext(currentAssignment)
+    )).rejects.toMatchObject({ code: "provider_mismatch", provider: "claude" });
     expect(orca.calls).toEqual([]);
   });
 
@@ -249,10 +306,50 @@ describe("Orca-backed worker providers", () => {
     const orca = new FakeProviderOrca();
     orca.malformedStart = true;
 
-    await expect(providers(orca).get("codex").start(assignment(), {
-      orcaTaskId: "orca-task-1",
-      setup: "run"
-    })).rejects.toMatchObject({ code: "invalid_provider_receipt", provider: "codex" });
+    const currentAssignment = assignment();
+    await expect(providers(orca).get("codex").start(
+      currentAssignment,
+      startContext(currentAssignment)
+    )).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      workerMayBeLive: true
+    });
+  });
+
+  it("preserves a Dispatch ID from a malformed post-start receipt", async () => {
+    // Break caught: schema rejection after worker creation must not discard the exact fence target.
+    const orca = new FakeProviderOrca();
+    orca.malformedStart = true;
+    orca.malformedStartWithDispatch = true;
+    const currentAssignment = assignment();
+
+    await expect(providers(orca).get("codex").start(
+      currentAssignment,
+      startContext(currentAssignment)
+    )).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      workerMayBeLive: true,
+      orcaDispatchId: "orca-dispatch-2"
+    });
+  });
+
+  it("rejects a worker-start receipt whose effective environment differs from preflight", async () => {
+    // Break caught: capability configuration without a matching launch receipt is not attestation.
+    const orca = new FakeProviderOrca();
+    orca.effectiveEnvironmentKeys = ["HOME"];
+    const currentAssignment = assignment();
+
+    await expect(providers(orca).get("codex").start(
+      currentAssignment,
+      startContext(currentAssignment)
+    )).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      workerMayBeLive: true,
+      orcaDispatchId: "orca-dispatch-2"
+    });
   });
 
   it("classifies authentication, process, and stale-dispatch failures without leaking diagnostics", async () => {
@@ -287,10 +384,13 @@ describe("Orca-backed worker providers", () => {
       orca.failure = entry.error;
       const provider = providers(orca).get("codex");
       const caught = await (entry.phase === "start"
-        ? provider.start(assignment(), { orcaTaskId: "orca-task-1", setup: "run" })
+        ? provider.start(assignment(), startContext(assignment()))
         : provider.inspect("orca-dispatch-2")).catch((error: unknown) => error);
 
       expect(caught).toMatchObject({ code: entry.want, provider: "codex", phase: entry.phase });
+      if (entry.error.code === "orca_process_failed" && entry.phase === "start") {
+        expect(caught).toMatchObject({ workerMayBeLive: true });
+      }
       expect(JSON.stringify(caught)).not.toContain("secret");
     }
   });
@@ -302,6 +402,38 @@ describe("Orca-backed worker providers", () => {
 
     await expect(providers(orca).get("claude").inspect("orca-dispatch-2"))
       .rejects.toMatchObject({ code: "stale_dispatch", provider: "claude" });
+  });
+
+  it("fails closed before worker-start when child environment isolation is unsupported", async () => {
+    // Break caught: filtering only the Orca CLI process must not be reported as provider isolation.
+    const orca = new FakeProviderOrca();
+    const currentAssignment = assignment();
+
+    await expect(providers(orca).get("codex").start(currentAssignment, {
+      ...startContext(currentAssignment),
+      providerEnvironmentIsolation: { kind: "unsupported" }
+    })).rejects.toMatchObject({
+      code: "provider_environment_isolation_unavailable",
+      provider: "codex",
+      phase: "start"
+    });
+    expect(orca.calls).toEqual([]);
+  });
+
+  it("fails closed when the assignment artifact is not readable on the worker host", async () => {
+    // Break caught: a saved-runtime worker cannot consume an HQ-local absolute artifact path.
+    const orca = new FakeProviderOrca();
+    const currentAssignment = assignment();
+
+    await expect(providers(orca).get("codex").start(currentAssignment, {
+      ...startContext(currentAssignment),
+      assignmentArtifactAccess: { kind: "unsupported" }
+    })).rejects.toMatchObject({
+      code: "provider_assignment_artifact_access_unavailable",
+      provider: "codex",
+      phase: "start"
+    });
+    expect(orca.calls).toEqual([]);
   });
 });
 
@@ -345,6 +477,20 @@ describe("provider selection", () => {
       kind: "unavailable",
       provider: "codex",
       reason: "provider_unavailable"
+    });
+  });
+
+  it("rejects a worker whose assignment artifact has no same-host access contract", () => {
+    // Break caught: explicit saved-runtime connectivity is not an artifact transport.
+    const capabilities: ProviderCapabilities = {
+      ...availableCapabilities,
+      assignmentArtifactAccess: { kind: "unsupported" }
+    };
+
+    expect(selectProvider({ role: "implement", preferredAgent: "codex" }, capabilities)).toEqual({
+      kind: "unavailable",
+      provider: "codex",
+      reason: "provider_assignment_artifact_access_unavailable"
     });
   });
 });

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 
 import type { ExecutionProposal } from "@orca-hq/core";
@@ -10,9 +11,16 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  CodexWorkerProvider,
   ExecutionLifecycle,
   ExecutionService,
   GitWorktreePlacementService,
+  WorkerProviderError,
+  workerPrompt,
+  type AssignmentArtifact,
+  type AssignmentArtifactReference,
+  type AssignmentArtifactStageInput,
+  type AssignmentArtifactStore,
   type AuthorizedProposal,
   type DispatchRecord,
   type EditingLockPort,
@@ -24,11 +32,14 @@ import {
   type LifecycleStore,
   type LifecycleTransition,
   type ProviderCapabilities,
+  type ProviderStartReceipt,
   type RunRecord,
   type TaskRecord,
   type UserVisibleLifecycleMessage,
   type WorkerDoneCommit,
-  type WorkerMessage
+  type WorkerMessage,
+  type WorkerProvider,
+  type WorkerProviderRegistryPort
 } from "../src/index.js";
 
 const project: ProjectRegistryEntry = {
@@ -90,8 +101,11 @@ class RecordingOrca {
   #task = 0;
   #dispatch = 0;
 
+  constructor(readonly events: string[] = []) {}
+
   async execute(operation: OrcaOperation): Promise<OrcaReceipt> {
     this.calls.push(structuredClone(operation));
+    this.events.push(`orca:${operation.kind}`);
     switch (operation.kind) {
       case "create_run":
         return receipt("run-receipt", { runId: "orca-run-1" });
@@ -106,7 +120,10 @@ class RecordingOrca {
       case "dispatch_worker": {
         this.#dispatch += 1;
         if (this.dispatchErrorOnCall === this.#dispatch) {
-          throw new Error(`synthetic worker-start failure ${this.#dispatch}`);
+          throw Object.assign(new Error(`synthetic worker-start failure ${this.#dispatch}`), {
+            code: "orca_command_failed",
+            orcaCode: "worker_start_rejected"
+          });
         }
         return receipt(`dispatch-receipt-${this.#dispatch}`, {
           dispatchId: `orca-dispatch-${this.#dispatch}`,
@@ -115,7 +132,13 @@ class RecordingOrca {
           state: "ready",
           stage: "ready",
           setup: { state: "running" },
-          effects: []
+          effects: [],
+          launch: {
+            providerEnvironment: {
+              kind: "verified_effective_allowlist",
+              effectiveEnvironmentKeys: ["HOME", "PATH"]
+            }
+          }
         });
       }
       case "show_worker":
@@ -154,6 +177,12 @@ class RecordingOrca {
           },
           warnings: [],
           archived: false
+        });
+      case "stop_worker":
+        return receipt(`stop-receipt-${operation.dispatchId}`, {
+          dispatchId: operation.dispatchId,
+          state: "stopped",
+          verdict: "stopped"
         });
       case "release_worker":
         if (this.releaseError !== undefined) throw this.releaseError;
@@ -244,6 +273,51 @@ class RecordingLocks implements EditingLockPort {
   }
 }
 
+class MemoryAssignmentArtifactStore implements AssignmentArtifactStore {
+  readonly staged: AssignmentArtifact[] = [];
+  readonly cleaned: AssignmentArtifact[] = [];
+  readonly #current = new Map<string, AssignmentArtifact>();
+
+  constructor(readonly events: string[] = []) {}
+
+  referenceFor(taskId: string): AssignmentArtifactReference {
+    const digest = createHash("sha256").update(taskId).digest("hex");
+    return {
+      protocol: 1,
+      artifactId: `assignment:${digest}`,
+      path: `/var/run/orca-hq/assignments/${digest}.json`
+    };
+  }
+
+  async stage(input: AssignmentArtifactStageInput): Promise<AssignmentArtifact> {
+    const artifact: AssignmentArtifact = {
+      ...input.reference,
+      version: input.version,
+      ownerDispatchId: input.ownerDispatchId,
+      content: input.content,
+      sha256: createHash("sha256").update(input.content).digest("hex")
+    };
+    this.#current.set(artifact.artifactId, artifact);
+    this.staged.push(structuredClone(artifact));
+    this.events.push(`artifact:stage:${artifact.version}`);
+    return artifact;
+  }
+
+  async cleanup(artifact: AssignmentArtifact): Promise<"removed" | "missing" | "superseded"> {
+    const current = this.#current.get(artifact.artifactId);
+    if (current === undefined) return "missing";
+    if (
+      current.version !== artifact.version
+      || current.ownerDispatchId !== artifact.ownerDispatchId
+      || current.sha256 !== artifact.sha256
+    ) return "superseded";
+    this.#current.delete(artifact.artifactId);
+    this.cleaned.push(structuredClone(artifact));
+    this.events.push(`artifact:cleanup:${artifact.version}`);
+    return "removed";
+  }
+}
+
 class MemoryGit implements GitWorktreePort {
   status: GitRepositoryStatus = {
     dirty: false,
@@ -297,7 +371,8 @@ class MemoryGit implements GitWorktreePort {
 
 function setup(
   git = new MemoryGit(),
-  providerCapabilities?: ProviderCapabilities
+  providerCapabilities?: ProviderCapabilities,
+  providerFactory?: (orca: RecordingOrca) => WorkerProviderRegistryPort
 ): {
   service: ExecutionService;
   orca: RecordingOrca;
@@ -305,25 +380,42 @@ function setup(
   locks: RecordingLocks;
   store: MemoryLifecycleStore;
   messages: RecordingMessageSink;
+  artifacts: MemoryAssignmentArtifactStore;
+  events: string[];
 } {
-  const orca = new RecordingOrca();
+  const events: string[] = [];
+  const orca = new RecordingOrca(events);
   const locks = new RecordingLocks();
   const store = new MemoryLifecycleStore();
   const messages = new RecordingMessageSink();
+  const artifacts = new MemoryAssignmentArtifactStore(events);
   const lifecycle = new ExecutionLifecycle({ store, messages });
+  const supportedCapabilities: ProviderCapabilities = {
+    codex: { worker: "available", hq: "available" },
+    claude: { worker: "available", hq: "unavailable" },
+    providerChildEnvironmentIsolation: {
+      kind: "verified_effective_allowlist",
+      effectiveEnvironmentKeys: ["HOME", "PATH"]
+    },
+    assignmentArtifactAccess: { kind: "same_host" }
+  };
   return {
     service: new ExecutionService({
       orca,
       placements: new GitWorktreePlacementService(git),
       locks,
       lifecycle,
-      ...(providerCapabilities === undefined ? {} : { providerCapabilities })
+      assignmentArtifacts: artifacts,
+      providerCapabilities: providerCapabilities ?? supportedCapabilities,
+      ...(providerFactory === undefined ? {} : { providers: providerFactory(orca) })
     }),
     orca,
     git,
     locks,
     store,
-    messages
+    messages,
+    artifacts,
+    events
   };
 }
 
@@ -639,13 +731,55 @@ describe("ExecutionService preflight and dispatch", () => {
       .toBe("intervention_required");
     expect(setupResult.store.runs.get("run:proposal-1")?.state)
       .toBe("intervention_required");
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({ assignmentArtifactCleanup: { kind: "removed" } });
+  });
+
+  it("keeps the editing lease and artifact when a possibly-live worker has no Dispatch ID", async () => {
+    // Break caught: uncertainty without an exact stop target must retain the project fence.
+    const setupResult = setup(new MemoryGit(), undefined, () => {
+      const provider: WorkerProvider = {
+        id: "codex",
+        start: async () => {
+          throw new WorkerProviderError("invalid_provider_receipt", "codex", "start", {
+            workerMayBeLive: true
+          });
+        },
+        inspect: async () => {
+          throw new Error("inspect must not run without a Dispatch ID");
+        }
+      };
+      return { get: () => provider };
+    });
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      phase: "start",
+      workerMayBeLive: true
+    });
+
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        state: "intervention_required",
+        assignmentArtifact: setupResult.artifacts.staged[0]
+      });
   });
 
   it("fails before mutation instead of substituting an unavailable preferred provider", async () => {
     // Break caught: falling back to Claude would execute an assignment that authorized Codex only.
     const capabilities: ProviderCapabilities = {
       codex: { worker: "unavailable", hq: "available" },
-      claude: { worker: "available", hq: "unavailable" }
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: {
+        kind: "verified_effective_allowlist",
+        effectiveEnvironmentKeys: ["HOME", "PATH"]
+      },
+      assignmentArtifactAccess: { kind: "same_host" }
     };
     const setupResult = setup(new MemoryGit(), capabilities);
 
@@ -660,6 +794,160 @@ describe("ExecutionService preflight and dispatch", () => {
     expect(setupResult.store.runs.size).toBe(0);
     expect(setupResult.store.tasks.size).toBe(0);
     expect(setupResult.store.dispatches.size).toBe(0);
+  });
+
+  it("fails closed before artifact or Orca mutation when provider child isolation is unsupported", async () => {
+    // Break caught: production Orca 1.4.195 cannot attest the launched provider environment.
+    const orca = new RecordingOrca();
+    const locks = new RecordingLocks();
+    const store = new MemoryLifecycleStore();
+    const artifacts = new MemoryAssignmentArtifactStore();
+    const service = new ExecutionService({
+      orca,
+      placements: new GitWorktreePlacementService(new MemoryGit()),
+      locks,
+      lifecycle: new ExecutionLifecycle({ store }),
+      assignmentArtifacts: artifacts
+    });
+
+    await expect(service.start(authorized())).rejects.toMatchObject({
+      code: "provider_environment_isolation_unavailable",
+      provider: "codex",
+      phase: "start"
+    });
+    expect(artifacts.staged).toEqual([]);
+    expect(orca.calls).toEqual([]);
+    expect(locks.acquired).toEqual([]);
+    expect(store.runs.size).toBe(0);
+  });
+
+  it("publishes an invariant Task reference before atomically staging the exact attempt", async () => {
+    // Break caught: a receipt created after worker-start cannot deliver the assignment to the worker.
+    const { service, orca, store, artifacts, events } = setup();
+
+    await service.start(authorized());
+
+    const taskOperation = orca.calls.find(({ kind }) => kind === "create_task");
+    if (taskOperation?.kind !== "create_task") throw new Error("Task was not created");
+    const spec = JSON.parse(taskOperation.spec) as Record<string, unknown>;
+    const staged = artifacts.staged[0];
+    expect(spec).toMatchObject({
+      assignmentArtifact: {
+        protocol: 1,
+        artifactId: staged?.artifactId,
+        path: staged?.path,
+        format: "orca_hq_assignment_artifact_v1",
+        requiredBeforeWork: true,
+        integrity: "sha256_content",
+        workerConsumption: "read_content_as_authoritative_assignment_before_work"
+      }
+    });
+    expect(staged).toMatchObject({
+      version: 1,
+      ownerDispatchId: "dispatch:proposal-1:implement:1",
+      content: workerPrompt([...store.dispatches.values()][0]!.assignment)
+    });
+    expect(events.indexOf("orca:create_task")).toBeLessThan(events.indexOf("artifact:stage:1"));
+    expect(events.indexOf("artifact:stage:1")).toBeLessThan(events.indexOf("orca:dispatch_worker"));
+    expect([...store.dispatches.values()][0]).toMatchObject({
+      assignmentArtifact: {
+        version: 1,
+        ownerDispatchId: "dispatch:proposal-1:implement:1",
+        sha256: staged?.sha256
+      }
+    });
+  });
+
+  it.each([
+    {
+      name: "content",
+      tamper(receipt: ProviderStartReceipt): ProviderStartReceipt {
+        const content = `${receipt.promptArtifact.content} `;
+        return {
+          ...receipt,
+          promptArtifact: {
+            ...receipt.promptArtifact,
+            content,
+            sha256: createHash("sha256").update(content).digest("hex")
+          }
+        };
+      }
+    },
+    {
+      name: "sha256",
+      tamper(receipt: ProviderStartReceipt): ProviderStartReceipt {
+        return {
+          ...receipt,
+          promptArtifact: { ...receipt.promptArtifact, sha256: "0".repeat(64) }
+        };
+      }
+    }
+  ])("rejects a schema-valid provider receipt with altered prompt $name", async ({ tamper }) => {
+    // Break caught: IDs alone cannot bind a provider receipt to the authorized assignment bytes.
+    const setupResult = setup(new MemoryGit(), undefined, (orca) => {
+      const delegate = new CodexWorkerProvider({ orca });
+      const provider: WorkerProvider = {
+        id: "codex",
+        start: async (assignment, context) => tamper(await delegate.start(assignment, context)),
+        inspect: (dispatchId) => delegate.inspect(dispatchId)
+      };
+      return { get: () => provider };
+    });
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      phase: "start",
+      workerMayBeLive: true,
+      orcaDispatchId: "orca-dispatch-1"
+    });
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    }]);
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        state: "intervention_required",
+        orcaDispatchId: "orca-dispatch-1",
+        fenceReceipt: {
+          id: "stop-receipt-orca-dispatch-1",
+          result: { dispatchId: "orca-dispatch-1", verdict: "stopped" }
+        },
+        assignmentArtifactCleanup: { kind: "removed" }
+      });
+  });
+
+  it("does not fence an unbound top-level provider Dispatch ID", async () => {
+    // Break caught: a provider receipt must not redirect stop_worker away from Orca's nested receipt.
+    const setupResult = setup(new MemoryGit(), undefined, (orca) => {
+      const delegate = new CodexWorkerProvider({ orca });
+      const provider: WorkerProvider = {
+        id: "codex",
+        start: async (assignment, context) => ({
+          ...await delegate.start(assignment, context),
+          orcaDispatchId: "orca-dispatch-unrelated"
+        }),
+        inspect: (dispatchId) => delegate.inspect(dispatchId)
+      };
+      return { get: () => provider };
+    });
+
+    const caught = await setupResult.service.start(authorized()).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      phase: "start",
+      workerMayBeLive: true
+    });
+    expect((caught as WorkerProviderError).orcaDispatchId).toBeUndefined();
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
   });
 
   it("persists immutable inputs, public receipts, and every lifecycle transition", async () => {
@@ -729,7 +1017,17 @@ describe("Git worktree placement", () => {
       orca,
       placements: new GitWorktreePlacementService(sandbox.git),
       locks,
-      lifecycle: new ExecutionLifecycle({ store, messages: new RecordingMessageSink() })
+      lifecycle: new ExecutionLifecycle({ store, messages: new RecordingMessageSink() }),
+      assignmentArtifacts: new MemoryAssignmentArtifactStore(),
+      providerCapabilities: {
+        codex: { worker: "available", hq: "available" },
+        claude: { worker: "available", hq: "unavailable" },
+        providerChildEnvironmentIsolation: {
+          kind: "verified_effective_allowlist",
+          effectiveEnvironmentKeys: ["HOME", "PATH"]
+        },
+        assignmentArtifactAccess: { kind: "same_host" }
+      }
     });
 
     const result = await service.start(authorized(proposal, sandboxProject));
@@ -750,7 +1048,7 @@ describe("Git worktree placement", () => {
 describe("worker lifecycle", () => {
   it("persists questions and escalations but never publishes worker_done as success", async () => {
     // Break caught: treating a worker completion report as accepted success bypasses verification.
-    const { service, orca, store, messages } = setup();
+    const { service, orca, store, messages, artifacts } = setup();
     await service.start(authorized());
 
     const question: WorkerMessage = {
@@ -793,8 +1091,10 @@ describe("worker lifecycle", () => {
       releaseReceipt: {
         id: "release-receipt-orca-dispatch-1",
         result: { dispatchId: "orca-dispatch-1", verdict: "released" }
-      }
+      },
+      assignmentArtifactCleanup: { kind: "removed" }
     });
+    expect(artifacts.cleaned).toEqual([artifacts.staged[0]]);
   });
 
   it("atomically rolls back worker_done dedupe and lifecycle transitions before redelivery", async () => {
@@ -1018,7 +1318,7 @@ describe("worker lifecycle", () => {
 
   it("permits one conflict-free replacement launch and requires intervention after its failure", async () => {
     // Break caught: an unbounded launch loop can duplicate workers and edits after partial startup.
-    const { service, orca, git, store } = setup();
+    const { service, orca, git, store, artifacts } = setup();
     await service.start(authorized());
     const authorizedBaseCommit = git.baseCommit;
     git.baseCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1098,6 +1398,41 @@ describe("worker lifecycle", () => {
       dispatchLinkage: {
         kind: "hq_receipt_linked_dispatch",
         taskId: "task:proposal-1:implement"
+      },
+      assignmentArtifact: {
+        protocol: 1,
+        artifactId: artifacts.staged[0]?.artifactId,
+        path: artifacts.staged[0]?.path,
+        format: "orca_hq_assignment_artifact_v1",
+        requiredBeforeWork: true,
+        integrity: "sha256_content",
+        workerConsumption: "read_content_as_authoritative_assignment_before_work"
+      }
+    });
+    expect(artifacts.staged).toHaveLength(2);
+    expect(artifacts.staged.map(({ artifactId, path, version, ownerDispatchId }) => ({
+      artifactId,
+      path,
+      version,
+      ownerDispatchId
+    }))).toEqual([
+      {
+        artifactId: artifacts.staged[0]?.artifactId,
+        path: artifacts.staged[0]?.path,
+        version: 1,
+        ownerDispatchId: "dispatch:proposal-1:implement:1"
+      },
+      {
+        artifactId: artifacts.staged[0]?.artifactId,
+        path: artifacts.staged[0]?.path,
+        version: 2,
+        ownerDispatchId: "dispatch:proposal-1:implement:2"
+      }
+    ]);
+    expect(JSON.parse(artifacts.staged[1]!.content)).toMatchObject({
+      assignment: {
+        worktree: { path: git.created[1]?.worktreePath },
+        dispatchId: "dispatch:proposal-1:implement:2"
       }
     });
 

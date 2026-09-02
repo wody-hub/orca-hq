@@ -11,6 +11,22 @@ export interface RunOrcaOptions {
   readonly signal: AbortSignal;
   readonly timeoutMs: number;
   readonly terminationGraceMs: number;
+  readonly connectionTarget?: OrcaConnectionTarget;
+}
+
+export type OrcaConnectionTarget = Readonly<
+  | { kind: "local" }
+  | { kind: "saved_environment"; name: string }
+>;
+
+export function orcaConnectionArguments(
+  target: OrcaConnectionTarget
+): readonly string[] {
+  if (target.kind === "local") return Object.freeze([]);
+  if (target.kind !== "saved_environment") throw new TypeError("unsupported Orca connection target");
+  const name = target.name.trim();
+  if (name.length === 0) throw new TypeError("saved environment name is required");
+  return Object.freeze(["--environment", name]);
 }
 
 const ORCA_ENVIRONMENT_KEYS = Object.freeze([
@@ -117,9 +133,12 @@ export async function runOrca(
     throw new TypeError("terminationGraceMs must be a positive safe integer");
   }
   if (args.includes("--json")) throw new TypeError("runOrca appends --json");
+  const connectionArgs = orcaConnectionArguments(
+    options.connectionTarget ?? Object.freeze({ kind: "local" })
+  );
 
   return new Promise<unknown>((resolve, reject) => {
-    const child = spawn(options.executablePath, [...args, "--json"], {
+    const child = spawn(options.executablePath, [...args, ...connectionArgs, "--json"], {
       env: boundedOrcaEnvironment(process.env),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]

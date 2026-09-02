@@ -10,6 +10,10 @@ import type { OrcaReceipt } from "@orca-hq/orca-adapter";
 import { z } from "zod";
 
 import type {
+  AssignmentArtifact,
+  AssignmentArtifactCleanupResult
+} from "./assignment-artifacts.js";
+import type {
   ProviderInspectReceipt,
   ProviderStartReceipt,
   WorkerProviderId
@@ -142,12 +146,18 @@ export type DispatchRecord = Readonly<{
   attempt: number;
   state: DispatchState;
   assignment: WorkerAssignment;
+  assignmentArtifact?: AssignmentArtifact | undefined;
+  assignmentArtifactCleanup?: Readonly<{
+    kind: AssignmentArtifactCleanupResult;
+  }> | undefined;
   retryOf?: string | undefined;
   orcaDispatchId?: string | undefined;
   receipt?: OrcaReceipt | undefined;
   providerId?: WorkerProviderId | undefined;
   providerStartReceipt?: ProviderStartReceipt | undefined;
   providerInspectReceipts?: readonly ProviderInspectReceipt[] | undefined;
+  fenceReceipt?: OrcaReceipt | undefined;
+  fenceFailure?: WorkerReleaseFailure | undefined;
   launchFailureId?: string | undefined;
   releaseReceipt?: OrcaReceipt | undefined;
   releaseFailure?: WorkerReleaseFailure | undefined;
@@ -312,6 +322,10 @@ export class ExecutionLifecycle {
       | "receipt"
       | "providerId"
       | "providerStartReceipt"
+      | "assignmentArtifact"
+      | "assignmentArtifactCleanup"
+      | "fenceReceipt"
+      | "fenceFailure"
       | "launchFailureId"
       | "releaseReceipt"
       | "releaseFailure"
@@ -380,6 +394,49 @@ export class ExecutionLifecycle {
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
     const updated = Object.freeze({ ...current, ...outcome });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordWorkerFence(
+    localDispatchId: string,
+    orcaDispatchId: string,
+    outcome: Readonly<
+      | { fenceReceipt: OrcaReceipt }
+      | { fenceFailure: WorkerReleaseFailure }
+    >
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const updated = Object.freeze({ ...current, ...outcome, orcaDispatchId });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordAssignmentArtifact(
+    localDispatchId: string,
+    artifact: AssignmentArtifact
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (artifact.ownerDispatchId !== localDispatchId) {
+      throw new TypeError("assignment artifact owner does not match the Dispatch");
+    }
+    const updated = Object.freeze({ ...current, assignmentArtifact: artifact });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordAssignmentArtifactCleanup(
+    localDispatchId: string,
+    kind: AssignmentArtifactCleanupResult
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const updated = Object.freeze({
+      ...current,
+      assignmentArtifactCleanup: Object.freeze({ kind })
+    });
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);
     return updated;

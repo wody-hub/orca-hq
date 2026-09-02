@@ -8,8 +8,8 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts src/providers.ts src/codex-worker.ts src/claude-worker.ts",
-    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts src/providers.ts src/codex-worker.ts src/claude-worker.ts"
+    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/assignment-artifacts.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts src/providers.ts src/codex-worker.ts src/claude-worker.ts",
+    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/assignment-artifacts.ts src/execution-service.ts src/worktree-placement.ts src/lifecycle.ts src/providers.ts src/codex-worker.ts src/claude-worker.ts"
   },
   "dependencies": {
     "@orca-hq/core": "workspace:*",

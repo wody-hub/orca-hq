@@ -10,7 +10,10 @@ import {
   versionIsCompatible,
   type OrcaOperation
 } from "./capabilities.js";
-import { runOrca } from "./process.js";
+import {
+  runOrca,
+  type OrcaConnectionTarget
+} from "./process.js";
 import {
   assertSuccessfulReceipt,
   OrcaInvalidReceiptError,
@@ -31,6 +34,7 @@ export interface OrcaClientOptions {
   readonly expectedVersionRange: string;
   readonly timeoutMs?: number;
   readonly terminationGraceMs?: number;
+  readonly connectionTarget?: OrcaConnectionTarget;
 }
 
 export type LoadedOrcaSkill = Readonly<{
@@ -47,6 +51,17 @@ export type OrcaHealth = Readonly<{
   version: string;
   capabilities: readonly string[];
   missingCapabilities: readonly string[];
+  providerChildEnvironmentIsolation: Readonly<{
+    kind: "unsupported";
+    reason: "public_worker_start_has_no_child_environment_contract";
+  }>;
+  assignmentArtifactAccess: Readonly<
+    | { kind: "same_host" }
+    | {
+        kind: "unsupported";
+        reason: "saved_environment_has_no_assignment_artifact_transport";
+      }
+  >;
   skills: readonly OrcaSkillBinding[];
 }>;
 
@@ -58,9 +73,10 @@ interface StartupState {
 const officialSkillNames = ["orca-cli", "orchestration"] as const;
 
 export class OrcaClient {
-  readonly #options: Required<
-    Pick<OrcaClientOptions, "timeoutMs" | "terminationGraceMs">
-  > & OrcaClientOptions;
+  readonly #options: OrcaClientOptions & Required<Pick<
+    OrcaClientOptions,
+    "timeoutMs" | "terminationGraceMs" | "connectionTarget"
+  >>;
   #startup?: Promise<StartupState>;
 
   constructor(options: OrcaClientOptions) {
@@ -74,7 +90,13 @@ export class OrcaClient {
     if (!Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
       throw new TypeError("terminationGraceMs must be a positive safe integer");
     }
-    this.#options = Object.freeze({ ...options, timeoutMs, terminationGraceMs });
+    const connectionTarget = options.connectionTarget ?? Object.freeze({ kind: "local" as const });
+    this.#options = Object.freeze({
+      ...options,
+      timeoutMs,
+      terminationGraceMs,
+      connectionTarget: Object.freeze({ ...connectionTarget })
+    });
   }
 
   async health(): Promise<OrcaHealth> {
@@ -96,10 +118,31 @@ export class OrcaClient {
     const operation = parseOrcaOperation(operationInput);
     const { health } = await this.#startupState();
     if (isMutation(operation) && !health.compatible) throw new OrcaIncompatibleError();
-    const raw = await runOrca(operationArguments(operation), this.#options);
-    const receipt = parseOrcaReceipt(raw);
-    assertSuccessfulReceipt(receipt);
-    return parseOrcaOperationReceipt(operation.kind, receipt);
+    let raw: unknown;
+    try {
+      raw = await runOrca(operationArguments(operation), this.#options);
+      const receipt = parseOrcaReceipt(raw);
+      assertSuccessfulReceipt(receipt);
+      return parseOrcaOperationReceipt(operation.kind, receipt);
+    } catch (error) {
+      if (
+        operation.kind !== "dispatch_worker"
+        || (error as { code?: unknown })?.code === "orca_command_failed"
+      ) throw error;
+      const dispatchId = (raw as { result?: { dispatchId?: unknown } })?.result?.dispatchId;
+      const uncertain = error instanceof Error
+        ? error
+        : Object.assign(new Error("Orca worker-start outcome is uncertain"), {
+            code: "orca_worker_start_uncertain"
+          });
+      Object.assign(uncertain, {
+        workerMayBeLive: true,
+        ...(typeof dispatchId === "string" && dispatchId.length > 0
+          ? { orcaDispatchId: dispatchId }
+          : {})
+      });
+      throw uncertain;
+    }
   }
 
   #startupState(): Promise<StartupState> {
@@ -141,6 +184,16 @@ export class OrcaClient {
       version,
       capabilities,
       missingCapabilities: absent,
+      providerChildEnvironmentIsolation: Object.freeze({
+        kind: "unsupported" as const,
+        reason: "public_worker_start_has_no_child_environment_contract" as const
+      }),
+      assignmentArtifactAccess: this.#options.connectionTarget.kind === "local"
+        ? Object.freeze({ kind: "same_host" as const })
+        : Object.freeze({
+            kind: "unsupported" as const,
+            reason: "saved_environment_has_no_assignment_artifact_transport" as const
+          }),
       skills
     });
     return Object.freeze({ health, skills: loadedSkills });
@@ -155,8 +208,10 @@ export {
 } from "./capabilities.js";
 export {
   OrcaAbortedError,
+  orcaConnectionArguments,
   OrcaProcessError,
   OrcaTimeoutError,
+  type OrcaConnectionTarget,
 } from "./process.js";
 export {
   OrcaCommandError,
