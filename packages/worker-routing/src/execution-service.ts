@@ -845,9 +845,6 @@ export class ExecutionService {
       if (currentTaskState !== "verified_success") {
         await this.#lifecycle.transitionTask(task.localId, "verified_success");
       }
-      if (!this.#completionWorkOutstanding(run) && currentRunState !== "verified_success") {
-        await this.#lifecycle.transitionRun(run.localId, "verified_success");
-      }
     } else if (decision.kind === "intervention_required") {
       if (
         currentTaskState === "intervention_required"
@@ -1137,8 +1134,10 @@ export class ExecutionService {
     }
     await this.#lifecycle.setVerificationObligationVerifier({
       runId: implementation.run.localId,
-      rootImplementationTaskId:
-        implementation.task.fixTask?.implementationTaskId ?? implementation.task.localId,
+      rootImplementationTaskId: this.#verificationRootTaskId(
+        implementation.run,
+        implementation.task
+      ),
       currentImplementationTaskId: implementation.task.localId,
       implementationDispatchId: implementation.dispatch.localId,
       cycle,
@@ -1264,6 +1263,24 @@ export class ExecutionService {
     };
     await this.#persistDispatch(implementation.run, task, dispatch);
     return this.#launchWithIntervention(implementation.run, task, dispatch);
+  }
+
+  #verificationRootTaskId(run: RunContext, implementation: TaskContext): string {
+    const seen = new Set<string>();
+    let current = implementation;
+    while (current.fixTask !== undefined) {
+      if (seen.has(current.localId)) {
+        throw new Error(`Fix Task lineage contains a cycle at ${current.localId}`);
+      }
+      seen.add(current.localId);
+      const parentTaskId = current.fixTask.implementationTaskId;
+      const parent = run.tasks.find((task) => task.localId === parentTaskId);
+      if (parent === undefined) {
+        throw new Error(`Fix Task ${current.localId} has no implementation parent ${parentTaskId}`);
+      }
+      current = parent;
+    }
+    return current.localId;
   }
 
   async recordLaunchFailure(input: LaunchFailureInput): Promise<LaunchFailureResult> {
@@ -1598,7 +1615,22 @@ export class ExecutionService {
     value: ProviderStartReceipt
   ): ProviderStartReceipt {
     const boundDispatchId = boundProviderStartDispatchId(value, orcaTaskId);
-    const parsed = ProviderStartReceiptSchema.safeParse(value);
+    let auditReceipt: OrcaReceipt;
+    try {
+      auditReceipt = providerStartOrcaAuditReceipt(
+        value.orcaReceipt,
+        value.boundary.providerChildEnvironmentIsolation
+      );
+    } catch {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "start", {
+        workerMayBeLive: true,
+        ...(boundDispatchId === undefined ? {} : { trustedDispatchId: boundDispatchId })
+      });
+    }
+    const parsed = ProviderStartReceiptSchema.safeParse({
+      ...value,
+      orcaReceipt: auditReceipt
+    });
     const expectedPrompt = workerPrompt(assignment);
     const expectedSha256 = createHash("sha256").update(expectedPrompt).digest("hex");
     if (!parsed.success) {
@@ -1639,18 +1671,6 @@ export class ExecutionService {
         ...(boundDispatchId === undefined ? {} : { trustedDispatchId: boundDispatchId })
       });
     }
-    let auditReceipt: OrcaReceipt;
-    try {
-      auditReceipt = providerStartOrcaAuditReceipt(
-        parsed.data.orcaReceipt,
-        parsed.data.boundary.providerChildEnvironmentIsolation
-      );
-    } catch {
-      throw new WorkerProviderError("invalid_provider_receipt", provider, "start", {
-        workerMayBeLive: true,
-        trustedDispatchId: parsed.data.orcaDispatchId
-      });
-    }
     return Object.freeze(ProviderStartReceiptSchema.parse({
       ...parsed.data,
       orcaReceipt: auditReceipt
@@ -1662,7 +1682,21 @@ export class ExecutionService {
     dispatchId: string,
     value: ProviderInspectReceipt
   ): ProviderInspectReceipt {
-    const parsed = ProviderInspectReceiptSchema.safeParse(value);
+    let auditReceipts: ReturnType<typeof providerInspectOrcaAuditReceipts>;
+    try {
+      auditReceipts = providerInspectOrcaAuditReceipts(
+        value.showReceipt,
+        value.readReceipt,
+        dispatchId
+      );
+    } catch {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
+    }
+    const parsed = ProviderInspectReceiptSchema.safeParse({
+      ...value,
+      showReceipt: auditReceipts.showReceipt,
+      readReceipt: auditReceipts.readReceipt
+    });
     if (
       !parsed.success
       || !parsed.data.showReceipt.ok
@@ -1670,16 +1704,6 @@ export class ExecutionService {
       || parsed.data.provider !== provider
       || parsed.data.dispatchId !== dispatchId
     ) {
-      throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
-    }
-    let auditReceipts: ReturnType<typeof providerInspectOrcaAuditReceipts>;
-    try {
-      auditReceipts = providerInspectOrcaAuditReceipts(
-        parsed.data.showReceipt,
-        parsed.data.readReceipt,
-        dispatchId
-      );
-    } catch {
       throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
     }
     if (parsed.data.workerState !== auditReceipts.workerState) {

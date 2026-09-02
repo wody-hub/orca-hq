@@ -310,7 +310,7 @@ const ProviderBoundarySchema = z.object({
   assignmentArtifactAccess: z.object({ kind: z.literal("same_host") }).strict()
 }).strict();
 
-const ProviderStartOrcaAuditReceiptSchema = z.object({
+export const ProviderStartOrcaAuditReceiptSchema = z.object({
   id: NonBlankStringSchema,
   ok: z.literal(true),
   result: z.object({
@@ -319,12 +319,15 @@ const ProviderStartOrcaAuditReceiptSchema = z.object({
     runId: NonBlankStringSchema,
     state: NonBlankStringSchema,
     stage: NonBlankStringSchema,
-    setup: z.object({ state: NonBlankStringSchema }),
-    effects: z.array(z.object({}))
-  })
-});
+    setup: z.object({ state: NonBlankStringSchema }).strict(),
+    effects: z.array(z.object({}).strict()),
+    launch: z.object({
+      providerEnvironment: ProviderChildEnvironmentBoundarySchema
+    }).strict().optional()
+  }).strict()
+}).strict();
 
-const ProviderInspectShowOrcaAuditReceiptSchema = z.object({
+export const ProviderInspectShowOrcaAuditReceiptSchema = z.object({
   id: NonBlankStringSchema,
   ok: z.literal(true),
   result: z.object({
@@ -333,25 +336,25 @@ const ProviderInspectShowOrcaAuditReceiptSchema = z.object({
       task_id: NonBlankStringSchema,
       run_id: NonBlankStringSchema,
       status: NonBlankStringSchema
-    }),
+    }).strict(),
     worker: z.object({
       dispatch_id: NonBlankStringSchema,
       state: NonBlankStringSchema,
       stage: NonBlankStringSchema,
       agent_terminal_handle: NonBlankStringSchema.nullable()
-    }),
-    terminal: z.unknown().transform(() => null),
+    }).strict(),
+    terminal: z.null(),
     observation: z.object({
       status: NonBlankStringSchema,
       exactWorker: z.boolean()
-    }),
+    }).strict(),
     terminalResource: z.object({
       id: NonBlankStringSchema,
       ownershipState: NonBlankStringSchema,
       releaseState: NonBlankStringSchema
-    })
-  })
-});
+    }).strict()
+  }).strict()
+}).strict();
 
 const ProviderInspectReadBaseAuditResultSchema = z.object({
   dispatchId: NonBlankStringSchema,
@@ -359,34 +362,34 @@ const ProviderInspectReadBaseAuditResultSchema = z.object({
   status: z.object({
     worker: NonBlankStringSchema,
     terminal: NonBlankStringSchema
-  }),
-  warnings: z.array(z.string()).transform(() => [] as string[]),
+  }).strict(),
+  warnings: z.array(z.string()).length(0),
   archived: z.boolean()
-});
+}).strict();
 
-const ProviderInspectReadOrcaAuditReceiptSchema = z.object({
+export const ProviderInspectReadOrcaAuditReceiptSchema = z.object({
   id: NonBlankStringSchema,
   ok: z.literal(true),
   result: z.discriminatedUnion("source", [
     ProviderInspectReadBaseAuditResultSchema.extend({
       source: z.literal("transcript"),
       transcript: z.object({
-        messages: z.array(z.unknown()).transform(() => [] as never[]),
+        messages: z.array(z.never()).length(0),
         limited: z.boolean(),
         nextCursor: NonBlankStringSchema,
         returnedMessageCount: z.number().int().nonnegative()
-      })
+      }).strict()
     }),
     ProviderInspectReadBaseAuditResultSchema.extend({
       source: z.literal("terminal"),
       terminal: z.object({
-        lines: z.array(z.string()).transform(() => [] as string[]),
+        lines: z.array(z.string()).length(0),
         limited: z.boolean(),
         nextCursor: NonBlankStringSchema
-      })
+      }).strict()
     })
   ])
-});
+}).strict();
 
 export const ProviderStartReceiptSchema = z.object({
   kind: z.literal("provider_start"),
@@ -398,7 +401,7 @@ export const ProviderStartReceiptSchema = z.object({
   orcaDispatchId: NonBlankStringSchema,
   promptArtifact: AssignmentArtifactSchema,
   boundary: ProviderBoundarySchema,
-  orcaReceipt: OrcaReceiptSchema
+  orcaReceipt: ProviderStartOrcaAuditReceiptSchema
 }).strict();
 
 export const ProviderInspectReceiptSchema = z.object({
@@ -407,8 +410,8 @@ export const ProviderInspectReceiptSchema = z.object({
   provider: WorkerProviderIdSchema,
   dispatchId: NonBlankStringSchema,
   workerState: NonBlankStringSchema,
-  showReceipt: OrcaReceiptSchema,
-  readReceipt: OrcaReceiptSchema
+  showReceipt: ProviderInspectShowOrcaAuditReceiptSchema,
+  readReceipt: ProviderInspectReadOrcaAuditReceiptSchema
 }).strict();
 
 type ParsedProviderStartReceipt = z.infer<typeof ProviderStartReceiptSchema>;
@@ -540,20 +543,31 @@ export function providerStartOrcaAuditReceipt(
       });
     }
   }
-  // The operation parser validates the public shape; this projection strips
-  // pass-through metadata, diagnostics, launch extensions, and effect contents.
-  const projected = ProviderStartOrcaAuditReceiptSchema.parse(receipt);
-  return boundary.kind === "unverified_orca_supervised"
-    ? projected
-    : {
-        ...projected,
-        result: {
-          ...projected.result,
-          launch: {
-            providerEnvironment: boundary
-          }
-        }
-      };
+  const publicResult = receipt.result as {
+    dispatchId: string;
+    taskId: string;
+    runId: string;
+    state: string;
+    stage: string;
+    setup: { state: string };
+    effects: readonly unknown[];
+  };
+  return ProviderStartOrcaAuditReceiptSchema.parse({
+    id: receipt.id,
+    ok: true,
+    result: {
+      dispatchId: publicResult.dispatchId,
+      taskId: publicResult.taskId,
+      runId: publicResult.runId,
+      state: publicResult.state,
+      stage: publicResult.stage,
+      setup: { state: publicResult.setup.state },
+      effects: publicResult.effects.map(() => ({})),
+      ...(boundary.kind === "unverified_orca_supervised"
+        ? {}
+        : { launch: { providerEnvironment: boundary } })
+    }
+  });
 }
 
 export function providerInspectOrcaAuditReceipts(
@@ -566,33 +580,92 @@ export function providerInspectOrcaAuditReceipts(
   readReceipt: OrcaReceipt;
 }> {
   const expectedDispatchId = NonBlankStringSchema.parse(expectedDispatchIdValue);
-  const showReceipt = (() => {
-    try {
-      return ProviderInspectShowOrcaAuditReceiptSchema.parse(
-        parseOrcaOperationReceipt("show_worker", showReceiptValue)
-      );
-    } catch (error) {
-      const auditReceipt = ProviderInspectShowOrcaAuditReceiptSchema.safeParse(
-        showReceiptValue
-      );
-      if (auditReceipt.success) return auditReceipt.data;
-      throw error;
+  const publicShowReceipt = parseOrcaOperationReceipt("show_worker", showReceiptValue);
+  const publicShow = publicShowReceipt.result as {
+    dispatch: { id: string; task_id: string; run_id: string; status: string };
+    worker: {
+      dispatch_id: string;
+      state: string;
+      stage: string;
+      agent_terminal_handle: string | null;
+    };
+    observation: { status: string; exactWorker: boolean };
+    terminalResource: { id: string; ownershipState: string; releaseState: string };
+  };
+  const showReceipt = ProviderInspectShowOrcaAuditReceiptSchema.parse({
+    id: publicShowReceipt.id,
+    ok: true,
+    result: {
+      dispatch: {
+        id: publicShow.dispatch.id,
+        task_id: publicShow.dispatch.task_id,
+        run_id: publicShow.dispatch.run_id,
+        status: publicShow.dispatch.status
+      },
+      worker: {
+        dispatch_id: publicShow.worker.dispatch_id,
+        state: publicShow.worker.state,
+        stage: publicShow.worker.stage,
+        agent_terminal_handle: publicShow.worker.agent_terminal_handle
+      },
+      terminal: null,
+      observation: {
+        status: publicShow.observation.status,
+        exactWorker: publicShow.observation.exactWorker
+      },
+      terminalResource: {
+        id: publicShow.terminalResource.id,
+        ownershipState: publicShow.terminalResource.ownershipState,
+        releaseState: publicShow.terminalResource.releaseState
+      }
     }
-  })();
+  });
   const shown = showResult(showReceipt);
-  const readReceipt = (() => {
-    try {
-      return ProviderInspectReadOrcaAuditReceiptSchema.parse(
-        parseOrcaOperationReceipt("read_worker", readReceiptValue)
-      );
-    } catch (error) {
-      const auditReceipt = ProviderInspectReadOrcaAuditReceiptSchema.safeParse(
-        readReceiptValue
-      );
-      if (auditReceipt.success) return auditReceipt.data;
-      throw error;
+  const publicReadReceipt = parseOrcaOperationReceipt("read_worker", readReceiptValue);
+  const publicRead = publicReadReceipt.result as {
+    dispatchId: string;
+    source: "transcript" | "terminal";
+    cursor: string;
+    status: { worker: string; terminal: string };
+    transcript?: {
+      limited: boolean;
+      nextCursor: string;
+      returnedMessageCount: number;
+    };
+    terminal?: { limited: boolean; nextCursor: string };
+    archived: boolean;
+  };
+  const readReceipt = ProviderInspectReadOrcaAuditReceiptSchema.parse({
+    id: publicReadReceipt.id,
+    ok: true,
+    result: {
+      dispatchId: publicRead.dispatchId,
+      source: publicRead.source,
+      cursor: publicRead.cursor,
+      status: {
+        worker: publicRead.status.worker,
+        terminal: publicRead.status.terminal
+      },
+      ...(publicRead.source === "transcript"
+        ? {
+            transcript: {
+              messages: [],
+              limited: publicRead.transcript?.limited,
+              nextCursor: publicRead.transcript?.nextCursor,
+              returnedMessageCount: publicRead.transcript?.returnedMessageCount
+            }
+          }
+        : {
+            terminal: {
+              lines: [],
+              limited: publicRead.terminal?.limited,
+              nextCursor: publicRead.terminal?.nextCursor
+            }
+          }),
+      warnings: [],
+      archived: publicRead.archived
     }
-  })();
+  });
   if (
     !shown.exactWorker
     || shown.dispatchId !== expectedDispatchId

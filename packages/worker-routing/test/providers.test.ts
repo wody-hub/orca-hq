@@ -131,7 +131,7 @@ class FakeProviderOrca {
               ...(secrets === undefined ? {} : { diagnostic: secrets.openAiVoice })
             },
             terminalResource: {
-              id: "resource-1",
+              id: "terminal-1",
               ownershipState: "owned",
               releaseState: "active",
               ...(secrets === undefined ? {} : { diagnostic: secrets.slack })
@@ -349,7 +349,7 @@ describe("Orca-backed worker providers", () => {
           terminal: null,
           observation: { status: "ready", exactWorker: true },
           terminalResource: {
-            id: "resource-1",
+            id: "terminal-1",
             ownershipState: "owned",
             releaseState: "active"
           }

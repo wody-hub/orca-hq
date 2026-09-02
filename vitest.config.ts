@@ -26,7 +26,10 @@ export default defineConfig({
       "@orca-hq/project-registry": fileURLToPath(
         new URL("./packages/project-registry/src/index.ts", import.meta.url)
       ),
-      "@orca-hq/voice": fileURLToPath(new URL("./packages/voice/src/index.ts", import.meta.url))
+      "@orca-hq/voice": fileURLToPath(new URL("./packages/voice/src/index.ts", import.meta.url)),
+      "@orca-hq/worker-routing": fileURLToPath(
+        new URL("./packages/worker-routing/src/index.ts", import.meta.url)
+      )
     }
   }
 });

@@ -57,6 +57,9 @@ importers:
       '@orca-hq/orca-adapter':
         specifier: workspace:*
         version: link:../orca-adapter
+      '@orca-hq/worker-routing':
+        specifier: workspace:*
+        version: link:../worker-routing
       better-sqlite3:
         specifier: ^12.2.0
         version: 12.11.1
@@ -73,9 +76,6 @@ importers:
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../core
-      '@orca-hq/persistence':
-        specifier: workspace:*
-        version: link:../persistence
       yaml:
         specifier: ^2.8.1
         version: 2.9.0

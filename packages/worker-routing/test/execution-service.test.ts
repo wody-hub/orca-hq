@@ -35,6 +35,7 @@ import {
   type LifecycleMessageSink,
   type LifecycleStore,
   type LifecycleTransition,
+  type ImplementationVerificationEvidence,
   type ProviderCapabilities,
   type ProviderInspectReceipt,
   type ProviderStartReceipt,
@@ -328,7 +329,7 @@ class RecordingOrca {
           terminal: null,
           observation: { status: "ready", exactWorker: true },
           terminalResource: {
-            id: `resource-${operation.dispatchId}`,
+            id: `terminal-${operation.dispatchId}`,
             ownershipState: "owned",
             releaseState: "active"
           }
@@ -715,7 +716,22 @@ const durableVerifierCommands = [{
   auditReference: "audit:durable:verifier:test"
 }];
 
-function durableExecutionService(store: ControlStore, orca: RecordingOrca): ExecutionService {
+function durableExecutionService(
+  store: ControlStore,
+  orca: RecordingOrca,
+  collectImplementation: (input: { task: TaskRecord }) => ImplementationVerificationEvidence =
+    () => ({
+      changedFiles: ["src/api.ts"],
+      gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+      testReceipts: [{
+        command: "pnpm test",
+        exitCode: 0,
+        outcome: "passed" as const,
+        auditReference: "audit:durable:implementation:test"
+      }],
+      auditReferences: ["audit:durable:implementation:dispatch"]
+    })
+): ExecutionService {
   const lifecycle = new ExecutionLifecycle({ store, messages: new RecordingMessageSink() });
   const verification = new VerificationService({
     store,
@@ -744,17 +760,7 @@ function durableExecutionService(store: ControlStore, orca: RecordingOrca): Exec
     verification: {
       service: verification,
       evidence: {
-        collectImplementation: () => ({
-          changedFiles: ["src/api.ts"],
-          gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
-          testReceipts: [{
-            command: "pnpm test",
-            exitCode: 0,
-            outcome: "passed" as const,
-            auditReference: "audit:durable:implementation:test"
-          }],
-          auditReferences: ["audit:durable:implementation:dispatch"]
-        }),
+        collectImplementation,
         collectVerifierCommands: () => durableVerifierCommands
       }
     }
@@ -1431,7 +1437,7 @@ describe("ExecutionService preflight and dispatch", () => {
           terminal: null,
           observation: { status: "ready", exactWorker: true },
           terminalResource: {
-            id: "resource-orca-dispatch-1",
+            id: "terminal-orca-dispatch-1",
             ownershipState: "owned",
             releaseState: "active"
           }
@@ -2583,6 +2589,82 @@ describe("worker lifecycle", () => {
     }
   });
 
+  it("cannot overwrite durable Run success after another verifier context fails to materialize", async () => {
+    // Break caught: in-memory task counting must not override a durable missing-verifier obligation.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-context-failure");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      let collections = 0;
+      const service = durableExecutionService(store, orca, () => {
+        collections += 1;
+        if (collections === 2) throw new Error("synthetic verifier context failure");
+        return {
+          changedFiles: ["src/api.ts"],
+          gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+          testReceipts: [{
+            command: "pnpm test",
+            exitCode: 0,
+            outcome: "passed",
+            auditReference: "audit:durable:implementation:test"
+          }],
+          auditReferences: ["audit:durable:implementation:dispatch"]
+        };
+      });
+      const multiTaskProposal: ExecutionProposal = {
+        ...proposal,
+        tasks: [
+          proposal.tasks[0]!,
+          {
+            localId: "implement-client",
+            title: "Implement the client change",
+            dependsOn: [],
+            role: "implement",
+            preferredAgent: "claude"
+          }
+        ]
+      };
+      await service.start(authorized(multiTaskProposal));
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "context-failure-server",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "server implementation complete"
+      });
+      await expect(service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "context-failure-client",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "client implementation complete"
+      })).rejects.toThrow("synthetic verifier context failure");
+
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "context-failure-first-verifier",
+        dispatchId: "orca-dispatch-3",
+        outcome: "completed",
+        summary: "first verifier complete"
+      });
+      const firstVerifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.payload.implementationTaskId ===
+          "task:proposal-1:implement"
+      )?.payload as VerificationTask | undefined;
+      if (firstVerifier === undefined) throw new Error("first verifier Task missing");
+      await service.recordVerificationReport(
+        durableReport(firstVerifier, "pass", "report:durable:context-partial-pass")
+      );
+
+      expect(database.prepare("SELECT state FROM runs WHERE id = 'run:proposal-1'").get())
+        .toEqual({ state: "awaiting_verification" });
+      expect(store.listOutbox()).toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
   it("resumes one durably persisted Fix launch after a fresh service restart", async () => {
     // Break caught: failed-report replay must recover its existing Fix identity across process state loss.
     const database = openDatabase(":memory:");
@@ -2645,6 +2727,81 @@ describe("worker lifecycle", () => {
       expect(store.listAuditEvents().filter(({ eventType }) => eventType === "verification.failed"))
         .toHaveLength(1);
       expect(store.listOutbox()).toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("keeps the original obligation root through the second Fix lineage", async () => {
+    // Break caught: cycle-2 verifier creation must not treat the cycle-1 Fix as a new root.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-second-fix-lineage");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      await service.start(authorized());
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "second-fix-implementation",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      });
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "second-fix-verifier-0",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "cycle 0 verifier found a defect"
+      });
+      const verifier0 = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier0 === undefined) throw new Error("cycle 0 verifier missing");
+      await service.recordVerificationReport(
+        durableReport(verifier0, "fail", "report:durable:second-fix:0")
+      );
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "second-fix-implementation-1",
+        dispatchId: "orca-dispatch-3",
+        outcome: "completed",
+        summary: "first Fix complete"
+      });
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "second-fix-verifier-1",
+        dispatchId: "orca-dispatch-4",
+        outcome: "completed",
+        summary: "cycle 1 verifier found another defect"
+      });
+      const verifier1 = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 1
+      )?.payload as VerificationTask | undefined;
+      if (verifier1 === undefined) throw new Error("cycle 1 verifier missing");
+      await service.recordVerificationReport(
+        durableReport(verifier1, "fail", "report:durable:second-fix:1")
+      );
+
+      await expect(service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "second-fix-implementation-2",
+        dispatchId: "orca-dispatch-5",
+        outcome: "completed",
+        summary: "second Fix complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-6"] });
+      const runPayload = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<Record<string, unknown>>;
+      };
+      expect(runPayload.verificationObligations).toContainEqual(expect.objectContaining({
+        rootImplementationTaskId: "task:proposal-1:implement",
+        currentImplementationTaskId: "task:proposal-1:implement:fix:1:fix:2",
+        cycle: 2,
+        status: "verifier_running"
+      }));
     } finally {
       database.close();
     }

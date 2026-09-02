@@ -1,10 +1,55 @@
-import {
-  type ControlStore,
-  type WorktreeAcquireResult,
-  type WorktreeHeartbeatResult,
-  type WorktreeLease,
-  type WorktreeReleaseResult
-} from "@orca-hq/persistence";
+export type WorktreeLease = Readonly<{
+  lockKey: string;
+  commandId: string;
+  taskId: string;
+  projectKey: string;
+  worktreePath: string;
+  branch: string;
+  dispatchId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+}>;
+
+export type WorktreeAcquireResult =
+  | Readonly<{ kind: "acquired"; lease: WorktreeLease }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{
+      kind: "review_required";
+      reason: "expired_lease_requires_reconciliation";
+      lease: WorktreeLease;
+    }>;
+
+export type WorktreeHeartbeatResult =
+  | Readonly<{ kind: "heartbeated"; lease: WorktreeLease }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{ kind: "not_found" }>
+  | Readonly<{
+      kind: "review_required";
+      reason: "expired_lease_requires_reconciliation" | "non_monotonic_heartbeat";
+      lease: WorktreeLease;
+    }>;
+
+export type WorktreeReleaseResult =
+  | Readonly<{ kind: "released" }>
+  | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
+  | Readonly<{ kind: "not_found" }>;
+
+export interface WorktreeLockStore {
+  acquireWorktreeLock(lease: WorktreeLease): WorktreeAcquireResult;
+  heartbeatWorktreeLock(input: Readonly<{
+    lockKey: string;
+    dispatchId: string;
+    heartbeatAt: string;
+    expiresAt: string;
+  }>): WorktreeHeartbeatResult;
+  releaseWorktreeLock(input: Readonly<{
+    lockKey: string;
+    dispatchId: string;
+    releasedAt: string;
+  }>): WorktreeReleaseResult;
+  getWorktreeLock(lockKey: string): WorktreeLease | undefined;
+}
 
 export const WORKTREE_LEASE_DURATION_MS = 5 * 60 * 1_000;
 
@@ -41,7 +86,7 @@ function authoritativeNow(clock: Clock): Date {
 
 export class WorktreeLockService {
   constructor(
-    private readonly store: ControlStore,
+    private readonly store: WorktreeLockStore,
     private readonly clock: Clock = systemClock
   ) {}
 
@@ -78,10 +123,3 @@ export class WorktreeLockService {
     return this.store.getWorktreeLock(lockKey);
   }
 }
-
-export type {
-  WorktreeAcquireResult,
-  WorktreeHeartbeatResult,
-  WorktreeLease,
-  WorktreeReleaseResult
-} from "@orca-hq/persistence";

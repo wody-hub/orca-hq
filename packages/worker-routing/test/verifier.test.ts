@@ -207,7 +207,10 @@ function persistCompletedVerificationDispatches(
         attemptContext: "orca_injected_task_spec_and_prestart_assignment",
         credentialSource: "provider_authenticated_cli",
         postStartMail: false,
-        providerChildEnvironmentIsolation: { kind: "verified_effective_allowlist" },
+        providerChildEnvironmentIsolation: {
+          kind: "verified_effective_allowlist",
+          effectiveEnvironmentKeys: ["HOME", "PATH"]
+        },
         assignmentArtifactAccess: { kind: "same_host" }
       },
       orcaReceipt: {
@@ -347,6 +350,33 @@ function persistCompletedVerificationDispatches(
     SET payload_json = json_set(payload_json, '$.orcaTaskId', 'orca-task-verifier')
     WHERE id = ?
   `).run(task.taskId);
+}
+
+function insertDurableTask(
+  database: Database.Database,
+  id: string,
+  runId: string,
+  state: string,
+  payload: Record<string, unknown>
+): void {
+  const now = "2026-09-02T00:00:00.000Z";
+  database.prepare(`
+    INSERT INTO tasks (id, run_id, state, payload_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, runId, state, JSON.stringify(payload), now, now);
+}
+
+function insertDurableDispatch(
+  database: Database.Database,
+  id: string,
+  taskId: string,
+  state = "worker_done"
+): void {
+  const now = "2026-09-02T00:00:00.000Z";
+  database.prepare(`
+    INSERT INTO dispatches (id, task_id, state, payload_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, taskId, state, JSON.stringify({ id, taskId }), now, now);
 }
 
 afterEach(() => {
@@ -550,6 +580,192 @@ describe("cross-model verification", () => {
     expect(store.listOutbox()).not.toContainEqual(expect.objectContaining({ template: "success" }));
   });
 
+  it("rejects success when the obligation set omits a durable original implementation root", async () => {
+    // Break caught: caller-selected obligations must not erase a completed original implementation.
+    const { store, database } = persistentStore();
+    const service = new VerificationService({ store, completionTarget });
+    const task = await service.start(input);
+    persistCompletedVerificationDispatches(database, task);
+    insertDurableTask(
+      database,
+      "task:proposal-1:omitted-root",
+      task.runId,
+      "worker_done",
+      {
+        id: "task:proposal-1:omitted-root",
+        runId: task.runId,
+        localId: "omitted-root",
+        title: "Omitted original implementation",
+        role: "implement",
+        preferredAgent: "claude",
+        dependsOn: [],
+        orcaTaskId: "orca-task-omitted-root"
+      }
+    );
+
+    await expect(service.complete(report(task, "pass")))
+      .rejects.toThrow("verification obligation roots");
+    expect(database.prepare("SELECT state FROM runs WHERE id = ?").get(task.runId))
+      .toEqual({ state: "awaiting_verification" });
+    expect(store.listAuditEvents()).toEqual([]);
+    expect(store.listOutbox()).toEqual([]);
+  });
+
+  it("rejects advancing one root obligation with another root's Fix", () => {
+    // Break caught: equal-or-higher cycle is not proof that a Fix descends from this root.
+    const { store, database } = persistentStore();
+    const otherRoot = "task:proposal-1:other-root";
+    const otherVerifier = `${otherRoot}:verify:0`;
+    const crossRootFix = `${otherRoot}:fix:1`;
+    insertDurableTask(database, otherRoot, input.runId, "worker_done", {
+      id: otherRoot,
+      runId: input.runId,
+      localId: "other-root",
+      title: "Other root implementation",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [],
+      orcaTaskId: "orca-task-other-root"
+    });
+    insertDurableTask(database, otherVerifier, input.runId, "verification_failed", {
+      taskId: otherVerifier,
+      runId: input.runId,
+      title: "Verify other root",
+      role: "verify",
+      preferredAgent: "claude",
+      cycle: 0,
+      implementationTaskId: otherRoot,
+      implementationDispatchId: "dispatch:proposal-1:other-root:1"
+    });
+    insertDurableTask(database, crossRootFix, input.runId, "worker_done", {
+      taskId: crossRootFix,
+      runId: input.runId,
+      sourceVerificationTaskId: otherVerifier,
+      implementationTaskId: otherRoot,
+      title: "Fix other root",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [otherVerifier],
+      cycle: 1,
+      findings: ["other root finding"],
+      requestedScope: ["src/**"],
+      prohibitedEffects: ["push"],
+      permissions: "read-write",
+      nestedWorkers: "forbidden",
+      orcaTaskId: "orca-task-cross-root-fix"
+    });
+    const crossDispatch = `dispatch:${crossRootFix}:1`;
+    insertDurableDispatch(database, crossDispatch, crossRootFix);
+    database.prepare(`
+      UPDATE runs SET payload_json = json_set(payload_json, '$.verificationObligations', json(?))
+      WHERE id = ?
+    `).run(JSON.stringify([
+      {
+        rootImplementationTaskId: input.implementationTaskId,
+        currentImplementationTaskId: input.implementationTaskId,
+        implementationDispatchId: input.implementationDispatchId,
+        cycle: 0,
+        status: "fix_required"
+      },
+      {
+        rootImplementationTaskId: otherRoot,
+        currentImplementationTaskId: otherRoot,
+        implementationDispatchId: "dispatch:proposal-1:other-root:1",
+        cycle: 0,
+        status: "pending",
+        verificationTaskId: otherVerifier
+      }
+    ]), input.runId);
+
+    expect(() => store.setVerificationObligationVerifier({
+      runId: input.runId,
+      rootImplementationTaskId: input.implementationTaskId,
+      currentImplementationTaskId: crossRootFix,
+      implementationDispatchId: crossDispatch,
+      cycle: 1,
+      verificationTaskId: `${crossRootFix}:verify:1`
+    })).toThrow("latest Fix lineage");
+    expect(store.listAuditEvents()).toEqual([]);
+    expect(store.listOutbox()).toEqual([]);
+  });
+
+  it("rejects advancing an obligation from a historical Fix when a later Fix exists", () => {
+    // Break caught: a passing historical cycle cannot supersede a newer durable Fix descendant.
+    const { store, database } = persistentStore();
+    const root = input.implementationTaskId;
+    const verifier0 = `${root}:verify:0`;
+    const fix1 = `${root}:fix:1`;
+    const verifier1 = `${fix1}:verify:1`;
+    const fix2 = `${fix1}:fix:2`;
+    insertDurableTask(database, verifier0, input.runId, "verification_failed", {
+      taskId: verifier0,
+      runId: input.runId,
+      title: "Verify root",
+      role: "verify",
+      preferredAgent: "claude",
+      cycle: 0,
+      implementationTaskId: root,
+      implementationDispatchId: input.implementationDispatchId
+    });
+    insertDurableTask(database, fix1, input.runId, "worker_done", {
+      taskId: fix1,
+      runId: input.runId,
+      sourceVerificationTaskId: verifier0,
+      implementationTaskId: root,
+      title: "First Fix",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [verifier0],
+      cycle: 1,
+      findings: ["first finding"],
+      requestedScope: ["src/**"],
+      prohibitedEffects: ["push"],
+      permissions: "read-write",
+      nestedWorkers: "forbidden",
+      orcaTaskId: "orca-task-fix-1"
+    });
+    insertDurableTask(database, verifier1, input.runId, "verification_failed", {
+      taskId: verifier1,
+      runId: input.runId,
+      title: "Verify first Fix",
+      role: "verify",
+      preferredAgent: "claude",
+      cycle: 1,
+      implementationTaskId: fix1,
+      implementationDispatchId: `dispatch:${fix1}:1`
+    });
+    insertDurableTask(database, fix2, input.runId, "worker_done", {
+      taskId: fix2,
+      runId: input.runId,
+      sourceVerificationTaskId: verifier1,
+      implementationTaskId: fix1,
+      title: "Second Fix",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [verifier1],
+      cycle: 2,
+      findings: ["second finding"],
+      requestedScope: ["src/**"],
+      prohibitedEffects: ["push"],
+      permissions: "read-write",
+      nestedWorkers: "forbidden",
+      orcaTaskId: "orca-task-fix-2"
+    });
+    const historicalDispatch = `dispatch:${fix1}:1`;
+    insertDurableDispatch(database, historicalDispatch, fix1);
+
+    expect(() => store.setVerificationObligationVerifier({
+      runId: input.runId,
+      rootImplementationTaskId: root,
+      currentImplementationTaskId: fix1,
+      implementationDispatchId: historicalDispatch,
+      cycle: 1,
+      verificationTaskId: verifier1
+    })).toThrow("latest Fix lineage");
+    expect(store.listAuditEvents()).toEqual([]);
+    expect(store.listOutbox()).toEqual([]);
+  });
+
   it("rolls back every verification side effect when its audit cannot be written", async () => {
     // Break caught: a visible state transition without its audit destroys completion traceability.
     const { store, database } = persistentStore();
@@ -604,6 +820,57 @@ describe("cross-model verification", () => {
   });
 
   it.each([
+    {
+      name: "provider start envelope omits required isolation evidence",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_remove(
+          payload_json,
+          '$.providerStartReceipt.boundary.providerChildEnvironmentIsolation.effectiveEnvironmentKeys'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "provider start envelope asserts an arbitrary isolation kind",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(
+          payload_json,
+          '$.providerStartReceipt.boundary.providerChildEnvironmentIsolation.kind',
+          'trust_me_isolated'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "provider terminal resource differs from its worker terminal handle",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(
+          payload_json,
+          '$.providerInspectReceipts[0].showReceipt.result.terminalResource.id',
+          'terminal:other-worker'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "provider read state contradicts its inspected worker state",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(
+          payload_json,
+          '$.providerInspectReceipts[0].readReceipt.result.status.worker',
+          'stopped'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
     {
       name: "verifier Task is not worker_done",
       mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`

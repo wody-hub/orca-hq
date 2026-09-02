@@ -8,7 +8,11 @@ import {
   type CommandEnvelope,
   type CommandIngress
 } from "@orca-hq/core";
-import { parseOrcaOperationReceipt } from "@orca-hq/orca-adapter";
+import { OrcaReceiptSchema, parseOrcaOperationReceipt } from "@orca-hq/orca-adapter";
+import {
+  ProviderInspectReceiptSchema,
+  ProviderStartReceiptSchema
+} from "@orca-hq/worker-routing";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 
@@ -346,6 +350,24 @@ const FixTaskStoreSchema = z.object({
   nestedWorkers: z.literal("forbidden")
 }).strict();
 
+const DurableFixLineageSchema = z.object({
+  taskId: z.string().min(1),
+  runId: z.string().min(1),
+  sourceVerificationTaskId: z.string().min(1),
+  implementationTaskId: z.string().min(1),
+  role: z.literal("implement"),
+  dependsOn: z.array(z.string().min(1)).length(1),
+  cycle: z.number().int().min(1).max(2)
+}).passthrough();
+
+const DurableVerifierLineageSchema = z.object({
+  taskId: z.string().min(1),
+  runId: z.string().min(1),
+  role: z.literal("verify"),
+  implementationTaskId: z.string().min(1),
+  cycle: z.number().int().min(0).max(2)
+}).passthrough();
+
 const VerificationCommitStoreSchema = z.object({
   report: VerificationReportStoreSchema,
   decision: VerificationDecisionStoreSchema,
@@ -369,74 +391,6 @@ const VerificationCommitStoreSchema = z.object({
     nextAttemptAt: z.string().datetime()
   }).strict().optional()
 }).strict();
-
-const ProviderStartEvidenceStoreSchema = z.object({
-  kind: z.literal("provider_start"),
-  protocol: z.literal(1),
-  provider: z.enum(["codex", "claude"]),
-  assignmentTaskId: z.string().min(1),
-  assignmentDispatchId: z.string().min(1),
-  orcaTaskId: z.string().min(1),
-  orcaDispatchId: z.string().min(1),
-  promptArtifact: z.object({
-    protocol: z.literal(1),
-    artifactId: z.string().regex(/^assignment:[a-f0-9]{64}$/u),
-    path: z.string().min(1),
-    version: z.number().int().positive(),
-    ownerDispatchId: z.string().min(1),
-    content: z.string().min(1),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/u)
-  }).strict(),
-  boundary: z.object({
-    lifecycleAuthority: z.literal("orca_worker_start"),
-    promptDelivery: z.literal("prestart_atomic_assignment_artifact"),
-    attemptContext: z.literal("orca_injected_task_spec_and_prestart_assignment"),
-    credentialSource: z.literal("provider_authenticated_cli"),
-    postStartMail: z.literal(false),
-    providerChildEnvironmentIsolation: z.object({ kind: z.string().min(1) }).passthrough(),
-    assignmentArtifactAccess: z.object({ kind: z.literal("same_host") }).strict()
-  }).strict(),
-  orcaReceipt: z.object({
-    id: z.string().min(1),
-    ok: z.literal(true),
-    result: z.object({
-      dispatchId: z.string().min(1),
-      taskId: z.string().min(1)
-    }).passthrough()
-  }).passthrough()
-}).strict();
-
-const ProviderInspectEvidenceStoreSchema = z.object({
-  kind: z.literal("provider_inspect"),
-  protocol: z.literal(1),
-  provider: z.enum(["codex", "claude"]),
-  dispatchId: z.string().min(1),
-  workerState: z.string().min(1),
-  showReceipt: z.object({
-    id: z.string().min(1),
-    ok: z.literal(true),
-    result: z.object({
-      dispatch: z.object({ id: z.string().min(1) }).passthrough(),
-      worker: z.object({ dispatch_id: z.string().min(1) }).passthrough(),
-      observation: z.object({ exactWorker: z.literal(true) }).passthrough(),
-      terminalResource: z.object({ id: z.string().min(1) }).passthrough()
-    }).passthrough()
-  }).passthrough(),
-  readReceipt: z.object({
-    id: z.string().min(1),
-    ok: z.literal(true),
-    result: z.object({ dispatchId: z.string().min(1) }).passthrough()
-  }).passthrough()
-}).strict();
-
-const ProviderTerminalEvidenceStoreSchema = z.object({
-  id: z.string().min(1),
-  ok: z.literal(true),
-  result: z.object({
-    dispatchId: z.string().min(1),
-    verdict: z.enum(["released", "stopped"])
-  }).passthrough()
-}).passthrough();
 
 export type StoredTaskRecord = Readonly<{
   id: string;
@@ -531,6 +485,166 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+type VerificationObligation = z.infer<typeof VerificationObligationStoreSchema>;
+
+type DurableLineageTask = Readonly<{
+  id: string;
+  state: string;
+  payload: Record<string, unknown>;
+}>;
+
+type DurableImplementationLineage = Readonly<{
+  rootTaskId: string;
+  currentTaskId: string;
+  cycle: number;
+}>;
+
+function deriveDurableImplementationLineages(
+  database: Database.Database,
+  runId: string,
+  obligations: readonly VerificationObligation[]
+): ReadonlyMap<string, DurableImplementationLineage> {
+  const rows = database.prepare(`
+    SELECT id, state, payload_json
+    FROM tasks
+    WHERE run_id = ?
+  `).all(runId) as Array<Pick<StoredTaskRow, "id" | "state" | "payload_json">>;
+  const tasks: DurableLineageTask[] = rows.map((row) => {
+    const payload = objectValue(parseJson(row.payload_json));
+    if (payload === undefined) throw new TypeError(`Task ${row.id} payload is invalid`);
+    return { id: row.id, state: row.state, payload };
+  });
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const roots = tasks.filter((task) =>
+    task.payload.role === "implement" && task.payload.sourceVerificationTaskId === undefined
+  );
+  const derivedRootIds = roots.map(({ id }) => id).sort();
+  const obligationRootIds = obligations.map(({ rootImplementationTaskId }) =>
+    rootImplementationTaskId
+  ).sort();
+  if (
+    new Set(obligationRootIds).size !== obligationRootIds.length
+    || !isDeepStrictEqual(derivedRootIds, obligationRootIds)
+  ) {
+    throw new TypeError(`Run ${runId} verification obligation roots are not exhaustive`);
+  }
+
+  const resolvedFixes = new Map<string, DurableImplementationLineage>();
+  const resolving = new Set<string>();
+  const resolveFix = (task: DurableLineageTask): DurableImplementationLineage => {
+    const existing = resolvedFixes.get(task.id);
+    if (existing !== undefined) return existing;
+    if (resolving.has(task.id)) {
+      throw new TypeError(`Run ${runId} latest Fix lineage contains a cycle`);
+    }
+    resolving.add(task.id);
+    try {
+      const fix = DurableFixLineageSchema.parse(task.payload);
+      if (fix.taskId !== task.id || fix.runId !== runId) {
+        throw new TypeError(`Run ${runId} latest Fix lineage has a mismatched Task identity`);
+      }
+      const parent = tasksById.get(fix.implementationTaskId);
+      if (parent === undefined || parent.payload.role !== "implement") {
+        throw new TypeError(`Run ${runId} latest Fix lineage has no implementation parent`);
+      }
+      const parentLineage = parent.payload.sourceVerificationTaskId === undefined
+        ? { rootTaskId: parent.id, currentTaskId: parent.id, cycle: 0 }
+        : resolveFix(parent);
+      const sourceVerifier = tasksById.get(fix.sourceVerificationTaskId);
+      if (sourceVerifier === undefined) {
+        throw new TypeError(`Run ${runId} latest Fix lineage has no source verifier`);
+      }
+      const verifier = DurableVerifierLineageSchema.parse(sourceVerifier.payload);
+      if (
+        verifier.taskId !== sourceVerifier.id
+        || verifier.runId !== runId
+        || verifier.implementationTaskId !== parent.id
+        || verifier.cycle !== parentLineage.cycle
+        || fix.cycle !== parentLineage.cycle + 1
+        || !isDeepStrictEqual(fix.dependsOn, [sourceVerifier.id])
+      ) {
+        throw new TypeError(`Run ${runId} latest Fix lineage is not monotonic`);
+      }
+      const lineage = {
+        rootTaskId: parentLineage.rootTaskId,
+        currentTaskId: task.id,
+        cycle: fix.cycle
+      };
+      resolvedFixes.set(task.id, lineage);
+      return lineage;
+    } finally {
+      resolving.delete(task.id);
+    }
+  };
+
+  const fixesByRootAndCycle = new Map<string, Map<number, DurableLineageTask>>();
+  for (const task of tasks) {
+    if (task.payload.role !== "implement" || task.payload.sourceVerificationTaskId === undefined) {
+      continue;
+    }
+    const lineage = resolveFix(task);
+    const fixesByCycle = fixesByRootAndCycle.get(lineage.rootTaskId) ?? new Map();
+    if (fixesByCycle.has(lineage.cycle)) {
+      throw new TypeError(`Run ${runId} latest Fix lineage branches at cycle ${lineage.cycle}`);
+    }
+    fixesByCycle.set(lineage.cycle, task);
+    fixesByRootAndCycle.set(lineage.rootTaskId, fixesByCycle);
+  }
+
+  return new Map(roots.map((root) => {
+    const fixesByCycle = fixesByRootAndCycle.get(root.id);
+    const cycleOne = fixesByCycle?.get(1);
+    const cycleTwo = fixesByCycle?.get(2);
+    if (cycleTwo !== undefined && cycleOne === undefined) {
+      throw new TypeError(`Run ${runId} latest Fix lineage skips cycle 1`);
+    }
+    if (cycleOne !== undefined) {
+      const firstFix = DurableFixLineageSchema.parse(cycleOne.payload);
+      if (firstFix.implementationTaskId !== root.id) {
+        throw new TypeError(`Run ${runId} latest Fix lineage has a historical branch`);
+      }
+    }
+    if (cycleTwo !== undefined) {
+      const secondFix = DurableFixLineageSchema.parse(cycleTwo.payload);
+      if (secondFix.implementationTaskId !== cycleOne?.id) {
+        throw new TypeError(`Run ${runId} latest Fix lineage has a historical branch`);
+      }
+    }
+    const current = cycleTwo ?? cycleOne ?? root;
+    return [root.id, {
+      rootTaskId: root.id,
+      currentTaskId: current.id,
+      cycle: cycleTwo === undefined ? cycleOne === undefined ? 0 : 1 : 2
+    }];
+  }));
+}
+
+function assertObligationsOwnLatestLineages(
+  database: Database.Database,
+  runId: string,
+  obligations: readonly VerificationObligation[]
+): ReadonlyMap<string, DurableImplementationLineage> {
+  const lineages = deriveDurableImplementationLineages(database, runId, obligations);
+  for (const obligation of obligations) {
+    const lineage = lineages.get(obligation.rootImplementationTaskId);
+    if (
+      lineage === undefined
+      || obligation.currentImplementationTaskId !== lineage.currentTaskId
+      || obligation.cycle !== lineage.cycle
+    ) {
+      throw new TypeError(`Run ${runId} obligation does not own its latest Fix lineage`);
+    }
+    if (
+      obligation.verificationTaskId !== undefined
+      && obligation.verificationTaskId !==
+        `${lineage.currentTaskId}:verify:${lineage.cycle}`
+    ) {
+      throw new TypeError(`Run ${runId} verifier identity is not bound to its latest Fix lineage`);
+    }
+  }
+  return lineages;
+}
+
 function verificationDecisionFor(
   report: z.infer<typeof VerificationReportStoreSchema>
 ): z.infer<typeof VerificationDecisionStoreSchema> {
@@ -555,45 +669,50 @@ function hasBoundProviderReceipts(
   orcaTaskId: string,
   orcaRunId: string
 ): boolean {
-  const startResult = ProviderStartEvidenceStoreSchema.safeParse(payload.providerStartReceipt);
-  const inspectionsResult = z.array(ProviderInspectEvidenceStoreSchema).min(1)
+  const startResult = ProviderStartReceiptSchema.safeParse(payload.providerStartReceipt);
+  const inspectionsResult = z.array(ProviderInspectReceiptSchema).min(1)
     .safeParse(payload.providerInspectReceipts);
-  const terminalResult = ProviderTerminalEvidenceStoreSchema.safeParse(
-    payload.releaseReceipt ?? payload.fenceReceipt
-  );
-  if (!startResult.success || !inspectionsResult.success || !terminalResult.success) return false;
+  if (!startResult.success || !inspectionsResult.success) return false;
   const start = startResult.data;
   const orcaDispatchId = start.orcaDispatchId;
   const assignment = objectValue(payload.assignment);
   const assignmentArtifact = objectValue(payload.assignmentArtifact);
   try {
-    const startReceipt = parseOrcaOperationReceipt("dispatch_worker", start.orcaReceipt);
-    const startReceiptResult = objectValue(startReceipt.result);
-    if (startReceiptResult === undefined) return false;
+    const startReceipt = start.orcaReceipt;
+    const startReceiptResult = startReceipt.result;
     for (const inspection of inspectionsResult.data) {
-      const showReceipt = parseOrcaOperationReceipt("show_worker", inspection.showReceipt);
-      const readReceipt = parseOrcaOperationReceipt("read_worker", inspection.readReceipt);
-      const show = objectValue(showReceipt.result);
-      const showDispatch = objectValue(show?.dispatch);
-      const showWorker = objectValue(show?.worker);
-      const terminalResource = objectValue(show?.terminalResource);
-      const read = objectValue(readReceipt.result);
+      const showReceipt = inspection.showReceipt;
+      const readReceipt = inspection.readReceipt;
+      const show = showReceipt.result;
+      const read = readReceipt.result;
       if (
         inspection.provider !== provider
         || inspection.dispatchId !== orcaDispatchId
-        || showDispatch?.id !== orcaDispatchId
-        || showDispatch.task_id !== orcaTaskId
-        || showDispatch.run_id !== orcaRunId
-        || showWorker?.dispatch_id !== orcaDispatchId
-        || read?.dispatchId !== orcaDispatchId
-        || terminalResource?.ownershipState !== "owned"
-        || terminalResource.releaseState !== "active"
+        || show.dispatch.id !== orcaDispatchId
+        || show.dispatch.task_id !== orcaTaskId
+        || show.dispatch.run_id !== orcaRunId
+        || show.worker.dispatch_id !== orcaDispatchId
+        || show.worker.agent_terminal_handle === null
+        || show.worker.agent_terminal_handle !== show.terminalResource.id
+        || inspection.workerState !== show.worker.state
+        || show.worker.state !== show.observation.status
+        || show.worker.state !== read.status.worker
+        || startReceipt.result.state !== show.worker.state
+        || startReceipt.result.stage !== show.worker.stage
+        || read.dispatchId !== orcaDispatchId
+        || read.status.terminal !== "running"
+        || show.terminalResource.ownershipState !== "owned"
+        || show.terminalResource.releaseState !== "active"
       ) return false;
     }
     const terminalOperation = payload.releaseReceipt === undefined ? "stop_worker" : "release_worker";
+    const terminalEnvelope = OrcaReceiptSchema.parse(
+      payload.releaseReceipt ?? payload.fenceReceipt
+    );
+    if (!terminalEnvelope.ok) return false;
     const terminalReceipt = parseOrcaOperationReceipt(
       terminalOperation,
-      terminalResult.data
+      terminalEnvelope
     );
     const terminal = objectValue(terminalReceipt.result);
     const expectedTerminal = terminalOperation === "release_worker"
@@ -697,44 +816,6 @@ export class ControlStore implements CommandIngress {
   ensureVerificationObligations(runIdInput: unknown, obligationsInput: unknown): void {
     const runId = z.string().min(1).parse(runIdInput);
     const obligations = z.array(VerificationObligationStoreSchema).min(1).parse(obligationsInput);
-    const roots = new Set(obligations.map(({ rootImplementationTaskId }) =>
-      rootImplementationTaskId
-    ));
-    if (roots.size !== obligations.length) {
-      throw new TypeError("verification obligation roots must be unique");
-    }
-    for (const obligation of obligations) {
-      if (
-        obligation.currentImplementationTaskId !== obligation.rootImplementationTaskId
-        || obligation.cycle !== 0
-        || obligation.status !== "pending"
-        || obligation.verificationTaskId !==
-          `${obligation.rootImplementationTaskId}:verify:0`
-      ) {
-        throw new TypeError("initial verification obligation is not bound to its root Task");
-      }
-      const task = this.database.prepare(`
-        SELECT run_id, state, payload_json FROM tasks WHERE id = ?
-      `).get(obligation.rootImplementationTaskId) as Omit<StoredTaskRow, "id"> | undefined;
-      const taskPayload = objectValue(task === undefined ? undefined : parseJson(task.payload_json));
-      const dispatch = this.database.prepare(`
-        SELECT task_id, state FROM dispatches WHERE id = ?
-      `).get(obligation.implementationDispatchId) as {
-        task_id: string;
-        state: string;
-      } | undefined;
-      if (
-        task === undefined
-        || task.run_id !== runId
-        || task.state !== "worker_done"
-        || taskPayload?.role !== "implement"
-        || taskPayload.sourceVerificationTaskId !== undefined
-        || dispatch?.task_id !== obligation.rootImplementationTaskId
-        || dispatch.state !== "worker_done"
-      ) {
-        throw new TypeError("verification obligation root is not a completed implementation");
-      }
-    }
     this.database.transaction(() => {
       const row = this.database.prepare(`
         SELECT payload_json FROM runs WHERE id = ?
@@ -742,6 +823,38 @@ export class ControlStore implements CommandIngress {
       if (row === undefined) throw new Error(`Run ${runId} is not persisted`);
       const payload = objectValue(parseJson(row.payload_json));
       if (payload === undefined) throw new TypeError(`Run ${runId} payload is invalid`);
+      const lineages = assertObligationsOwnLatestLineages(this.database, runId, obligations);
+      for (const obligation of obligations) {
+        const lineage = lineages.get(obligation.rootImplementationTaskId);
+        const task = this.database.prepare(`
+          SELECT run_id, state, payload_json FROM tasks WHERE id = ?
+        `).get(obligation.rootImplementationTaskId) as Omit<StoredTaskRow, "id"> | undefined;
+        const taskPayload = objectValue(
+          task === undefined ? undefined : parseJson(task.payload_json)
+        );
+        const dispatch = this.database.prepare(`
+          SELECT task_id, state FROM dispatches WHERE id = ?
+        `).get(obligation.implementationDispatchId) as {
+          task_id: string;
+          state: string;
+        } | undefined;
+        if (
+          lineage?.cycle !== 0
+          || obligation.currentImplementationTaskId !== obligation.rootImplementationTaskId
+          || obligation.status !== "pending"
+          || obligation.verificationTaskId !==
+            `${obligation.rootImplementationTaskId}:verify:0`
+          || task === undefined
+          || task.run_id !== runId
+          || task.state !== "worker_done"
+          || taskPayload?.role !== "implement"
+          || taskPayload.sourceVerificationTaskId !== undefined
+          || dispatch?.task_id !== obligation.rootImplementationTaskId
+          || dispatch.state !== "worker_done"
+        ) {
+          throw new TypeError("initial verification obligation is not bound to its root Task");
+        }
+      }
       if (payload.verificationObligations !== undefined) {
         const existing = z.array(VerificationObligationStoreSchema).min(1)
           .parse(payload.verificationObligations);
@@ -773,12 +886,37 @@ export class ControlStore implements CommandIngress {
       const payload = objectValue(parseJson(row.payload_json));
       const obligations = z.array(VerificationObligationStoreSchema).min(1)
         .parse(payload?.verificationObligations);
+      const lineages = assertObligationsOwnLatestLineages(
+        this.database,
+        input.runId,
+        obligations
+      );
       const index = obligations.findIndex(({ rootImplementationTaskId }) =>
         rootImplementationTaskId === input.rootImplementationTaskId
       );
       const current = obligations[index];
       if (current === undefined) {
         throw new Error(`Run ${input.runId} has no verification obligation for the root Task`);
+      }
+      const lineage = lineages.get(input.rootImplementationTaskId);
+      const implementationDispatch = this.database.prepare(`
+        SELECT task_id, state
+        FROM dispatches
+        WHERE id = ?
+      `).get(input.implementationDispatchId) as {
+        task_id: string;
+        state: string;
+      } | undefined;
+      if (
+        lineage === undefined
+        || input.currentImplementationTaskId !== lineage.currentTaskId
+        || input.cycle !== lineage.cycle
+        || input.verificationTaskId !==
+          `${lineage.currentTaskId}:verify:${lineage.cycle}`
+        || implementationDispatch?.task_id !== lineage.currentTaskId
+        || implementationDispatch.state !== "worker_done"
+      ) {
+        throw new TypeError(`Run ${input.runId} verifier does not own the latest Fix lineage`);
       }
       const next = VerificationObligationStoreSchema.parse({
         rootImplementationTaskId: input.rootImplementationTaskId,
@@ -791,8 +929,11 @@ export class ControlStore implements CommandIngress {
       if (current.status === "passed" || current.status === "intervention_required") {
         throw new Error(`Run ${input.runId} verification obligation is terminal`);
       }
-      if (current.cycle > input.cycle) {
-        throw new Error(`Run ${input.runId} verification obligation cannot move backwards`);
+      if (
+        current.currentImplementationTaskId !== lineage.currentTaskId
+        || current.cycle !== lineage.cycle
+      ) {
+        throw new Error(`Run ${input.runId} verification obligation cannot change lineage`);
       }
       obligations[index] = next;
       const updated = JsonValueSchema.parse({ ...payload, verificationObligations: obligations });
@@ -1394,12 +1535,11 @@ export class ControlStore implements CommandIngress {
       }
       const verificationObligations = z.array(VerificationObligationStoreSchema).min(1)
         .parse(runPayload?.verificationObligations);
-      const uniqueRoots = new Set(verificationObligations.map(({ rootImplementationTaskId }) =>
-        rootImplementationTaskId
-      ));
-      if (uniqueRoots.size !== verificationObligations.length) {
-        throw new TypeError(`Run ${report.runId} has duplicate verification obligation roots`);
-      }
+      assertObligationsOwnLatestLineages(
+        this.database,
+        report.runId,
+        verificationObligations
+      );
       const obligationIndex = verificationObligations.findIndex((obligation) =>
         obligation.verificationTaskId === report.verificationTaskId
       );
