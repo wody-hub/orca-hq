@@ -1,0 +1,10 @@
+{
+  "update_id": 500,
+  "message": {
+    "message_id": 42,
+    "date": 1725148800,
+    "from": { "id": 7788 },
+    "chat": { "id": 9900 },
+    "text": "status"
+  }
+}
