@@ -54,11 +54,11 @@ export async function pollTelegramUpdates(options: TelegramPollingOptions): Prom
     try {
       const offset = await options.cursorStore.load("telegram");
       const updates = await options.updates.getUpdates({ offset, timeoutSeconds, signal: options.signal });
-      failures = 0;
       for (const update of updates) {
         if (options.signal.aborted) return;
         await options.adapter.handleUpdate(update);
       }
+      failures = 0;
     } catch (error) {
       if (options.signal.aborted) return;
       failures += 1;

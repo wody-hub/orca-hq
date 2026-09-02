@@ -202,6 +202,30 @@ describe("Telegram adapter", () => {
     expect(getUpdates).toHaveBeenCalledTimes(2);
   });
 
+  it("caps consecutive retries when handling a fetched update fails", async () => {
+    // Break caught: resetting after fetch rather than after a completed batch retries a durable-ingress failure forever.
+    const controller = new AbortController();
+    const error = new Error("durable ingress unavailable");
+    const handleUpdate = vi.fn(async () => { throw error; });
+    const getUpdates = vi.fn(async () => {
+      if (getUpdates.mock.calls.length === 3) controller.abort();
+      return [{ update_id: 500 }];
+    });
+
+    await expect(pollTelegramUpdates({
+      adapter: { handleUpdate, deliver: vi.fn() },
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      updates: { getUpdates },
+      signal: controller.signal,
+      maxConsecutiveFailures: 1,
+      sleep: vi.fn(async () => undefined),
+      random: () => 0
+    })).rejects.toThrow("durable ingress unavailable");
+
+    expect(handleUpdate).toHaveBeenCalledTimes(2);
+    expect(getUpdates).toHaveBeenCalledTimes(2);
+  });
+
   it("delivers progress as a reply to the originating Telegram message", async () => {
     // Break caught: dropping reply_to_message_id detaches progress from its source command.
     const send = vi.fn(async () => ({ messageId: 44 }));
