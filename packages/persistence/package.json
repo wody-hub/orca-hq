@@ -8,8 +8,8 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/database.ts src/migrations/001-initial.ts src/store.ts",
-    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/database.ts src/migrations/001-initial.ts src/store.ts"
+    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/database.ts src/migrations/001-initial.ts src/store.ts src/outbox-dispatcher.ts",
+    "typecheck": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --noEmit src/index.ts src/database.ts src/migrations/001-initial.ts src/store.ts src/outbox-dispatcher.ts"
   },
   "dependencies": {
     "@orca-hq/core": "workspace:*",

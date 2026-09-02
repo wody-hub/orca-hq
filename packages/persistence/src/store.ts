@@ -1,66 +1,17 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  ChannelMessageJsonSchema,
   CommandEnvelopeSchema,
+  type ChannelMessageJson,
   type CommandEnvelope,
   type CommandIngress
 } from "@orca-hq/core";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 
-export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
-
-function isJsonValue(value: unknown, ancestors: Set<object>): value is JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return true;
-  }
-  if (typeof value === "number") {
-    return Number.isFinite(value);
-  }
-  if (typeof value !== "object" || ancestors.has(value)) {
-    return false;
-  }
-
-  if (Array.isArray(value)) {
-    ancestors.add(value);
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.hasOwn(value, index) || !isJsonValue(value[index], ancestors)) {
-        ancestors.delete(value);
-        return false;
-      }
-    }
-    ancestors.delete(value);
-    return Reflect.ownKeys(value).every((key) => key === "length" || (
-      typeof key === "string" && /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length
-    ));
-  }
-
-  const prototype = Object.getPrototypeOf(value) as object | null;
-  if (prototype !== Object.prototype && prototype !== null) {
-    return false;
-  }
-
-  ancestors.add(value);
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== "string" || !isJsonValue((value as Record<string, unknown>)[key], ancestors)) {
-      ancestors.delete(value);
-      return false;
-    }
-  }
-  ancestors.delete(value);
-  return true;
-}
-
-export const JsonValueSchema = z.custom<JsonValue>(
-  (value): value is JsonValue => isJsonValue(value, new Set()),
-  { message: "must be a lossless JSON value" }
-);
+export type JsonValue = ChannelMessageJson;
+export const JsonValueSchema = ChannelMessageJsonSchema;
 
 const InboxEventSchema = z.object({
   id: z.string().min(1),
@@ -177,6 +128,11 @@ export type WorktreeReleaseResult =
   | Readonly<{ kind: "conflict"; lease: WorktreeLease }>
   | Readonly<{ kind: "not_found" }>;
 
+export type TaskRecord = Readonly<{
+  id: string;
+  state: string;
+}>;
+
 interface CommandRow {
   payload_json: string;
 }
@@ -220,6 +176,11 @@ interface AuditEventRow {
 interface WorktreeLockRow {
   state: string;
   payload_json: string;
+}
+
+interface TaskRow {
+  id: string;
+  state: string;
 }
 
 function parseJson(value: string): unknown {
@@ -402,6 +363,91 @@ export class ControlStore implements CommandIngress {
       if (row === undefined) return undefined;
       return outboxMessageFromRow(row);
     })();
+  }
+
+  getOutbox(idInput: string): OutboxMessage | undefined {
+    const id = z.string().min(1).parse(idInput);
+    const row = this.database.prepare(`
+      SELECT *
+      FROM outbox_messages
+      WHERE id = ?
+    `).get(id) as OutboxMessageRow | undefined;
+    return row === undefined ? undefined : outboxMessageFromRow(row);
+  }
+
+  getTask(idInput: string): TaskRecord | undefined {
+    const id = z.string().min(1).parse(idInput);
+    const row = this.database.prepare(`
+      SELECT id, state
+      FROM tasks
+      WHERE id = ?
+    `).get(id) as TaskRow | undefined;
+    return row === undefined ? undefined : Object.freeze({ id: row.id, state: row.state });
+  }
+
+  markOutboxDelivered(
+    idInput: string,
+    providerMessageIdInput: string,
+    deliveredAtInput = new Date().toISOString()
+  ): void {
+    const id = z.string().min(1).parse(idInput);
+    const providerMessageId = z.string().min(1).parse(providerMessageIdInput);
+    const deliveredAt = normalizeTimestamp(z.string().datetime().parse(deliveredAtInput));
+    const result = this.database.prepare(`
+      UPDATE outbox_messages
+      SET state = 'delivered', provider_message_id = ?, last_error_json = NULL,
+          claimed_by = NULL, claimed_at = NULL, updated_at = ?
+      WHERE id = ? AND state = 'claimed'
+    `).run(providerMessageId, deliveredAt, id);
+    if (result.changes !== 1) throw new Error(`Outbox message ${id} is not claimed`);
+  }
+
+  rescheduleOutbox(
+    idInput: string,
+    retryInput: Readonly<{ nextAttemptAt: string; lastError: JsonValue }>,
+    updatedAtInput = new Date().toISOString()
+  ): void {
+    const id = z.string().min(1).parse(idInput);
+    const nextAttemptAt = normalizeTimestamp(z.string().datetime().parse(retryInput.nextAttemptAt));
+    const lastError = JsonValueSchema.parse(retryInput.lastError);
+    const updatedAt = normalizeTimestamp(z.string().datetime().parse(updatedAtInput));
+    const result = this.database.prepare(`
+      UPDATE outbox_messages
+      SET state = 'pending', next_attempt_at = ?, last_error_json = ?,
+          claimed_by = NULL, claimed_at = NULL, updated_at = ?
+      WHERE id = ? AND state = 'claimed'
+    `).run(nextAttemptAt, JSON.stringify(lastError), updatedAt, id);
+    if (result.changes !== 1) throw new Error(`Outbox message ${id} is not claimed`);
+  }
+
+  markOutboxFailed(
+    idInput: string,
+    failureInput: Readonly<{
+      channel: OutboxMessage["channel"];
+      attempts: number;
+      failure: JsonValue;
+    }>,
+    failedAtInput = new Date().toISOString()
+  ): void {
+    const id = z.string().min(1).parse(idInput);
+    const channel = z.enum(["slack", "telegram", "tailscale-web"]).parse(failureInput.channel);
+    const attempts = z.number().int().positive().parse(failureInput.attempts);
+    const failure = JsonValueSchema.parse(failureInput.failure);
+    const failedAt = normalizeTimestamp(z.string().datetime().parse(failedAtInput));
+    this.database.transaction(() => {
+      const result = this.database.prepare(`
+        UPDATE outbox_messages
+        SET state = 'failed', last_error_json = ?, claimed_by = NULL,
+            claimed_at = NULL, updated_at = ?
+        WHERE id = ? AND state = 'claimed'
+      `).run(JSON.stringify(failure), failedAt, id);
+      if (result.changes !== 1) throw new Error(`Outbox message ${id} is not claimed`);
+      this.appendAudit({
+        subjectId: id,
+        eventType: "outbox.delivery_failed",
+        data: { channel, attempts, failure }
+      });
+    }).immediate();
   }
 
   appendAudit(eventInput: AppendAuditEvent): AuditEvent {

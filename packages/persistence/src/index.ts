@@ -1,4 +1,5 @@
 export { migrate, openDatabase } from "./database.js";
+export { OutboxDispatcher, type OutboxDispatcherOptions } from "./outbox-dispatcher.js";
 export {
   ControlStore,
   type AppendAuditEvent,
@@ -8,6 +9,7 @@ export {
   JsonValueSchema,
   type JsonValue,
   type OutboxMessage,
+  type TaskRecord,
   type WorktreeAcquireResult,
   type WorktreeHeartbeatResult,
   type WorktreeHeartbeatUpdate,

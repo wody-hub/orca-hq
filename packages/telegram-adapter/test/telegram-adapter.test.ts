@@ -232,11 +232,34 @@ describe("Telegram adapter", () => {
 
     await expect(deliverTelegramMessage({
       id: "outbox-1",
+      channel: "telegram",
       destination: "9900",
-      text: "Working on it",
-      replyToMessageId: 42
+      template: "progress",
+      payload: { text: "Working on it", replyToMessageId: 42 },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
     }, { send })).resolves.toEqual({ providerMessageId: "44" });
 
     expect(send).toHaveBeenCalledWith({ chatId: "9900", text: "Working on it", replyToMessageId: 42 });
+  });
+
+  it("renders an approval-channel denial from its durable template payload", async () => {
+    // Break caught: requiring pre-rendered provider text bypasses the durable template contract used by callback handling.
+    const send = vi.fn(async () => ({ messageId: 45 }));
+
+    await deliverTelegramMessage({
+      id: "approval-denied-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "approval_channel_not_allowed",
+      payload: { riskLevel: "L3" },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
+    }, { send });
+
+    expect(send).toHaveBeenCalledWith({
+      chatId: "9900",
+      text: "Telegram에서는 L3 승인을 처리할 수 없습니다. Slack HQ에서 승인해 주세요."
+    });
   });
 });

@@ -1,16 +1,37 @@
+import {
+  OutboundDeliveryReceiptSchema,
+  OutboundMessageSchema,
+  type OutboundMessageFor
+} from "@orca-hq/core";
 import { z } from "zod";
 
-export const SlackOutboundMessageSchema = z.object({
-  id: z.string().min(1),
-  destination: z.string().min(1),
+const SlackPayloadSchema = z.object({
   text: z.string().min(1),
-  threadId: z.string().min(1)
-}).strict();
+  threadId: z.string().min(1).optional()
+}).passthrough();
 
-export type SlackOutboundMessage = z.infer<typeof SlackOutboundMessageSchema>;
+export const SlackOutboundMessageSchema = OutboundMessageSchema.extend({
+  channel: z.literal("slack"),
+  payload: SlackPayloadSchema
+}).strict().superRefine((message, context) => {
+  const isHqMirror = message.template === "final_summary" && message.id.endsWith(":slack-hq");
+  if (!isHqMirror && message.payload.threadId === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["payload", "threadId"],
+      message: "originating Slack thread is required"
+    });
+  }
+});
+
+export type SlackOutboundMessage = OutboundMessageFor<"slack">;
 
 export type SlackMessagePort = Readonly<{
-  send(message: Readonly<{ channel: string; text: string; threadTs: string }>): Promise<Readonly<{ ts: string }>>;
+  send(message: Readonly<{
+    channel: string;
+    text: string;
+    threadTs?: string | undefined;
+  }>): Promise<Readonly<{ ts: string }>>;
 }>;
 
 export type SlackDeliveryReceipt = Readonly<{ providerMessageId: string }>;
@@ -23,8 +44,8 @@ export async function deliverSlackMessage(
   const message = SlackOutboundMessageSchema.parse(messageInput);
   const response = await messages.send({
     channel: message.destination,
-    text: message.text,
-    threadTs: message.threadId
+    text: message.payload.text,
+    ...(message.payload.threadId === undefined ? {} : { threadTs: message.payload.threadId })
   });
-  return { providerMessageId: z.string().min(1).parse(response.ts) };
+  return OutboundDeliveryReceiptSchema.parse({ providerMessageId: response.ts });
 }

@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createSlackAdapter,
   createSlackAttachmentStager,
+  deliverSlackMessage,
   registerSlackSocketModeHandlers,
   SlackAttachmentTooLargeError,
   writeFully
@@ -357,9 +358,12 @@ describe("Slack adapter", () => {
 
     await threadedAdapter.deliver({
       id: "outbox-1",
+      channel: "slack",
       destination: "C123",
-      text: "Working on it",
-      threadId: "171.001"
+      template: "progress",
+      payload: { text: "Working on it", threadId: "171.001" },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
     });
 
     expect(send).toHaveBeenCalledWith({ channel: "C123", text: "Working on it", threadTs: "171.001" });
@@ -382,7 +386,15 @@ describe("Slack adapter", () => {
       messages: { send }
     });
 
-    await expect(adapter.deliver({ id: "outbox-1", destination: "C123", text: "Working on it" }))
+    await expect(adapter.deliver({
+      id: "outbox-1",
+      channel: "slack",
+      destination: "C123",
+      template: "progress",
+      payload: { text: "Working on it" },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
+    }))
       .rejects.toThrow();
     expect(send).not.toHaveBeenCalled();
   });
@@ -406,10 +418,34 @@ describe("Slack adapter", () => {
 
     await expect(adapter.deliver({
       id: "outbox-1",
+      channel: "slack",
       destination: "C123",
-      text: "Working on it",
-      threadId: "171.001"
+      template: "progress",
+      payload: { text: "Working on it", threadId: "171.001" },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
     })).rejects.toThrow("socket_closed");
+  });
+
+  it("renders a mirrored final summary as a Slack HQ root post", async () => {
+    // Break caught: requiring an origin thread on the generated HQ mirror makes cross-channel summaries undeliverable.
+    const send = vi.fn(async () => ({ ts: "172.002" }));
+
+    await expect(deliverSlackMessage({
+      id: "outbox-telegram:slack-hq",
+      commandId: "command-telegram",
+      channel: "slack",
+      destination: "C-HQ",
+      template: "final_summary",
+      payload: { text: "Redacted completion summary" },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
+    }, { send })).resolves.toEqual({ providerMessageId: "172.002" });
+
+    expect(send).toHaveBeenCalledWith({
+      channel: "C-HQ",
+      text: "Redacted completion summary"
+    });
   });
 
   it("normalizes an interactive approval request without approving it", async () => {
