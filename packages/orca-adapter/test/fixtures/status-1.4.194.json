@@ -1,0 +1,22 @@
+{
+  "id": "local-status",
+  "ok": true,
+  "result": {
+    "target": { "kind": "local" },
+    "app": { "running": true, "pid": 72100, "desktopWindowStatus": "available" },
+    "runtime": {
+      "state": "ready",
+      "reachable": true,
+      "runtimeId": "runtime-test-1",
+      "appVersion": "1.4.194",
+      "capabilities": [
+        "runtime.status.compat.v1",
+        "orchestration.contract.v1",
+        "orchestration.worker-stop-verdict.v1",
+        "orchestration.worker-launch-preferences.v1"
+      ]
+    },
+    "graph": { "state": "ready" }
+  },
+  "_meta": { "runtimeId": "runtime-test-1" }
+}

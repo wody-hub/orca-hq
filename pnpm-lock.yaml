@@ -24,6 +24,19 @@ importers:
         specifier: ^3.24.2
         version: 3.25.76
 
+  packages/orca-adapter:
+    dependencies:
+      semver:
+        specifier: ^7.7.2
+        version: 7.8.5
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
+    devDependencies:
+      '@types/semver':
+        specifier: ^7.7.0
+        version: 7.8.0
+
   packages/persistence:
     dependencies:
       '@orca-hq/core':
@@ -78,6 +91,8 @@ importers:
       zod:
         specifier: ^3.24.2
         version: 3.25.76
+
+  packages/test-support: {}
 
   packages/voice:
     dependencies:
@@ -394,6 +409,9 @@ packages:
 
   '@types/node@22.20.1':
     resolution: {integrity: sha512-EANqOCF9QFyra+4pfxUcX9STKJpCLjMbObVzljIJomAWSnuSIEAvyzEU53GaajbXJEgdh0iEcPL+DGvpUd4k1Q==}
+
+  '@types/semver@7.8.0':
+    resolution: {integrity: sha512-1mAINjtQCXXeLkJ9ehXkwOcBpqtLxiVtKhpUf83DdRNdQKV0iXZpaHYqRr7nj+wvxuJzoAmAwXI+sCNMv1CzLQ==}
 
   '@vitest/expect@4.1.11':
     resolution: {integrity: sha512-VX2x5vNJXET47KAFzwERI+KRMtTTCSWTfSMKsW7JsUsXV4psq++e3DvZpuTDOpHcxytiDs6p2nhVb2tVDiiUYw==}
@@ -933,6 +951,8 @@ snapshots:
   '@types/node@22.20.1':
     dependencies:
       undici-types: 6.21.0
+
+  '@types/semver@7.8.0': {}
 
   '@vitest/expect@4.1.11':
     dependencies:
