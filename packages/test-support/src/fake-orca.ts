@@ -7,6 +7,7 @@ export interface FakeOrcaScenario {
   readonly stderr?: string;
   readonly exitCode?: number;
   readonly delayMs?: number;
+  readonly ignoreSigterm?: boolean;
 }
 
 interface StoredScenario extends FakeOrcaScenario {
@@ -16,6 +17,7 @@ interface StoredScenario extends FakeOrcaScenario {
 interface FakeOrcaState {
   readonly scenarios: readonly StoredScenario[];
   readonly calls: readonly (readonly string[])[];
+  readonly processes: readonly Readonly<{ args: readonly string[]; pid: number }>[];
 }
 
 const executableSource = `#!/usr/bin/env node
@@ -34,6 +36,8 @@ if (scenarioIndex < 0) {
   process.exit(64);
 }
 const [scenario] = state.scenarios.splice(scenarioIndex, 1);
+state.processes.push({ args, pid: process.pid });
+if (scenario.ignoreSigterm === true) process.on("SIGTERM", () => {});
 await writeFile(statePath, JSON.stringify(state));
 if (scenario.delayMs !== undefined) {
   await new Promise((resolve) => setTimeout(resolve, scenario.delayMs));
@@ -59,7 +63,7 @@ export class FakeOrca {
     const fake = new FakeOrca(directory);
     await writeFile(fake.executablePath, executableSource, "utf8");
     await chmod(fake.executablePath, 0o755);
-    await fake.#writeState({ scenarios: [], calls: [] });
+    await fake.#writeState({ scenarios: [], calls: [], processes: [] });
     return fake;
   }
 
@@ -67,7 +71,8 @@ export class FakeOrca {
     const state = await this.#readState();
     await this.#writeState({
       scenarios: [...state.scenarios, { ...scenario, args: [...args] }],
-      calls: state.calls
+      calls: state.calls,
+      processes: state.processes
     });
   }
 
@@ -81,6 +86,22 @@ export class FakeOrca {
 
   async calls(): Promise<readonly (readonly string[])[]> {
     return (await this.#readState()).calls;
+  }
+
+  async waitForProcess(args: readonly string[], timeoutMs = 1_000): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const processRecord = (await this.#readState()).processes.find((candidate) =>
+          JSON.stringify(candidate.args) === JSON.stringify(args)
+        );
+        if (processRecord !== undefined) return processRecord.pid;
+      } catch {
+        // The child replaces the tiny JSON state file between polling reads.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`fake Orca process did not start for ${JSON.stringify(args)}`);
   }
 
   async cleanup(): Promise<void> {

@@ -46,14 +46,32 @@ async function enqueueStartup(
 
 function clientFor(
   fake: FakeOrca,
-  options: { signal?: AbortSignal; timeoutMs?: number; expectedVersionRange?: string } = {}
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    terminationGraceMs?: number;
+    expectedVersionRange?: string;
+  } = {}
 ): OrcaClient {
   return new OrcaClient({
     executablePath: fake.executablePath,
     signal: options.signal ?? new AbortController().signal,
     timeoutMs: options.timeoutMs ?? 500,
+    ...(options.terminationGraceMs === undefined
+      ? {}
+      : { terminationGraceMs: options.terminationGraceMs }),
     expectedVersionRange: options.expectedVersionRange ?? ">=1.4.194"
   });
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
 }
 
 function statusWith(change: { version?: string; capabilities?: readonly string[] }): unknown {
@@ -202,6 +220,37 @@ describe("Orca CLI capability adapter", () => {
       .rejects.toMatchObject({ code: "orca_timeout", timeoutMs: 40 });
   });
 
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid termination grace period %s",
+    async (terminationGraceMs) => {
+      // Break caught: an invalid escalation deadline can disable bounded child cleanup.
+      const fake = await fakeOrca();
+
+      expect(() => clientFor(fake, { terminationGraceMs }))
+        .toThrow("terminationGraceMs must be a positive safe integer");
+    }
+  );
+
+  it("SIGKILLs a timeout child that ignores SIGTERM before returning", async () => {
+    // Break caught: waiting forever after SIGTERM defeats the configured timeout and leaves an orphan.
+    const fake = await fakeOrca();
+    await enqueueStartup(fake);
+    const args = ["repo", "list", "--json"] as const;
+    await fake.enqueueJson(args, {
+      id: "projects", ok: true, result: { repos: [] }
+    }, { delayMs: 1_500, ignoreSigterm: true });
+    const client = clientFor(fake, { timeoutMs: 300, terminationGraceMs: 20 });
+    await client.health();
+
+    const startedAt = Date.now();
+    const execution = client.execute({ kind: "list_projects" }).catch((error: unknown) => error);
+    const pid = await fake.waitForProcess(args);
+
+    await expect(execution).resolves.toMatchObject({ code: "orca_timeout", timeoutMs: 300 });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(processExists(pid)).toBe(false);
+  });
+
   it("classifies an aborted operation before launching another process", async () => {
     // Break caught: an already-cancelled coordinator turn must not start an Orca subprocess.
     const fake = await fakeOrca();
@@ -231,6 +280,32 @@ describe("Orca CLI capability adapter", () => {
     setTimeout(() => controller.abort(), 20);
 
     await expect(execution).rejects.toMatchObject({ code: "orca_aborted" });
+  });
+
+  it("SIGKILLs an aborted child that ignores SIGTERM before returning", async () => {
+    // Break caught: abort must have a hard shutdown deadline and must not resolve while the child survives.
+    const fake = await fakeOrca();
+    const controller = new AbortController();
+    await enqueueStartup(fake);
+    const args = ["repo", "list", "--json"] as const;
+    await fake.enqueueJson(args, {
+      id: "projects", ok: true, result: { repos: [] }
+    }, { delayMs: 1_500, ignoreSigterm: true });
+    const client = clientFor(fake, {
+      signal: controller.signal,
+      timeoutMs: 5_000,
+      terminationGraceMs: 20
+    });
+    await client.health();
+
+    const execution = client.execute({ kind: "list_projects" });
+    const pid = await fake.waitForProcess(args);
+    const abortedAt = Date.now();
+    controller.abort();
+
+    await expect(execution).rejects.toMatchObject({ code: "orca_aborted" });
+    expect(Date.now() - abortedAt).toBeLessThan(500);
+    expect(processExists(pid)).toBe(false);
   });
 
   it("turns a stale worker handle receipt into a typed recovery error", async () => {
@@ -274,11 +349,18 @@ describe("Orca CLI capability adapter", () => {
     });
   });
 
-  it("maps task, dispatch, read, stop, and release operations to fixed public argv", async () => {
+  it("maps lifecycle operations to fixed public argv and validates their current results", async () => {
     // Break caught: lifecycle command drift or shell-string construction can target the wrong public operation.
     const fake = await fakeOrca();
     await enqueueStartup(fake);
     const cases = [
+      {
+        operation: { kind: "create_run" as const, objective: "coordinate work" },
+        args: [
+          "orchestration", "run-create", "--objective", "coordinate work", "--json"
+        ],
+        result: { runId: "run-1" }
+      },
       {
         operation: {
           kind: "create_task" as const,
@@ -289,7 +371,8 @@ describe("Orca CLI capability adapter", () => {
         args: [
           "orchestration", "task-create", "--spec", "implement adapter",
           "--deps", "[\"task-0\"]", "--parent", "task-parent", "--json"
-        ]
+        ],
+        result: { taskId: "task-1", runId: "run-1", status: "ready" }
       },
       {
         operation: {
@@ -306,7 +389,41 @@ describe("Orca CLI capability adapter", () => {
           "--worktree", "new-top-level", "--agent", "codex",
           "--name", "adapter-worker", "--setup", "run",
           "--retry-of", "dispatch-0", "--json"
-        ]
+        ],
+        result: {
+          dispatchId: "dispatch-1",
+          taskId: "task-1",
+          runId: "run-1",
+          state: "ready",
+          stage: "ready",
+          setup: { state: "running" },
+          effects: []
+        }
+      },
+      {
+        operation: { kind: "show_worker" as const, dispatchId: "dispatch-1" },
+        args: ["orchestration", "worker-show", "--dispatch", "dispatch-1", "--json"],
+        result: {
+          dispatch: {
+            id: "dispatch-1",
+            task_id: "task-1",
+            run_id: "run-1",
+            status: "dispatched"
+          },
+          worker: {
+            dispatch_id: "dispatch-1",
+            state: "ready",
+            stage: "ready",
+            agent_terminal_handle: "terminal-1"
+          },
+          terminal: null,
+          observation: { status: "ready", exactWorker: true },
+          terminalResource: {
+            id: "resource-1",
+            ownershipState: "owned",
+            releaseState: "active"
+          }
+        }
       },
       {
         operation: {
@@ -318,22 +435,38 @@ describe("Orca CLI capability adapter", () => {
         args: [
           "orchestration", "worker-read", "--dispatch", "dispatch-1",
           "--limit", "50", "--cursor", "cursor-1", "--json"
-        ]
+        ],
+        result: {
+          dispatchId: "dispatch-1",
+          source: "transcript",
+          cursor: "cursor-2",
+          status: { worker: "ready", terminal: "running" },
+          transcript: {
+            messages: [],
+            limited: false,
+            nextCursor: "cursor-2",
+            returnedMessageCount: 0
+          },
+          warnings: [],
+          archived: false
+        }
       },
       {
         operation: { kind: "stop_worker" as const, dispatchId: "dispatch-1" },
-        args: ["orchestration", "worker-stop", "--dispatch", "dispatch-1", "--json"]
+        args: ["orchestration", "worker-stop", "--dispatch", "dispatch-1", "--json"],
+        result: { dispatchId: "dispatch-1", state: "stopped", verdict: "stopped" }
       },
       {
         operation: { kind: "release_worker" as const, dispatchId: "dispatch-1" },
-        args: ["orchestration", "worker-release", "--dispatch", "dispatch-1", "--json"]
+        args: ["orchestration", "worker-release", "--dispatch", "dispatch-1", "--json"],
+        result: { dispatchId: "dispatch-1", state: "released", verdict: "released" }
       }
     ] as const;
     for (const entry of cases) {
       await fake.enqueueJson(entry.args, {
         id: `receipt-${entry.operation.kind}`,
         ok: true,
-        result: {}
+        result: entry.result
       });
     }
     const client = clientFor(fake);
@@ -348,6 +481,64 @@ describe("Orca CLI capability adapter", () => {
     ]);
   });
 
+  it("rejects an empty result for every exposed orchestration operation", async () => {
+    // Break caught: validating only `{id,ok,result}` lets `{result:{}}` forge lifecycle success.
+    const fake = await fakeOrca();
+    await enqueueStartup(fake);
+    const cases = [
+      {
+        operation: { kind: "create_run" as const, objective: "coordinate work" },
+        args: ["orchestration", "run-create", "--objective", "coordinate work", "--json"]
+      },
+      {
+        operation: { kind: "create_task" as const, spec: "implement adapter" },
+        args: ["orchestration", "task-create", "--spec", "implement adapter", "--json"]
+      },
+      {
+        operation: {
+          kind: "dispatch_worker" as const,
+          taskId: "task-1",
+          worktree: "current",
+          agent: "codex" as const
+        },
+        args: [
+          "orchestration", "worker-start", "--task", "task-1",
+          "--worktree", "current", "--agent", "codex", "--json"
+        ]
+      },
+      {
+        operation: { kind: "show_worker" as const, dispatchId: "dispatch-1" },
+        args: ["orchestration", "worker-show", "--dispatch", "dispatch-1", "--json"]
+      },
+      {
+        operation: { kind: "read_worker" as const, dispatchId: "dispatch-1" },
+        args: ["orchestration", "worker-read", "--dispatch", "dispatch-1", "--json"]
+      },
+      {
+        operation: { kind: "stop_worker" as const, dispatchId: "dispatch-1" },
+        args: ["orchestration", "worker-stop", "--dispatch", "dispatch-1", "--json"]
+      },
+      {
+        operation: { kind: "release_worker" as const, dispatchId: "dispatch-1" },
+        args: ["orchestration", "worker-release", "--dispatch", "dispatch-1", "--json"]
+      }
+    ] as const;
+    for (const entry of cases) {
+      await fake.enqueueJson(entry.args, {
+        id: `malformed-${entry.operation.kind}`,
+        ok: true,
+        result: {}
+      });
+    }
+    const client = clientFor(fake);
+
+    for (const entry of cases) {
+      await expect(client.execute(entry.operation)).rejects.toMatchObject({
+        code: "invalid_orca_receipt"
+      });
+    }
+  });
+
   it("constructs mutation arguments from a validated typed operation", async () => {
     // Break caught: interpolating an objective into a shell string would make it executable command syntax.
     const fake = await fakeOrca();
@@ -355,7 +546,7 @@ describe("Orca CLI capability adapter", () => {
     await fake.enqueueJson([
       "orchestration", "run-create", "--objective", "inspect; echo not-a-command", "--json"
     ], {
-      id: "run-create", ok: true, result: { run: { id: "run-1" } }
+      id: "run-create", ok: true, result: { runId: "run-1" }
     });
 
     await expect(clientFor(fake).execute({

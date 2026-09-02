@@ -14,6 +14,7 @@ import { runOrca } from "./process.js";
 import {
   assertSuccessfulReceipt,
   OrcaInvalidReceiptError,
+  parseOrcaOperationReceipt,
   parseOrcaProjects,
   parseOrcaReceipt,
   parseOrcaSkillResponse,
@@ -29,6 +30,7 @@ export interface OrcaClientOptions {
   readonly signal: AbortSignal;
   readonly expectedVersionRange: string;
   readonly timeoutMs?: number;
+  readonly terminationGraceMs?: number;
 }
 
 export type LoadedOrcaSkill = Readonly<{
@@ -56,7 +58,9 @@ interface StartupState {
 const officialSkillNames = ["orca-cli", "orchestration"] as const;
 
 export class OrcaClient {
-  readonly #options: Required<Pick<OrcaClientOptions, "timeoutMs">> & OrcaClientOptions;
+  readonly #options: Required<
+    Pick<OrcaClientOptions, "timeoutMs" | "terminationGraceMs">
+  > & OrcaClientOptions;
   #startup?: Promise<StartupState>;
 
   constructor(options: OrcaClientOptions) {
@@ -66,7 +70,11 @@ export class OrcaClient {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       throw new TypeError("timeoutMs must be a positive safe integer");
     }
-    this.#options = Object.freeze({ ...options, timeoutMs });
+    const terminationGraceMs = options.terminationGraceMs ?? 250;
+    if (!Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
+      throw new TypeError("terminationGraceMs must be a positive safe integer");
+    }
+    this.#options = Object.freeze({ ...options, timeoutMs, terminationGraceMs });
   }
 
   async health(): Promise<OrcaHealth> {
@@ -91,7 +99,7 @@ export class OrcaClient {
     const raw = await runOrca(operationArguments(operation), this.#options);
     const receipt = parseOrcaReceipt(raw);
     assertSuccessfulReceipt(receipt);
-    return receipt;
+    return parseOrcaOperationReceipt(operation.kind, receipt);
   }
 
   #startupState(): Promise<StartupState> {

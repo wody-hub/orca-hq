@@ -10,6 +10,7 @@ export interface RunOrcaOptions {
   readonly executablePath: string;
   readonly signal: AbortSignal;
   readonly timeoutMs: number;
+  readonly terminationGraceMs: number;
 }
 
 export class OrcaProcessError extends Error {
@@ -81,6 +82,9 @@ export async function runOrca(
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new TypeError("timeoutMs must be a positive safe integer");
   }
+  if (!Number.isSafeInteger(options.terminationGraceMs) || options.terminationGraceMs <= 0) {
+    throw new TypeError("terminationGraceMs must be a positive safe integer");
+  }
   if (args.includes("--json")) throw new TypeError("runOrca appends --json");
 
   return new Promise<unknown>((resolve, reject) => {
@@ -90,39 +94,46 @@ export async function runOrca(
     });
     let stdout = "";
     let finished = false;
-    let aborted = false;
-    let timedOut = false;
+    let closed = false;
+    let cancellationReason: "aborted" | "timeout" | undefined;
+    let processError: OrcaProcessError | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let terminationGrace: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (action: () => void): void => {
       if (finished) return;
       finished = true;
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (terminationGrace !== undefined) clearTimeout(terminationGrace);
       options.signal.removeEventListener("abort", abort);
       action();
     };
-    const abort = (): void => {
-      aborted = true;
+    const cancel = (reason: "aborted" | "timeout"): void => {
+      if (finished || cancellationReason !== undefined) return;
+      cancellationReason = reason;
       child.kill("SIGTERM");
+      terminationGrace = setTimeout(() => {
+        if (!closed) child.kill("SIGKILL");
+      }, options.terminationGraceMs);
     };
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, options.timeoutMs);
+    const abort = (): void => { cancel("aborted"); };
 
-    options.signal.addEventListener("abort", abort, { once: true });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.resume();
     child.on("error", () => {
-      finish(() => reject(aborted ? new OrcaAbortedError() : new OrcaProcessError(null)));
+      processError = new OrcaProcessError(null);
     });
     child.on("close", (exitCode) => {
+      closed = true;
       finish(() => {
-        if (aborted) {
+        if (cancellationReason === "aborted") {
           reject(new OrcaAbortedError());
-        } else if (timedOut) {
+        } else if (cancellationReason === "timeout") {
           reject(new OrcaTimeoutError(options.timeoutMs));
+        } else if (processError !== undefined) {
+          reject(processError);
         } else if (exitCode !== 0) {
           reject(classifyNonzeroExit(stdout, exitCode));
         } else {
@@ -134,5 +145,8 @@ export async function runOrca(
         }
       });
     });
+    timeout = setTimeout(() => { cancel("timeout"); }, options.timeoutMs);
+    options.signal.addEventListener("abort", abort, { once: true });
+    if (options.signal.aborted) abort();
   });
 }
