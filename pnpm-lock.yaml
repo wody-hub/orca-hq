@@ -54,6 +54,9 @@ importers:
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../core
+      '@orca-hq/orca-adapter':
+        specifier: workspace:*
+        version: link:../orca-adapter
       better-sqlite3:
         specifier: ^12.2.0
         version: 12.11.1

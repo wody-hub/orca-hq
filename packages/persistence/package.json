@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@orca-hq/core": "workspace:*",
+    "@orca-hq/orca-adapter": "workspace:*",
     "better-sqlite3": "^12.2.0",
     "zod": "^3.24.2"
   },

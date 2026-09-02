@@ -39,7 +39,7 @@ const input = {
   testReceipts: [{
     command: "pnpm test",
     exitCode: 0,
-    summary: "28 tests passed",
+    outcome: "passed" as const,
     auditReference: "audit:test:1"
   }],
   prohibitedEffects: ["push", "deployment", "secret access"],
@@ -130,8 +130,18 @@ function persistentStore(): { store: ControlStore; database: Database.Database }
   `).run(now, now);
   database.prepare(`
     INSERT INTO runs (id, command_id, state, payload_json, created_at, updated_at)
-    VALUES (?, 'command-1', 'awaiting_verification', '{}', ?, ?)
-  `).run(input.runId, now, now);
+    VALUES (?, 'command-1', 'awaiting_verification', ?, ?, ?)
+  `).run(input.runId, JSON.stringify({
+    orcaRunId: "orca-run-verification",
+    verificationObligations: [{
+      rootImplementationTaskId: input.implementationTaskId,
+      currentImplementationTaskId: input.implementationTaskId,
+      implementationDispatchId: input.implementationDispatchId,
+      cycle: 0,
+      status: "verifier_running",
+      verificationTaskId: `${input.implementationTaskId}:verify:0`
+    }]
+  }), now, now);
   database.prepare(`
     INSERT INTO tasks (id, run_id, state, payload_json, created_at, updated_at)
     VALUES (?, ?, 'worker_done', ?, ?, ?)
@@ -145,6 +155,7 @@ function persistentStore(): { store: ControlStore; database: Database.Database }
       title: "Implement the requested change",
       role: "implement",
       preferredAgent: input.implementationProvider,
+      orcaTaskId: "orca-task-implementation",
       dependsOn: []
     }),
     now,
@@ -165,9 +176,21 @@ function persistCompletedVerificationDispatches(
     dispatchId: string,
     orcaTaskId: string,
     orcaDispatchId: string
-  ) => ({
+  ) => {
+    const promptArtifact = {
+      protocol: 1,
+      artifactId: `assignment:${"c".repeat(64)}`,
+      path: "/var/run/orca-hq/assignments/test.json",
+      version: 1,
+      ownerDispatchId: dispatchId,
+      content: "bounded assignment",
+      sha256: "d".repeat(64)
+    };
+    return {
     id: dispatchId,
     taskId,
+    orcaDispatchId,
+    assignmentArtifact: promptArtifact,
     providerId: provider,
     providerStartReceipt: {
       kind: "provider_start",
@@ -177,15 +200,7 @@ function persistCompletedVerificationDispatches(
       assignmentDispatchId: dispatchId,
       orcaTaskId,
       orcaDispatchId,
-      promptArtifact: {
-        protocol: 1,
-        artifactId: `assignment:${"c".repeat(64)}`,
-        path: "/var/run/orca-hq/assignments/test.json",
-        version: 1,
-        ownerDispatchId: dispatchId,
-        content: "bounded assignment",
-        sha256: "d".repeat(64)
-      },
+      promptArtifact,
       boundary: {
         lifecycleAuthority: "orca_worker_start",
         promptDelivery: "prestart_atomic_assignment_artifact",
@@ -198,7 +213,15 @@ function persistCompletedVerificationDispatches(
       orcaReceipt: {
         id: `start:${orcaDispatchId}`,
         ok: true,
-        result: { taskId: orcaTaskId, dispatchId: orcaDispatchId }
+        result: {
+          dispatchId: orcaDispatchId,
+          taskId: orcaTaskId,
+          runId: "orca-run-verification",
+          state: "ready",
+          stage: "ready",
+          setup: { state: "running" },
+          effects: []
+        }
       }
     },
     providerInspectReceipts: [{
@@ -211,24 +234,53 @@ function persistCompletedVerificationDispatches(
         id: `show:${orcaDispatchId}`,
         ok: true,
         result: {
-          dispatch: { id: orcaDispatchId },
-          worker: { dispatch_id: orcaDispatchId },
-          observation: { exactWorker: true },
-          terminalResource: { id: `terminal:${orcaDispatchId}` }
+          dispatch: {
+            id: orcaDispatchId,
+            task_id: orcaTaskId,
+            run_id: "orca-run-verification",
+            status: "dispatched"
+          },
+          worker: {
+            dispatch_id: orcaDispatchId,
+            state: "ready",
+            stage: "ready",
+            agent_terminal_handle: `terminal:${orcaDispatchId}`
+          },
+          terminal: null,
+          observation: { status: "ready", exactWorker: true },
+          terminalResource: {
+            id: `terminal:${orcaDispatchId}`,
+            ownershipState: "owned",
+            releaseState: "active"
+          }
         }
       },
       readReceipt: {
         id: `read:${orcaDispatchId}`,
         ok: true,
-        result: { dispatchId: orcaDispatchId }
+        result: {
+          dispatchId: orcaDispatchId,
+          source: "transcript",
+          cursor: "cursor:1",
+          status: { worker: "ready", terminal: "running" },
+          transcript: {
+            messages: [],
+            limited: false,
+            nextCursor: "cursor:1",
+            returnedMessageCount: 0
+          },
+          warnings: [],
+          archived: false
+        }
       }
     }],
     releaseReceipt: {
       id: `release:${orcaDispatchId}`,
       ok: true,
-      result: { dispatchId: orcaDispatchId, verdict: "released" }
+      result: { dispatchId: orcaDispatchId, state: "released", verdict: "released" }
     }
-  });
+  };
+  };
   database.prepare(`
     INSERT INTO dispatches (id, task_id, state, payload_json, created_at, updated_at)
     VALUES (?, ?, 'worker_done', ?, ?, ?)
@@ -290,6 +342,11 @@ function persistCompletedVerificationDispatches(
   database.prepare(`
     UPDATE tasks SET state = 'worker_done', updated_at = ? WHERE id = ?
   `).run(now, task.taskId);
+  database.prepare(`
+    UPDATE tasks
+    SET payload_json = json_set(payload_json, '$.orcaTaskId', 'orca-task-verifier')
+    WHERE id = ?
+  `).run(task.taskId);
 }
 
 afterEach(() => {
@@ -586,6 +643,50 @@ describe("cross-model verification", () => {
       error: "implementation Dispatch provider evidence"
     },
     {
+      name: "prompt artifact belongs to another local Dispatch",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(
+          payload_json,
+          '$.providerStartReceipt.promptArtifact.ownerDispatchId',
+          'dispatch:other-task:1'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "persisted Orca Dispatch differs from its provider start receipt",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(payload_json, '$.orcaDispatchId', 'orca-dispatch:other')
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "provider inspection belongs to another Orca Task",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(
+          payload_json,
+          '$.providerInspectReceipts[0].showReceipt.result.dispatch.task_id',
+          'orca-task:other'
+        )
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
+      name: "release receipt reports stop semantics",
+      mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
+        UPDATE dispatches
+        SET payload_json = json_set(payload_json, '$.releaseReceipt.result.verdict', 'stopped')
+        WHERE id = ?
+      `).run(task.implementationDispatchId),
+      error: "implementation Dispatch provider evidence"
+    },
+    {
       name: "verifier acceptance evidence was substituted",
       mutate: (database: Database.Database, task: VerificationTask) => database.prepare(`
         UPDATE dispatches
@@ -700,7 +801,7 @@ describe("cross-model verification", () => {
       commands: [{
         command: "echo substituted",
         exitCode: 0,
-        summary: "substituted command passed",
+        outcome: "passed",
         auditReference: "audit:substituted"
       }],
       evidence: ["audit:substituted"]
@@ -733,7 +834,7 @@ describe("cross-model verification", () => {
     })).rejects.toThrow("conflicting verification completion replay");
   });
 
-  it("requires a durable completion target and bounded command summaries", () => {
+  it("requires a durable completion target and rejects free-form command output", () => {
     // Break caught: an optional delivery route or raw command output makes durable completion inconsistent and leaky.
     expect(() => new VerificationService({ store: new MemoryVerificationStore() } as never))
       .toThrow("completion target");
@@ -741,8 +842,35 @@ describe("cross-model verification", () => {
     const valid = report(task, "pass");
     expect(() => VerificationReportSchema.parse({
       ...valid,
-      commands: [{ ...valid.commands[0], summary: "x".repeat(513) }]
+      commands: [{ ...valid.commands[0], stdout: "x".repeat(513) }]
     })).toThrow();
+  });
+
+  it("rejects every free-form command output field before audit or Outbox serialization", async () => {
+    // Break caught: a short summary can still carry channel tokens, voice keys, or terminal output.
+    const { store, database } = persistentStore();
+    const service = new VerificationService({ store, completionTarget });
+    const task = await service.start(input);
+    persistCompletedVerificationDispatches(database, task);
+    const valid = report(task, "pass");
+    const leaked = "Slack=xoxb-secret Telegram=123:secret Tailscale=tskey OpenAI=sk-secret";
+    await expect(service.complete({
+      ...valid,
+      commands: [{
+        ...valid.commands[0],
+        summary: leaked
+      }]
+    } as never)).rejects.toThrow();
+    const serialized = JSON.stringify({
+      audit: store.listAuditEvents(),
+      outbox: store.listOutbox(),
+      reports: database.prepare(`
+        SELECT payload_json FROM tasks WHERE id = ?
+      `).all(task.taskId)
+    });
+    for (const value of ["xoxb-secret", "123:secret", "tskey", "sk-secret"]) {
+      expect(serialized).not.toContain(value);
+    }
   });
 });
 

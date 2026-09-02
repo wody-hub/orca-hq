@@ -24,9 +24,18 @@ const GitDiffEvidenceSchema = z.object({
 export const VerificationCommandReceiptSchema = z.object({
   command: NonBlankStringSchema.max(2_048),
   exitCode: z.number().int(),
-  summary: NonBlankStringSchema.max(512),
+  outcome: z.enum(["passed", "failed"]),
   auditReference: NonBlankStringSchema.max(256)
-}).strict();
+}).strict().superRefine((receipt, context) => {
+  const expectedOutcome = receipt.exitCode === 0 ? "passed" : "failed";
+  if (receipt.outcome !== expectedOutcome) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["outcome"],
+      message: "command outcome must match its exit code"
+    });
+  }
+});
 
 const WorkerResultSchema = z.object({
   outcome: z.enum(["completed", "failed"]),
@@ -126,7 +135,7 @@ export const VerificationReportSchema = z.object({
   }
   if (
     report.verdict === "pass"
-    && report.commands.some(({ exitCode }) => exitCode !== 0)
+    && report.commands.some(({ exitCode, outcome }) => exitCode !== 0 || outcome !== "passed")
   ) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -226,6 +235,7 @@ type MaybePromise<T> = T | Promise<T>;
 export interface VerificationLifecycleStore {
   saveVerificationTask(task: VerificationTask): MaybePromise<void>;
   commitVerification(commit: VerificationCommit): MaybePromise<void>;
+  loadVerificationTask?(taskId: string): MaybePromise<unknown | undefined>;
 }
 
 const verifierProhibitions = Object.freeze([
@@ -432,7 +442,14 @@ export class VerificationService {
 
   async complete(reportValue: VerificationReport): Promise<CompletionDecision> {
     const report = deepFreeze(VerificationReportSchema.parse(reportValue)) as VerificationReport;
-    const task = this.#tasks.get(report.verificationTaskId);
+    let task = this.#tasks.get(report.verificationTaskId);
+    if (task === undefined) {
+      const recovered = await this.#store.loadVerificationTask?.(report.verificationTaskId);
+      if (recovered !== undefined) {
+        task = deepFreeze(VerificationTaskSchema.parse(recovered)) as VerificationTask;
+        this.#tasks.set(task.taskId, task);
+      }
+    }
     if (task === undefined) {
       throw new Error(`Verification Task ${report.verificationTaskId} is not known`);
     }

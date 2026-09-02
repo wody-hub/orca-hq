@@ -340,6 +340,7 @@ const ProviderInspectShowOrcaAuditReceiptSchema = z.object({
       stage: NonBlankStringSchema,
       agent_terminal_handle: NonBlankStringSchema.nullable()
     }),
+    terminal: z.unknown().transform(() => null),
     observation: z.object({
       status: NonBlankStringSchema,
       exactWorker: z.boolean()
@@ -359,6 +360,7 @@ const ProviderInspectReadBaseAuditResultSchema = z.object({
     worker: NonBlankStringSchema,
     terminal: NonBlankStringSchema
   }),
+  warnings: z.array(z.string()).transform(() => [] as string[]),
   archived: z.boolean()
 });
 
@@ -369,6 +371,7 @@ const ProviderInspectReadOrcaAuditReceiptSchema = z.object({
     ProviderInspectReadBaseAuditResultSchema.extend({
       source: z.literal("transcript"),
       transcript: z.object({
+        messages: z.array(z.unknown()).transform(() => [] as never[]),
         limited: z.boolean(),
         nextCursor: NonBlankStringSchema,
         returnedMessageCount: z.number().int().nonnegative()
@@ -377,6 +380,7 @@ const ProviderInspectReadOrcaAuditReceiptSchema = z.object({
     ProviderInspectReadBaseAuditResultSchema.extend({
       source: z.literal("terminal"),
       terminal: z.object({
+        lines: z.array(z.string()).transform(() => [] as string[]),
         limited: z.boolean(),
         nextCursor: NonBlankStringSchema
       })

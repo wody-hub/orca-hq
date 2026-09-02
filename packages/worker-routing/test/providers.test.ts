@@ -346,6 +346,7 @@ describe("Orca-backed worker providers", () => {
             stage: "ready",
             agent_terminal_handle: "terminal-1"
           },
+          terminal: null,
           observation: { status: "ready", exactWorker: true },
           terminalResource: {
             id: "resource-1",
@@ -365,22 +366,21 @@ describe("Orca-backed worker providers", () => {
           ...(source === "transcript"
             ? {
                 transcript: {
+                  messages: [],
                   limited: false,
                   nextCursor: "cursor-1",
                   returnedMessageCount: 1
                 }
               }
-            : { terminal: { limited: false, nextCursor: "cursor-1" } }),
+            : { terminal: { lines: [], limited: false, nextCursor: "cursor-1" } }),
+          warnings: [],
           archived: false
         }
       });
       expect(inspected.workerState).toBe("ready");
       const audit = JSON.stringify(inspected);
       for (const value of Object.values(secrets)) expect(audit).not.toContain(value);
-      expect(audit).not.toContain("messages");
       expect(audit).not.toContain("blocks");
-      expect(audit).not.toContain("lines");
-      expect(audit).not.toContain("warnings");
       expect(audit).not.toContain("_meta");
       expect(audit).not.toContain("diagnostic");
     }

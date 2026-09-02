@@ -8,6 +8,7 @@ import {
   type CommandEnvelope,
   type CommandIngress
 } from "@orca-hq/core";
+import { parseOrcaOperationReceipt } from "@orca-hq/orca-adapter";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 
@@ -129,6 +130,30 @@ const LifecycleMessageStoreSchema = z.object({
   dispatchId: z.string().min(1)
 }).passthrough();
 
+const VerificationObligationStoreSchema = z.object({
+  rootImplementationTaskId: z.string().min(1),
+  currentImplementationTaskId: z.string().min(1),
+  implementationDispatchId: z.string().min(1),
+  cycle: z.number().int().min(0).max(2),
+  status: z.enum([
+    "pending",
+    "verifier_running",
+    "fix_required",
+    "passed",
+    "intervention_required"
+  ]),
+  verificationTaskId: z.string().min(1).optional()
+}).strict();
+
+const VerificationObligationVerifierInputSchema = z.object({
+  runId: z.string().min(1),
+  rootImplementationTaskId: z.string().min(1),
+  currentImplementationTaskId: z.string().min(1),
+  implementationDispatchId: z.string().min(1),
+  cycle: z.number().int().min(0).max(2),
+  verificationTaskId: z.string().min(1)
+}).strict();
+
 const WorkerDoneCommitStoreSchema = z.object({
   message: LifecycleMessageStoreSchema,
   dispatch: LifecycleDispatchStoreSchema,
@@ -215,9 +240,18 @@ const VerificationReportStoreSchema = z.object({
   commands: z.array(z.object({
     command: z.string().min(1),
     exitCode: z.number().int(),
-    summary: z.string().min(1).max(512),
+    outcome: z.enum(["passed", "failed"]),
     auditReference: z.string().min(1).max(256)
-  }).strict()).min(1),
+  }).strict().superRefine((receipt, context) => {
+    const expectedOutcome = receipt.exitCode === 0 ? "passed" : "failed";
+    if (receipt.outcome !== expectedOutcome) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["outcome"],
+        message: "command outcome must match its exit code"
+      });
+    }
+  })).min(1),
   implementationProvider: z.enum(["codex", "claude"]),
   verifierProvider: z.enum(["codex", "claude"]),
   findings: z.array(z.string().min(1)),
@@ -243,7 +277,7 @@ const VerificationReportStoreSchema = z.object({
   }
   if (report.verdict === "pass" && (
     report.evidence.length === 0
-    || report.commands.some(({ exitCode }) => exitCode !== 0)
+    || report.commands.some(({ exitCode, outcome }) => exitCode !== 0 || outcome !== "passed")
     || report.commands.some(({ auditReference }) => !report.evidence.includes(auditReference))
   )) {
     context.addIssue({
@@ -517,7 +551,9 @@ function hasBoundProviderReceipts(
   payload: Record<string, unknown>,
   provider: "codex" | "claude",
   taskId: string,
-  dispatchId: string
+  dispatchId: string,
+  orcaTaskId: string,
+  orcaRunId: string
 ): boolean {
   const startResult = ProviderStartEvidenceStoreSchema.safeParse(payload.providerStartReceipt);
   const inspectionsResult = z.array(ProviderInspectEvidenceStoreSchema).min(1)
@@ -527,30 +563,66 @@ function hasBoundProviderReceipts(
   );
   if (!startResult.success || !inspectionsResult.success || !terminalResult.success) return false;
   const start = startResult.data;
-  const startReceiptResult = start.orcaReceipt.result;
   const orcaDispatchId = start.orcaDispatchId;
-  const terminal = terminalResult.data.result;
   const assignment = objectValue(payload.assignment);
-  return payload.providerId === provider
+  const assignmentArtifact = objectValue(payload.assignmentArtifact);
+  try {
+    const startReceipt = parseOrcaOperationReceipt("dispatch_worker", start.orcaReceipt);
+    const startReceiptResult = objectValue(startReceipt.result);
+    if (startReceiptResult === undefined) return false;
+    for (const inspection of inspectionsResult.data) {
+      const showReceipt = parseOrcaOperationReceipt("show_worker", inspection.showReceipt);
+      const readReceipt = parseOrcaOperationReceipt("read_worker", inspection.readReceipt);
+      const show = objectValue(showReceipt.result);
+      const showDispatch = objectValue(show?.dispatch);
+      const showWorker = objectValue(show?.worker);
+      const terminalResource = objectValue(show?.terminalResource);
+      const read = objectValue(readReceipt.result);
+      if (
+        inspection.provider !== provider
+        || inspection.dispatchId !== orcaDispatchId
+        || showDispatch?.id !== orcaDispatchId
+        || showDispatch.task_id !== orcaTaskId
+        || showDispatch.run_id !== orcaRunId
+        || showWorker?.dispatch_id !== orcaDispatchId
+        || read?.dispatchId !== orcaDispatchId
+        || terminalResource?.ownershipState !== "owned"
+        || terminalResource.releaseState !== "active"
+      ) return false;
+    }
+    const terminalOperation = payload.releaseReceipt === undefined ? "stop_worker" : "release_worker";
+    const terminalReceipt = parseOrcaOperationReceipt(
+      terminalOperation,
+      terminalResult.data
+    );
+    const terminal = objectValue(terminalReceipt.result);
+    const expectedTerminal = terminalOperation === "release_worker"
+      ? { state: "released", verdict: "released" }
+      : { state: "stopped", verdict: "stopped" };
+    return payload.providerId === provider
     && payload.id === dispatchId
     && payload.taskId === taskId
+    && payload.orcaDispatchId === orcaDispatchId
     && assignment?.taskId === taskId
     && assignment.dispatchId === dispatchId
     && start.provider === provider
     && start.assignmentTaskId === taskId
     && start.assignmentDispatchId === dispatchId
+    && start.orcaTaskId === orcaTaskId
+    && start.promptArtifact.ownerDispatchId === dispatchId
+    && assignmentArtifact !== undefined
+    && isDeepStrictEqual(assignmentArtifact, start.promptArtifact)
     && startReceiptResult.dispatchId === orcaDispatchId
-    && startReceiptResult.taskId === start.orcaTaskId
-    && inspectionsResult.data.every((inspection) => {
-      return inspection.provider === provider
-        && inspection.dispatchId === orcaDispatchId
-        && inspection.showReceipt.result.dispatch.id === orcaDispatchId
-        && inspection.showReceipt.result.worker.dispatch_id === orcaDispatchId
-        && inspection.readReceipt.result.dispatchId === orcaDispatchId;
-    })
-    && terminal.dispatchId === orcaDispatchId
+    && startReceiptResult.taskId === orcaTaskId
+    && startReceiptResult.runId === orcaRunId
+    && terminal?.dispatchId === orcaDispatchId
+    && terminal.state === expectedTerminal.state
+    && terminal.verdict === expectedTerminal.verdict
     && payload.releaseFailure === undefined
     && payload.fenceFailure === undefined;
+  } catch {
+    return false;
+  }
 }
 
 function outboxMessageFromRow(row: OutboxMessageRow): OutboxMessage {
@@ -600,10 +672,10 @@ export class ControlStore implements CommandIngress {
     const record = LifecycleRunStoreSchema.parse(payload);
     const now = new Date().toISOString();
     const existing = this.database.prepare(`
-      SELECT command_id
+      SELECT command_id, payload_json
       FROM runs
       WHERE id = ?
-    `).get(record.id) as { command_id: string } | undefined;
+    `).get(record.id) as { command_id: string; payload_json: string } | undefined;
     if (existing === undefined) {
       this.database.prepare(`
         INSERT INTO runs (
@@ -615,9 +687,163 @@ export class ControlStore implements CommandIngress {
     if (existing.command_id !== record.commandId) {
       throw new Error(`Run ${record.id} belongs to another Command`);
     }
+    const existingPayload = objectValue(parseJson(existing.payload_json));
+    const merged = JsonValueSchema.parse({ ...(existingPayload ?? {}), ...record });
     this.database.prepare(`
       UPDATE runs SET state = ?, payload_json = ?, updated_at = ? WHERE id = ?
-    `).run(record.state, JSON.stringify(payload), now, record.id);
+    `).run(record.state, JSON.stringify(merged), now, record.id);
+  }
+
+  ensureVerificationObligations(runIdInput: unknown, obligationsInput: unknown): void {
+    const runId = z.string().min(1).parse(runIdInput);
+    const obligations = z.array(VerificationObligationStoreSchema).min(1).parse(obligationsInput);
+    const roots = new Set(obligations.map(({ rootImplementationTaskId }) =>
+      rootImplementationTaskId
+    ));
+    if (roots.size !== obligations.length) {
+      throw new TypeError("verification obligation roots must be unique");
+    }
+    for (const obligation of obligations) {
+      if (
+        obligation.currentImplementationTaskId !== obligation.rootImplementationTaskId
+        || obligation.cycle !== 0
+        || obligation.status !== "pending"
+        || obligation.verificationTaskId !==
+          `${obligation.rootImplementationTaskId}:verify:0`
+      ) {
+        throw new TypeError("initial verification obligation is not bound to its root Task");
+      }
+      const task = this.database.prepare(`
+        SELECT run_id, state, payload_json FROM tasks WHERE id = ?
+      `).get(obligation.rootImplementationTaskId) as Omit<StoredTaskRow, "id"> | undefined;
+      const taskPayload = objectValue(task === undefined ? undefined : parseJson(task.payload_json));
+      const dispatch = this.database.prepare(`
+        SELECT task_id, state FROM dispatches WHERE id = ?
+      `).get(obligation.implementationDispatchId) as {
+        task_id: string;
+        state: string;
+      } | undefined;
+      if (
+        task === undefined
+        || task.run_id !== runId
+        || task.state !== "worker_done"
+        || taskPayload?.role !== "implement"
+        || taskPayload.sourceVerificationTaskId !== undefined
+        || dispatch?.task_id !== obligation.rootImplementationTaskId
+        || dispatch.state !== "worker_done"
+      ) {
+        throw new TypeError("verification obligation root is not a completed implementation");
+      }
+    }
+    this.database.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT payload_json FROM runs WHERE id = ?
+      `).get(runId) as { payload_json: string } | undefined;
+      if (row === undefined) throw new Error(`Run ${runId} is not persisted`);
+      const payload = objectValue(parseJson(row.payload_json));
+      if (payload === undefined) throw new TypeError(`Run ${runId} payload is invalid`);
+      if (payload.verificationObligations !== undefined) {
+        const existing = z.array(VerificationObligationStoreSchema).min(1)
+          .parse(payload.verificationObligations);
+        const existingRoots = existing.map(({ rootImplementationTaskId }) =>
+          rootImplementationTaskId
+        ).sort();
+        const requestedRoots = obligations.map(({ rootImplementationTaskId }) =>
+          rootImplementationTaskId
+        ).sort();
+        if (!isDeepStrictEqual(existingRoots, requestedRoots)) {
+          throw new Error(`Run ${runId} has conflicting verification obligations`);
+        }
+        return;
+      }
+      const updated = JsonValueSchema.parse({ ...payload, verificationObligations: obligations });
+      this.database.prepare(`
+        UPDATE runs SET payload_json = ?, updated_at = ? WHERE id = ?
+      `).run(JSON.stringify(updated), new Date().toISOString(), runId);
+    }).immediate();
+  }
+
+  setVerificationObligationVerifier(inputValue: unknown): void {
+    const input = VerificationObligationVerifierInputSchema.parse(inputValue);
+    this.database.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT payload_json FROM runs WHERE id = ?
+      `).get(input.runId) as { payload_json: string } | undefined;
+      if (row === undefined) throw new Error(`Run ${input.runId} is not persisted`);
+      const payload = objectValue(parseJson(row.payload_json));
+      const obligations = z.array(VerificationObligationStoreSchema).min(1)
+        .parse(payload?.verificationObligations);
+      const index = obligations.findIndex(({ rootImplementationTaskId }) =>
+        rootImplementationTaskId === input.rootImplementationTaskId
+      );
+      const current = obligations[index];
+      if (current === undefined) {
+        throw new Error(`Run ${input.runId} has no verification obligation for the root Task`);
+      }
+      const next = VerificationObligationStoreSchema.parse({
+        rootImplementationTaskId: input.rootImplementationTaskId,
+        currentImplementationTaskId: input.currentImplementationTaskId,
+        implementationDispatchId: input.implementationDispatchId,
+        cycle: input.cycle,
+        status: "verifier_running",
+        verificationTaskId: input.verificationTaskId
+      });
+      if (current.status === "passed" || current.status === "intervention_required") {
+        throw new Error(`Run ${input.runId} verification obligation is terminal`);
+      }
+      if (current.cycle > input.cycle) {
+        throw new Error(`Run ${input.runId} verification obligation cannot move backwards`);
+      }
+      obligations[index] = next;
+      const updated = JsonValueSchema.parse({ ...payload, verificationObligations: obligations });
+      this.database.prepare(`
+        UPDATE runs SET payload_json = ?, updated_at = ? WHERE id = ?
+      `).run(JSON.stringify(updated), new Date().toISOString(), input.runId);
+    }).immediate();
+  }
+
+  loadRunRecord(idInput: unknown): JsonValue | undefined {
+    const id = z.string().min(1).parse(idInput);
+    const row = this.database.prepare(`SELECT id, state, payload_json FROM runs WHERE id = ?`)
+      .get(id) as { id: string; state: string; payload_json: string } | undefined;
+    if (row === undefined) return undefined;
+    return JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)),
+      id: row.id,
+      state: row.state
+    });
+  }
+
+  loadTaskRecord(idInput: unknown): JsonValue | undefined {
+    const id = z.string().min(1).parse(idInput);
+    const row = this.database.prepare(`SELECT id, run_id, state, payload_json FROM tasks WHERE id = ?`)
+      .get(id) as { id: string; run_id: string; state: string; payload_json: string } | undefined;
+    if (row === undefined) return undefined;
+    return JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)),
+      id: row.id,
+      runId: row.run_id,
+      state: row.state
+    });
+  }
+
+  loadDispatchesForTask(taskIdInput: unknown): JsonValue[] {
+    const taskId = z.string().min(1).parse(taskIdInput);
+    const rows = this.database.prepare(`
+      SELECT id, task_id, state, payload_json
+      FROM dispatches WHERE task_id = ? ORDER BY created_at, id
+    `).all(taskId) as Array<{
+      id: string;
+      task_id: string;
+      state: string;
+      payload_json: string;
+    }>;
+    return rows.map((row) => JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)),
+      id: row.id,
+      taskId: row.task_id,
+      state: row.state
+    }));
   }
 
   saveTask(recordInput: unknown): void {
@@ -958,6 +1184,46 @@ export class ControlStore implements CommandIngress {
     `).run(task.taskId, task.runId, JSON.stringify(payload), now, now);
   }
 
+  loadVerificationTask(taskIdInput: unknown): JsonValue | undefined {
+    const taskId = z.string().min(1).parse(taskIdInput);
+    const row = this.database.prepare(`
+      SELECT payload_json FROM tasks WHERE id = ?
+    `).get(taskId) as { payload_json: string } | undefined;
+    if (row === undefined) return undefined;
+    const payload = JsonValueSchema.parse(parseJson(row.payload_json));
+    const task = StoredGeneratedTaskSchema.parse(payload);
+    if (task.taskId !== taskId || task.role !== "verify") {
+      throw new TypeError(`Task ${taskId} is not a durable verification Task`);
+    }
+    const value = objectValue(payload);
+    if (value === undefined) throw new TypeError(`Task ${taskId} payload is invalid`);
+    const keys = [
+      "runId",
+      "implementationTaskId",
+      "implementationDispatchId",
+      "implementationProvider",
+      "cycle",
+      "projectRoute",
+      "requestedScope",
+      "changedFiles",
+      "gitDiff",
+      "testReceipts",
+      "prohibitedEffects",
+      "workerResult",
+      "auditReferences",
+      "taskId",
+      "title",
+      "role",
+      "preferredAgent",
+      "dependsOn",
+      "permissions",
+      "nestedWorkers",
+      "implementationProhibitedEffects",
+      "allowedActions"
+    ] as const;
+    return JsonValueSchema.parse(Object.fromEntries(keys.map((key) => [key, value[key]])));
+  }
+
   listTasks(): StoredTaskRecord[] {
     const rows = this.database.prepare(`
       SELECT id, run_id, state, payload_json
@@ -1114,12 +1380,38 @@ export class ControlStore implements CommandIngress {
         throw new Error(`conflicting verification completion replay: ${report.verificationTaskId}`);
       }
       const runRow = this.database.prepare(`
-        SELECT id, state
+        SELECT id, state, payload_json
         FROM runs
         WHERE id = ?
-      `).get(report.runId) as TaskRow | undefined;
+      `).get(report.runId) as (TaskRow & { payload_json: string }) | undefined;
       if (runRow === undefined || runRow.state !== "awaiting_verification") {
         throw new Error(`Run ${report.runId} is not awaiting_verification`);
+      }
+      const runPayload = objectValue(parseJson(runRow.payload_json));
+      const orcaRunId = runPayload?.orcaRunId;
+      if (typeof orcaRunId !== "string" || orcaRunId.length === 0) {
+        throw new TypeError(`Run ${report.runId} has no durable Orca Run identity`);
+      }
+      const verificationObligations = z.array(VerificationObligationStoreSchema).min(1)
+        .parse(runPayload?.verificationObligations);
+      const uniqueRoots = new Set(verificationObligations.map(({ rootImplementationTaskId }) =>
+        rootImplementationTaskId
+      ));
+      if (uniqueRoots.size !== verificationObligations.length) {
+        throw new TypeError(`Run ${report.runId} has duplicate verification obligation roots`);
+      }
+      const obligationIndex = verificationObligations.findIndex((obligation) =>
+        obligation.verificationTaskId === report.verificationTaskId
+      );
+      const obligation = verificationObligations[obligationIndex];
+      if (
+        obligation === undefined
+        || obligation.currentImplementationTaskId !== report.implementationTaskId
+        || obligation.implementationDispatchId !== report.implementationDispatchId
+        || obligation.cycle !== report.cycle
+        || obligation.status !== "verifier_running"
+      ) {
+        throw new TypeError("verification report does not own a durable Run obligation");
       }
       const implementationTask = this.database.prepare(`
         SELECT id, run_id, state, payload_json
@@ -1135,6 +1427,7 @@ export class ControlStore implements CommandIngress {
         || implementationTask.state !== "worker_done"
         || implementationTaskPayload?.role !== "implement"
         || implementationTaskPayload.preferredAgent !== report.implementationProvider
+        || typeof implementationTaskPayload.orcaTaskId !== "string"
       ) {
         throw new Error(
           `implementation Task ${report.implementationTaskId} is not durably worker_done`
@@ -1163,7 +1456,9 @@ export class ControlStore implements CommandIngress {
           implementationDispatchPayload,
           report.implementationProvider,
           report.implementationTaskId,
-          report.implementationDispatchId
+          report.implementationDispatchId,
+          implementationTaskPayload.orcaTaskId,
+          orcaRunId
         )
         || objectValue(implementationDispatchPayload.assignment)?.preferredAgent
           !== report.implementationProvider
@@ -1185,6 +1480,7 @@ export class ControlStore implements CommandIngress {
       if (
         taskPayload.taskId !== report.verificationTaskId
         || taskPayload.preferredAgent !== report.verifierProvider
+        || typeof taskPayload.orcaTaskId !== "string"
         || taskPayload.implementationTaskId !== report.implementationTaskId
         || taskPayload.implementationDispatchId !== report.implementationDispatchId
         || taskPayload.implementationProvider !== report.implementationProvider
@@ -1238,7 +1534,9 @@ export class ControlStore implements CommandIngress {
           verifierDispatchPayload,
           report.verifierProvider,
           report.verificationTaskId,
-          verifierDispatch.id
+          verifierDispatch.id,
+          taskPayload.orcaTaskId,
+          orcaRunId
         )
       ) {
         throw new TypeError("verification report is not bound to durable verifier Dispatch evidence");
@@ -1282,6 +1580,20 @@ export class ControlStore implements CommandIngress {
         `).run(fixTask.taskId, fixTask.runId, JSON.stringify(fixPayload), now, now);
       }
 
+      verificationObligations[obligationIndex] = VerificationObligationStoreSchema.parse(
+        passing
+          ? { ...obligation, status: "passed" }
+          : intervening
+            ? { ...obligation, status: "intervention_required" }
+            : {
+                rootImplementationTaskId: obligation.rootImplementationTaskId,
+                currentImplementationTaskId: fixTask?.taskId,
+                implementationDispatchId: `dispatch:${fixTask?.taskId}:1`,
+                cycle: fixTask?.cycle,
+                status: "fix_required"
+              }
+      );
+
       const outstanding = this.database.prepare(`
         SELECT COUNT(*) AS count
         FROM tasks
@@ -1297,7 +1609,12 @@ export class ControlStore implements CommandIngress {
             )
           )
       `).get(report.runId) as { count: number };
-      const finalPassingReport = passing && outstanding.count === 0;
+      const everyOriginalImplementationPassed = verificationObligations.every(
+        ({ status }) => status === "passed"
+      );
+      const finalPassingReport = passing
+        && outstanding.count === 0
+        && everyOriginalImplementationPassed;
       const runState = finalPassingReport
         ? "verified_success"
         : intervening
@@ -1305,10 +1622,14 @@ export class ControlStore implements CommandIngress {
           : fixing
             ? "active"
             : "awaiting_verification";
+      const updatedRunPayload = JsonValueSchema.parse({
+        ...runPayload,
+        verificationObligations
+      });
       const runUpdate = this.database.prepare(`
-        UPDATE runs SET state = ?, updated_at = ?
+        UPDATE runs SET state = ?, payload_json = ?, updated_at = ?
         WHERE id = ? AND state = 'awaiting_verification'
-      `).run(runState, now, report.runId);
+      `).run(runState, JSON.stringify(updatedRunPayload), now, report.runId);
       if (runUpdate.changes !== 1) throw new Error(`Run ${report.runId} is not persisted`);
 
       this.appendAudit({

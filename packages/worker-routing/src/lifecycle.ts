@@ -129,6 +129,23 @@ export type RunRecord = Readonly<{
   state: RunState;
   orcaRunId?: string | undefined;
   receipt?: OrcaReceipt | undefined;
+  recoveryContext?: unknown;
+}>;
+
+export type VerificationObligationStatus =
+  | "pending"
+  | "verifier_running"
+  | "fix_required"
+  | "passed"
+  | "intervention_required";
+
+export type VerificationObligation = Readonly<{
+  rootImplementationTaskId: string;
+  currentImplementationTaskId: string;
+  implementationDispatchId: string;
+  cycle: number;
+  status: VerificationObligationStatus;
+  verificationTaskId?: string | undefined;
 }>;
 
 export type TaskRecord = Readonly<{
@@ -236,6 +253,21 @@ export interface LifecycleStore {
   appendTransition(transition: LifecycleTransition): MaybePromise<void>;
   appendMessageOnce(message: LifecycleMessage): MaybePromise<"inserted" | "duplicate">;
   commitWorkerDone(input: WorkerDoneCommit): MaybePromise<"inserted" | "duplicate">;
+  ensureVerificationObligations(
+    runId: string,
+    obligations: readonly VerificationObligation[]
+  ): MaybePromise<void>;
+  setVerificationObligationVerifier(input: Readonly<{
+    runId: string;
+    rootImplementationTaskId: string;
+    currentImplementationTaskId: string;
+    implementationDispatchId: string;
+    cycle: number;
+    verificationTaskId: string;
+  }>): MaybePromise<void>;
+  loadRunRecord?(id: string): MaybePromise<unknown | undefined>;
+  loadTaskRecord?(id: string): MaybePromise<unknown | undefined>;
+  loadDispatchesForTask?(taskId: string): MaybePromise<readonly unknown[]>;
 }
 
 export interface LifecycleMessageSink {
@@ -515,6 +547,63 @@ export class ExecutionLifecycle {
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);
     return updated;
+  }
+
+  async ensureVerificationObligations(
+    runId: string,
+    obligations: readonly VerificationObligation[]
+  ): Promise<void> {
+    if (obligations.length === 0) {
+      throw new TypeError("verification obligations must not be empty");
+    }
+    await this.#store.ensureVerificationObligations(runId, obligations);
+  }
+
+  async setVerificationObligationVerifier(input: Readonly<{
+    runId: string;
+    rootImplementationTaskId: string;
+    currentImplementationTaskId: string;
+    implementationDispatchId: string;
+    cycle: number;
+    verificationTaskId: string;
+  }>): Promise<void> {
+    await this.#store.setVerificationObligationVerifier(input);
+  }
+
+  async recoverRun(id: string): Promise<RunRecord | undefined> {
+    const existing = this.#runs.get(id);
+    const value = await this.#store.loadRunRecord?.(id);
+    if (value === undefined) return existing;
+    if (typeof value !== "object" || value === null) return undefined;
+    const record = value as RunRecord;
+    if (record.id !== id) throw new TypeError("recovered Run identity mismatch");
+    this.#runs.set(id, Object.freeze(record));
+    return this.#runs.get(id);
+  }
+
+  async recoverTask(id: string): Promise<TaskRecord | undefined> {
+    const existing = this.#tasks.get(id);
+    const value = await this.#store.loadTaskRecord?.(id);
+    if (value === undefined) return existing;
+    if (typeof value !== "object" || value === null) return undefined;
+    const record = value as TaskRecord;
+    if (record.id !== id) throw new TypeError("recovered Task identity mismatch");
+    this.#tasks.set(id, Object.freeze(record));
+    return this.#tasks.get(id);
+  }
+
+  async recoverDispatchesForTask(taskId: string): Promise<readonly DispatchRecord[]> {
+    const values = await this.#store.loadDispatchesForTask?.(taskId) ?? [];
+    const records = values.map((value) => {
+      if (typeof value !== "object" || value === null) {
+        throw new TypeError("recovered Dispatch is not an object");
+      }
+      const record = value as DispatchRecord;
+      if (record.taskId !== taskId) throw new TypeError("recovered Dispatch ownership mismatch");
+      this.#dispatches.set(record.id, Object.freeze(record));
+      return this.#dispatches.get(record.id) as DispatchRecord;
+    });
+    return Object.freeze(records);
   }
 
   run(id: string): RunRecord {

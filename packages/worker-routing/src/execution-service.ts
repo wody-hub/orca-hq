@@ -62,6 +62,7 @@ import {
 } from "./providers.js";
 import {
   VerificationCommandReceiptSchema,
+  VerificationTaskSchema,
   type FixTask,
   type VerificationCommandReceipt,
   type VerificationInput,
@@ -761,14 +762,32 @@ export class ExecutionService {
       );
       if (verifierDispatchId !== undefined) dispatched.push(verifierDispatchId);
     } else if (this.#allOriginalTasksDone(lookup.run)) {
-      if (this.#lifecycle.run(lookup.run.localId).state !== "awaiting_verification") {
-        await this.#lifecycle.transitionRun(lookup.run.localId, "awaiting_verification");
-      }
-      for (const task of lookup.run.tasks.filter((candidate) =>
+      const originalImplementations = lookup.run.tasks.filter((candidate) =>
         candidate.verificationTask === undefined
         && candidate.fixTask === undefined
         && candidate.task.role === "implement"
-      )) {
+      );
+      await this.#lifecycle.ensureVerificationObligations(
+        lookup.run.localId,
+        originalImplementations.map((task) => {
+          const dispatch = task.dispatches.at(-1);
+          if (dispatch === undefined) {
+            throw new Error(`implementation Task ${task.localId} has no Dispatch`);
+          }
+          return Object.freeze({
+            rootImplementationTaskId: task.localId,
+            currentImplementationTaskId: task.localId,
+            implementationDispatchId: dispatch.localId,
+            cycle: 0,
+            status: "pending" as const,
+            verificationTaskId: `${task.localId}:verify:0`
+          });
+        })
+      );
+      if (this.#lifecycle.run(lookup.run.localId).state !== "awaiting_verification") {
+        await this.#lifecycle.transitionRun(lookup.run.localId, "awaiting_verification");
+      }
+      for (const task of originalImplementations) {
         const dispatch = task.dispatches.at(-1);
         if (dispatch === undefined || task.workerDone === undefined) continue;
         const verifierDispatchId = await this.#startVerification(
@@ -791,10 +810,15 @@ export class ExecutionService {
     if (this.#verification === undefined) {
       throw new Error("verification is not configured");
     }
-    const run = [...this.#runs.values()].find(({ localId }) => localId === report.runId);
-    const task = run?.tasks.find(({ verificationTask }) =>
+    let run = [...this.#runs.values()].find(({ localId }) => localId === report.runId);
+    let task = run?.tasks.find(({ verificationTask }) =>
       verificationTask?.taskId === report.verificationTaskId
     );
+    if (run === undefined || task?.verificationTask === undefined) {
+      const recovered = await this.#recoverVerificationContext(report);
+      run = recovered?.run;
+      task = recovered?.task;
+    }
     if (run === undefined || task?.verificationTask === undefined) {
       throw new Error(`Verification Task ${report.verificationTaskId} is not known`);
     }
@@ -813,8 +837,10 @@ export class ExecutionService {
       throw new TypeError("verification report commands do not match durable Dispatch evidence");
     }
     const decision = await this.#verification.service.complete(report);
-    const currentTaskState = this.#lifecycle.task(task.localId).state;
-    const currentRunState = this.#lifecycle.run(run.localId).state;
+    const currentTaskState = (await this.#lifecycle.recoverTask(task.localId)
+      ?? this.#lifecycle.task(task.localId)).state;
+    const currentRunState = (await this.#lifecycle.recoverRun(run.localId)
+      ?? this.#lifecycle.run(run.localId)).state;
     if (decision.kind === "verified_success") {
       if (currentTaskState !== "verified_success") {
         await this.#lifecycle.transitionTask(task.localId, "verified_success");
@@ -830,11 +856,10 @@ export class ExecutionService {
       await this.#lifecycle.transitionTask(task.localId, "intervention_required");
       await this.#lifecycle.transitionRun(run.localId, "intervention_required");
     } else {
-      if (currentTaskState === "verification_failed" && currentRunState === "active") {
-        return decision;
+      if (currentTaskState !== "verification_failed") {
+        await this.#lifecycle.transitionTask(task.localId, "verification_failed");
       }
-      await this.#lifecycle.transitionTask(task.localId, "verification_failed");
-      await this.#lifecycle.transitionRun(run.localId, "active");
+      if (currentRunState !== "active") await this.#lifecycle.transitionRun(run.localId, "active");
       const fixTask = this.#verification.service.fixTaskFor(report.verificationTaskId);
       if (fixTask === undefined) {
         throw new Error(`Verification Task ${report.verificationTaskId} has no durable Fix Task`);
@@ -842,6 +867,112 @@ export class ExecutionService {
       await this.#startFixTask(run, task, fixTask);
     }
     return decision;
+  }
+
+  async #recoverVerificationContext(report: VerificationReport): Promise<Readonly<{
+    run: RunContext;
+    task: TaskContext;
+  }> | undefined> {
+    const runRecord = await this.#lifecycle.recoverRun(report.runId);
+    const taskRecord = await this.#lifecycle.recoverTask(report.verificationTaskId);
+    if (runRecord === undefined || taskRecord === undefined) return undefined;
+    const recovery = runRecord.recoveryContext;
+    if (typeof recovery !== "object" || recovery === null) return undefined;
+    const recoveryValue = recovery as { proposal?: unknown; project?: unknown };
+    const proposal = ExecutionProposalSchema.parse(recoveryValue.proposal);
+    const project = ProjectRegistryEntrySchema.parse(recoveryValue.project);
+    const taskValue = taskRecord as unknown as Record<string, unknown>;
+    const verificationTask = VerificationTaskSchema.parse({
+      runId: taskValue.runId,
+      implementationTaskId: taskValue.implementationTaskId,
+      implementationDispatchId: taskValue.implementationDispatchId,
+      implementationProvider: taskValue.implementationProvider,
+      cycle: taskValue.cycle,
+      projectRoute: taskValue.projectRoute,
+      requestedScope: taskValue.requestedScope,
+      changedFiles: taskValue.changedFiles,
+      gitDiff: taskValue.gitDiff,
+      testReceipts: taskValue.testReceipts,
+      prohibitedEffects: taskValue.prohibitedEffects,
+      workerResult: taskValue.workerResult,
+      auditReferences: taskValue.auditReferences,
+      taskId: taskValue.taskId,
+      title: taskValue.title,
+      role: taskValue.role,
+      preferredAgent: taskValue.preferredAgent,
+      dependsOn: taskValue.dependsOn,
+      permissions: taskValue.permissions,
+      nestedWorkers: taskValue.nestedWorkers,
+      implementationProhibitedEffects: taskValue.implementationProhibitedEffects,
+      allowedActions: taskValue.allowedActions
+    });
+    const durableDispatches = await this.#lifecycle.recoverDispatchesForTask(
+      report.verificationTaskId
+    );
+    const durableDispatch = durableDispatches.at(-1);
+    if (durableDispatch === undefined) return undefined;
+    const assignment = parseWorkerAssignment(durableDispatch.assignment);
+    const placement: ReadyWorktreePlacement = Object.freeze({
+      kind: "ready",
+      repositoryPath: assignment.repo.repositoryPath,
+      baseRef: assignment.base.ref,
+      baseCommit: assignment.base.commit,
+      worktree: assignment.worktree,
+      permissions: assignment.permissions,
+      requiresEditingLease: assignment.permissions === "read-write"
+    });
+    const dispatch: DispatchContext = {
+      localId: durableDispatch.id,
+      attempt: durableDispatch.attempt,
+      assignment,
+      placement,
+      ...(durableDispatch.orcaDispatchId === undefined
+        ? {}
+        : { orcaDispatchId: durableDispatch.orcaDispatchId }),
+      ...(durableDispatch.assignmentArtifact === undefined
+        ? {}
+        : { assignmentArtifact: durableDispatch.assignmentArtifact }),
+      editingLeaseHeld: false,
+      leaseReleaseBlocked: false
+    };
+    const executionTask: ExecutionTask = Object.freeze({
+      localId: taskRecord.localId,
+      title: taskRecord.title,
+      dependsOn: [],
+      role: "verify",
+      preferredAgent: taskRecord.preferredAgent
+    });
+    const task: TaskContext = {
+      task: executionTask,
+      localId: taskRecord.id,
+      initialAssignment: assignment,
+      assignmentArtifactReference: this.#assignmentArtifacts.referenceFor(taskRecord.id),
+      dispatches: [dispatch],
+      verificationTask,
+      ...(taskRecord.orcaTaskId === undefined ? {} : { orcaTaskId: taskRecord.orcaTaskId })
+    };
+    const authorized: AuthorizedProposal = Object.freeze({
+      authorization: "authorized",
+      proposal,
+      project
+    });
+    const run: RunContext = {
+      authorized,
+      proposal,
+      project,
+      localId: runRecord.id,
+      tasks: [task],
+      tasksByProposalId: new Map([[executionTask.localId, task]]),
+      placement,
+      ...(runRecord.orcaRunId === undefined ? {} : { orcaRunId: runRecord.orcaRunId })
+    };
+    this.#runs.set(proposal.proposalId, run);
+    const lookup = { run, task, dispatch };
+    this.#dispatchLookup.set(dispatch.localId, lookup);
+    if (dispatch.orcaDispatchId !== undefined) {
+      this.#dispatchLookup.set(dispatch.orcaDispatchId, lookup);
+    }
+    return Object.freeze({ run, task });
   }
 
   async #startFixTask(
@@ -888,37 +1019,55 @@ export class ExecutionService {
       role: "implement",
       preferredAgent: fixTask.preferredAgent
     });
-    const task: TaskContext = {
-      task: executionTask,
-      localId: fixTask.taskId,
-      initialAssignment: assignment,
-      assignmentArtifactReference: this.#assignmentArtifacts.referenceFor(fixTask.taskId),
-      dispatches: [],
-      fixTask
-    };
-    run.tasks.push(task);
-    run.tasksByProposalId.set(executionTask.localId, task);
-    await this.#lifecycle.planTask(Object.freeze({
-      id: fixTask.taskId,
-      runId: run.localId,
-      localId: executionTask.localId,
-      title: executionTask.title,
-      role: executionTask.role,
-      preferredAgent: executionTask.preferredAgent,
-      dependsOn: immutableStrings([verification.localId]),
-      state: "planned"
-    }));
-    await this.#lifecycle.transitionTask(fixTask.taskId, "creating");
-    const taskReceipt = await this.#orca.execute({
-      kind: "create_task",
-      spec: taskSpec(task),
-      dependencies: [verification.orcaTaskId]
-    });
-    task.orcaTaskId = taskIdFrom(taskReceipt);
-    await this.#lifecycle.transitionTask(fixTask.taskId, "ready", {
-      orcaTaskId: task.orcaTaskId,
-      receipt: taskReceipt
-    });
+    let task = run.tasks.find((candidate) => candidate.localId === fixTask.taskId);
+    if (task === undefined) {
+      task = {
+        task: executionTask,
+        localId: fixTask.taskId,
+        initialAssignment: assignment,
+        assignmentArtifactReference: this.#assignmentArtifacts.referenceFor(fixTask.taskId),
+        dispatches: [],
+        fixTask
+      };
+      run.tasks.push(task);
+      run.tasksByProposalId.set(executionTask.localId, task);
+    }
+    const recoveredTask = await this.#lifecycle.recoverTask(fixTask.taskId);
+    if (recoveredTask === undefined) {
+      await this.#lifecycle.planTask(Object.freeze({
+        id: fixTask.taskId,
+        runId: run.localId,
+        localId: executionTask.localId,
+        title: executionTask.title,
+        role: executionTask.role,
+        preferredAgent: executionTask.preferredAgent,
+        dependsOn: immutableStrings([verification.localId]),
+        state: "planned"
+      }));
+    } else if (recoveredTask.orcaTaskId !== undefined) {
+      task.orcaTaskId = recoveredTask.orcaTaskId;
+    }
+    if (task.orcaTaskId === undefined) {
+      if (this.#lifecycle.task(fixTask.taskId).state !== "creating") {
+        await this.#lifecycle.transitionTask(fixTask.taskId, "creating");
+      }
+      const taskReceipt = await this.#orca.execute({
+        kind: "create_task",
+        spec: taskSpec(task),
+        dependencies: [verification.orcaTaskId]
+      });
+      task.orcaTaskId = taskIdFrom(taskReceipt);
+      await this.#lifecycle.transitionTask(fixTask.taskId, "ready", {
+        orcaTaskId: task.orcaTaskId,
+        receipt: taskReceipt
+      });
+    }
+    const recoveredDispatch = (await this.#lifecycle.recoverDispatchesForTask(fixTask.taskId)).at(-1);
+    if (recoveredDispatch !== undefined) {
+      const existing = task.dispatches.find(({ localId }) => localId === recoveredDispatch.id);
+      if (existing?.orcaDispatchId !== undefined) return existing.orcaDispatchId;
+      if (recoveredDispatch.orcaDispatchId !== undefined) return recoveredDispatch.orcaDispatchId;
+    }
     const dispatch: DispatchContext = {
       localId: localDispatchId,
       attempt: 1,
@@ -933,7 +1082,7 @@ export class ExecutionService {
       await this.#lifecycle.transitionRun(run.localId, "intervention_required");
       throw new Error(`Fix Task ${fixTask.taskId} could not acquire its editing lease`);
     }
-    await this.#persistDispatch(run, task, dispatch);
+    if (recoveredDispatch === undefined) await this.#persistDispatch(run, task, dispatch);
     return this.#launchWithIntervention(run, task, dispatch);
   }
 
@@ -943,6 +1092,7 @@ export class ExecutionService {
     cycle: number
   ): Promise<string | undefined> {
     if (this.#verification === undefined) return undefined;
+    const verificationTaskId = `${implementation.task.localId}:verify:${cycle}`;
     const existingTask = implementation.run.tasks.find(({ verificationTask }) =>
       verificationTask?.implementationDispatchId === implementation.dispatch.localId
       && verificationTask.cycle === cycle
@@ -985,6 +1135,15 @@ export class ExecutionService {
       await this.#persistDispatch(implementation.run, existingTask, dispatch);
       return this.#launchWithIntervention(implementation.run, existingTask, dispatch);
     }
+    await this.#lifecycle.setVerificationObligationVerifier({
+      runId: implementation.run.localId,
+      rootImplementationTaskId:
+        implementation.task.fixTask?.implementationTaskId ?? implementation.task.localId,
+      currentImplementationTaskId: implementation.task.localId,
+      implementationDispatchId: implementation.dispatch.localId,
+      cycle,
+      verificationTaskId
+    });
     const implementationDispatch = this.#lifecycle.dispatch(implementation.dispatch.localId);
     const implementationTask = this.#lifecycle.task(implementation.task.localId);
     const provider = implementationDispatch.providerId;
@@ -1263,7 +1422,11 @@ export class ExecutionService {
       proposalId: context.proposal.proposalId,
       commandId: context.proposal.commandId,
       objective: objectiveFor(context.proposal),
-      state: "planned"
+      state: "planned",
+      recoveryContext: Object.freeze({
+        proposal: context.proposal,
+        project: context.project
+      })
     });
     await this.#lifecycle.planRun(run);
     for (const task of context.tasks) {

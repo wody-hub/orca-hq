@@ -5,6 +5,7 @@ import type { ExecutionProposal } from "@orca-hq/core";
 import type { OrcaOperation, OrcaReceipt } from "../../orca-adapter/src/index.js";
 import type { ProjectRegistryEntry } from "../../project-registry/src/index.js";
 import { ControlStore, openDatabase } from "../../persistence/src/index.js";
+import type Database from "better-sqlite3";
 import {
   createSandboxRepo,
   type SandboxRepo
@@ -48,6 +49,7 @@ import {
   VerificationService,
   type VerificationCommit,
   type VerificationLifecycleStore,
+  type VerificationObligation,
   type VerificationReport,
   type VerificationTask
 } from "../src/index.js";
@@ -242,6 +244,7 @@ class RecordingOrca {
   }> | undefined;
   #task = 0;
   #dispatch = 0;
+  readonly #dispatchTasks = new Map<string, string>();
 
   constructor(readonly events: string[] = []) {}
 
@@ -276,11 +279,13 @@ class RecordingOrca {
           });
         }
         const extensions = this.startSecretExtensions;
+        const orcaDispatchId = `orca-dispatch-${this.#dispatch}`;
+        this.#dispatchTasks.set(orcaDispatchId, operation.taskId);
         return {
           id: `dispatch-receipt-${this.#dispatch}`,
           ok: true,
           result: {
-            dispatchId: `orca-dispatch-${this.#dispatch}`,
+            dispatchId: orcaDispatchId,
             taskId: this.dispatchTaskId ?? operation.taskId,
             runId: "orca-run-1",
             state: "ready",
@@ -310,7 +315,7 @@ class RecordingOrca {
         return receipt(`show-receipt-${operation.dispatchId}`, {
           dispatch: {
             id: operation.dispatchId,
-            task_id: "orca-task-1",
+            task_id: this.#dispatchTasks.get(operation.dispatchId) ?? "unknown-task",
             run_id: "orca-run-1",
             status: "dispatched"
           },
@@ -372,6 +377,7 @@ class MemoryLifecycleStore implements LifecycleStore {
   readonly dispatches = new Map<string, DispatchRecord>();
   readonly transitions: LifecycleTransition[] = [];
   readonly messages: LifecycleMessage[] = [];
+  readonly verificationObligations = new Map<string, VerificationObligation[]>();
   readonly #messageIds = new Set<string>();
   readonly #doneDispatches = new Set<string>();
   failWorkerDoneCommitOnce = false;
@@ -433,6 +439,44 @@ class MemoryLifecycleStore implements LifecycleStore {
     this.transitions.push(...structuredClone(input.transitions));
     return "inserted";
   }
+
+  ensureVerificationObligations(
+    runId: string,
+    obligations: readonly VerificationObligation[]
+  ): void {
+    const existing = this.verificationObligations.get(runId);
+    if (existing === undefined) {
+      this.verificationObligations.set(runId, structuredClone(obligations));
+      return;
+    }
+    expect(existing.map(({ rootImplementationTaskId }) => rootImplementationTaskId))
+      .toEqual(obligations.map(({ rootImplementationTaskId }) => rootImplementationTaskId));
+  }
+
+  setVerificationObligationVerifier(input: Readonly<{
+    runId: string;
+    rootImplementationTaskId: string;
+    currentImplementationTaskId: string;
+    implementationDispatchId: string;
+    cycle: number;
+    verificationTaskId: string;
+  }>): void {
+    const obligations = this.verificationObligations.get(input.runId);
+    if (obligations === undefined) return;
+    const index = obligations.findIndex(({ rootImplementationTaskId }) =>
+      rootImplementationTaskId === input.rootImplementationTaskId
+    );
+    const current = obligations[index];
+    if (current === undefined) return;
+    obligations[index] = {
+      ...current,
+      currentImplementationTaskId: input.currentImplementationTaskId,
+      implementationDispatchId: input.implementationDispatchId,
+      cycle: input.cycle,
+      status: "verifier_running",
+      verificationTaskId: input.verificationTaskId
+    };
+  }
 }
 
 class MemoryVerificationLifecycleStore implements VerificationLifecycleStore {
@@ -454,7 +498,7 @@ function executionVerificationHarness(collectImplementation = () => ({
   testReceipts: [{
     command: "pnpm test",
     exitCode: 0,
-    summary: "implementation suite passed",
+    outcome: "passed" as const,
     auditReference: "audit:implementation:test"
   }],
   auditReferences: ["audit:implementation:dispatch"]
@@ -463,7 +507,7 @@ function executionVerificationHarness(collectImplementation = () => ({
   const verifierCommands = [{
     command: "pnpm test",
     exitCode: 0,
-    summary: "verification suite passed",
+    outcome: "passed" as const,
     auditReference: "audit:verifier:test"
   }];
   const service = new VerificationService({
@@ -661,6 +705,109 @@ function setup(
     messages,
     artifacts,
     events
+  };
+}
+
+const durableVerifierCommands = [{
+  command: "pnpm test",
+  exitCode: 0,
+  outcome: "passed" as const,
+  auditReference: "audit:durable:verifier:test"
+}];
+
+function durableExecutionService(store: ControlStore, orca: RecordingOrca): ExecutionService {
+  const lifecycle = new ExecutionLifecycle({ store, messages: new RecordingMessageSink() });
+  const verification = new VerificationService({
+    store,
+    completionTarget: {
+      commandId: proposal.commandId,
+      channel: "slack",
+      destination: "C123",
+      nextAttemptAt: "2026-09-02T00:00:00.000Z"
+    }
+  });
+  return new ExecutionService({
+    orca,
+    placements: new GitWorktreePlacementService(new MemoryGit()),
+    locks: new RecordingLocks(),
+    lifecycle,
+    assignmentArtifacts: new MemoryAssignmentArtifactStore(),
+    providerCapabilities: {
+      codex: { worker: "available", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" },
+      providerChildEnvironmentIsolation: {
+        kind: "verified_effective_allowlist",
+        effectiveEnvironmentKeys: ["HOME", "PATH"]
+      },
+      assignmentArtifactAccess: { kind: "same_host" }
+    },
+    verification: {
+      service: verification,
+      evidence: {
+        collectImplementation: () => ({
+          changedFiles: ["src/api.ts"],
+          gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+          testReceipts: [{
+            command: "pnpm test",
+            exitCode: 0,
+            outcome: "passed" as const,
+            auditReference: "audit:durable:implementation:test"
+          }],
+          auditReferences: ["audit:durable:implementation:dispatch"]
+        }),
+        collectVerifierCommands: () => durableVerifierCommands
+      }
+    }
+  });
+}
+
+function seedDurableCommand(database: Database.Database, idempotencyKey: string): void {
+  const now = "2026-09-02T00:00:00.000Z";
+  database.prepare(`
+    INSERT OR IGNORE INTO principals (id, payload_json, created_at, updated_at)
+    VALUES ('owner', '{}', ?, ?)
+  `).run(now, now);
+  database.prepare(`
+    INSERT INTO commands (
+      id, idempotency_key, channel, external_message_id, principal_id,
+      received_at, payload_json, created_at
+    ) VALUES ('command-1', ?, 'slack', '171.003', 'owner', ?, '{}', ?)
+  `).run(idempotencyKey, now, now);
+}
+
+function durableReport(
+  task: VerificationTask,
+  verdict: "pass" | "fail",
+  reportId: string
+): VerificationReport {
+  return {
+    reportId,
+    runId: task.runId,
+    verificationTaskId: task.taskId,
+    implementationTaskId: task.implementationTaskId,
+    implementationDispatchId: task.implementationDispatchId,
+    cycle: task.cycle,
+    verdict,
+    projectRoute: task.projectRoute,
+    changedFiles: task.changedFiles,
+    diffSha256: task.gitDiff.sha256,
+    diffSummary: task.gitDiff.summary,
+    commands: durableVerifierCommands,
+    implementationProvider: task.implementationProvider,
+    verifierProvider: task.preferredAgent,
+    findings: verdict === "pass" ? [] : ["acceptance behavior is incomplete"],
+    evidence: ["audit:durable:verifier:test"],
+    auditReferences: [...task.auditReferences, "audit:durable:verifier:test"],
+    verifierEffects: {
+      filesModified: false,
+      committed: false,
+      pushed: false,
+      pullRequestChanged: false,
+      merged: false,
+      deployed: false,
+      secretsAccessed: false,
+      productionAccessed: false
+    }
   };
 }
 
@@ -1281,6 +1428,7 @@ describe("ExecutionService preflight and dispatch", () => {
             stage: "ready",
             agent_terminal_handle: "terminal-orca-dispatch-1"
           },
+          terminal: null,
           observation: { status: "ready", exactWorker: true },
           terminalResource: {
             id: "resource-orca-dispatch-1",
@@ -1300,21 +1448,20 @@ describe("ExecutionService preflight and dispatch", () => {
           ...(source === "transcript"
             ? {
                 transcript: {
+                  messages: [],
                   limited: false,
                   nextCursor: "cursor-1",
                   returnedMessageCount: 1
                 }
               }
-            : { terminal: { limited: false, nextCursor: "cursor-1" } }),
+            : { terminal: { lines: [], limited: false, nextCursor: "cursor-1" } }),
+          warnings: [],
           archived: false
         }
       });
       const durableAudit = JSON.stringify([...setupResult.store.dispatches.values()]);
       for (const value of Object.values(secrets)) expect(durableAudit).not.toContain(value);
-      expect(durableAudit).not.toContain("messages");
       expect(durableAudit).not.toContain("blocks");
-      expect(durableAudit).not.toContain("lines");
-      expect(durableAudit).not.toContain("warnings");
       expect(durableAudit).not.toContain("_meta");
       expect(durableAudit).not.toContain("diagnostic");
     }
@@ -1966,7 +2113,7 @@ describe("worker lifecycle", () => {
         testReceipts: [{
           command: "pnpm test",
           exitCode: 0,
-          summary: "implementation suite passed",
+          outcome: "passed",
           auditReference: "audit:implementation:test"
         }],
         auditReferences: ["audit:implementation:dispatch"]
@@ -2047,7 +2194,7 @@ describe("worker lifecycle", () => {
             testReceipts: [{
               command: "pnpm test",
               exitCode: 0,
-              summary: "28 tests passed",
+              outcome: "passed",
               auditReference: "audit:implementation:test:1"
             }],
             auditReferences: ["audit:implementation:dispatch:1"]
@@ -2124,7 +2271,7 @@ describe("worker lifecycle", () => {
     const verifierCommands = [{
       command: "pnpm test",
       exitCode: 0,
-      summary: "52 tests passed",
+      outcome: "passed" as const,
       auditReference: "audit:verifier:command:1"
     }];
     const { service, store } = setup(
@@ -2144,7 +2291,7 @@ describe("worker lifecycle", () => {
             testReceipts: [{
               command: "pnpm test",
               exitCode: 0,
-              summary: "28 tests passed",
+              outcome: "passed",
               auditReference: "audit:implementation:test:1"
             }],
             auditReferences: ["audit:implementation:dispatch:1"]
@@ -2257,7 +2404,7 @@ describe("worker lifecycle", () => {
       const verifierCommands = [{
         command: "pnpm test",
         exitCode: 0,
-        summary: "durable suite passed",
+        outcome: "passed" as const,
         auditReference: "audit:durable:verifier:test"
       }];
       const service = new ExecutionService({
@@ -2284,7 +2431,7 @@ describe("worker lifecycle", () => {
               testReceipts: [{
                 command: "pnpm test",
                 exitCode: 0,
-                summary: "implementation suite passed",
+                outcome: "passed",
                 auditReference: "audit:durable:implementation:test"
               }],
               auditReferences: ["audit:durable:implementation:dispatch"]
@@ -2352,6 +2499,152 @@ describe("worker lifecycle", () => {
       expect(database.prepare("SELECT state FROM runs WHERE id = ?").get(report.runId))
         .toEqual({ state: "verified_success" });
       expect(store.listOutbox()).toContainEqual(expect.objectContaining({ template: "success" }));
+    } finally {
+      database.close();
+    }
+  });
+
+  it("persists every implementation obligation before verifier creation and withholds partial success", async () => {
+    // Break caught: a verifier create failure must not erase the unlaunched implementation obligation.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-obligations");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      const multiTaskProposal: ExecutionProposal = {
+        ...proposal,
+        tasks: [
+          proposal.tasks[0]!,
+          {
+            localId: "implement-client",
+            title: "Implement the client change",
+            dependsOn: [],
+            role: "implement",
+            preferredAgent: "claude"
+          }
+        ]
+      };
+      await service.start(authorized(multiTaskProposal));
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-obligation-server",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "server implementation complete"
+      });
+      orca.createTaskErrorOnCall = 4;
+      const clientDone: WorkerMessage = {
+        kind: "worker_done",
+        messageId: "durable-obligation-client",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "client implementation complete"
+      };
+      await expect(service.recordWorkerMessage(clientDone))
+        .rejects.toThrow("synthetic create_task failure 4");
+
+      const runPayload = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<{ status: string }>;
+      };
+      expect(runPayload.verificationObligations).toHaveLength(2);
+      expect(runPayload.verificationObligations.map(({ status }) => status))
+        .toEqual(["verifier_running", "verifier_running"]);
+
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-obligation-first-verifier",
+        dispatchId: "orca-dispatch-3",
+        outcome: "completed",
+        summary: "first verifier complete"
+      });
+      const firstVerifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.payload.implementationTaskId ===
+          "task:proposal-1:implement"
+      )?.payload as VerificationTask | undefined;
+      if (firstVerifier === undefined) throw new Error("first verifier Task missing");
+      await service.recordVerificationReport(
+        durableReport(firstVerifier, "pass", "report:durable:partial-pass")
+      );
+
+      expect(database.prepare("SELECT state FROM runs WHERE id = 'run:proposal-1'").get())
+        .toEqual({ state: "awaiting_verification" });
+      expect(store.listOutbox()).toEqual([]);
+
+      await expect(service.recordWorkerMessage(clientDone)).resolves.toMatchObject({
+        dispatched: expect.arrayContaining(["orca-dispatch-4"])
+      });
+      expect(store.listTasks().filter(({ role }) => role === "verify")).toHaveLength(2);
+      expect(orca.calls.filter(({ kind }) => kind === "create_task")).toHaveLength(5);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("resumes one durably persisted Fix launch after a fresh service restart", async () => {
+    // Break caught: failed-report replay must recover its existing Fix identity across process state loss.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-fix-restart");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const firstService = durableExecutionService(store, orca);
+      await firstService.start(authorized());
+      await firstService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-restart-implementation",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      });
+      await firstService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-restart-verifier",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "verification found a defect"
+      });
+      const verificationTask = store.listTasks().find(({ role }) => role === "verify")
+        ?.payload as VerificationTask | undefined;
+      if (verificationTask === undefined) throw new Error("verifier Task missing");
+      const failedReport = durableReport(
+        verificationTask,
+        "fail",
+        "report:durable:fix-restart"
+      );
+      orca.createTaskErrorOnCall = 3;
+
+      await expect(firstService.recordVerificationReport(failedReport))
+        .rejects.toThrow("synthetic create_task failure 3");
+      expect(store.listTasks().filter((task) => task.payload.sourceVerificationTaskId !== undefined))
+        .toHaveLength(1);
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "verification.failed"))
+        .toHaveLength(1);
+      expect(store.listOutbox()).toEqual([]);
+
+      const restartedService = durableExecutionService(store, orca);
+      await expect(restartedService.recordVerificationReport(structuredClone(failedReport)))
+        .resolves.toEqual({
+          kind: "create_fix_task",
+          findings: ["acceptance behavior is incomplete"],
+          nextCycle: 1
+        });
+
+      const fixTasks = store.listTasks().filter((task) =>
+        task.payload.sourceVerificationTaskId !== undefined
+      );
+      expect(fixTasks).toHaveLength(1);
+      expect(fixTasks[0]).toMatchObject({
+        taskId: "task:proposal-1:implement:fix:1",
+        state: "running"
+      });
+      expect(orca.calls.filter(({ kind }) => kind === "create_task")).toHaveLength(4);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(3);
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "verification.failed"))
+        .toHaveLength(1);
+      expect(store.listOutbox()).toEqual([]);
     } finally {
       database.close();
     }
