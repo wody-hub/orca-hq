@@ -72,6 +72,16 @@ export type OutboundDeliveryReceipt = z.infer<typeof OutboundDeliveryReceiptSche
 export type OutboundMessageFor<C extends OutboundMessage["channel"]> =
   Omit<OutboundMessage, "channel"> & Readonly<{ channel: C }>;
 
+export class InvalidOutboundMessageError extends Error {
+  readonly code = "invalid_outbound_message";
+  readonly retryable = false;
+
+  constructor() {
+    super("invalid_outbound_message");
+    this.name = "InvalidOutboundMessageError";
+  }
+}
+
 export type OutboundDeliveryFailure = Readonly<{
   code: string;
   retryable: boolean;

@@ -31,6 +31,10 @@ export class IdentityResolver {
   readonly #allowedSlackWorkspaceIds: ReadonlySet<string>;
 
   constructor(options: IdentityResolverOptions) {
+    if (options.allowedSlackWorkspaceIds.length !== 1 ||
+      options.allowedSlackWorkspaceIds[0]?.length === 0) {
+      throw new TypeError("IdentityResolver requires exactly one trusted Slack workspace");
+    }
     this.#bindings = options.bindings.map((binding) => PrincipalBindingSchema.parse(binding));
     this.#allowedSlackWorkspaceIds = new Set(options.allowedSlackWorkspaceIds);
   }

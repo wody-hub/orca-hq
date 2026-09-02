@@ -1,7 +1,27 @@
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { IdentityResolver, type CommandEnvelope, type CommandIngress } from "@orca-hq/core";
-import { describe, expect, it, vi } from "vitest";
+import { createVoiceCommandTranscriber, createVoiceIngestionService } from "@orca-hq/voice";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createTelegramAdapter } from "../src/index.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true
+  })));
+});
+
+async function voiceTemporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "orca-telegram-voice-limit-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
 
 const identities = new IdentityResolver({
   bindings: [{
@@ -12,7 +32,7 @@ const identities = new IdentityResolver({
     tailscaleLoginNames: [],
     roles: ["owner"]
   }],
-  allowedSlackWorkspaceIds: []
+  allowedSlackWorkspaceIds: ["T123"]
 });
 
 const message = {
@@ -24,6 +44,76 @@ const message = {
 };
 
 describe("Telegram voice update", () => {
+  it("rejects declared Telegram voice media over its explicit byte limit", async () => {
+    // Break caught: trusting only streamed bytes starts an avoidable oversized provider download.
+    const ingress = { accept: vi.fn(async () => ({ kind: "accepted" as const, commandId: "unused" })) };
+    const cursorStore = { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) };
+    const media = { download: vi.fn(async function* () { yield new Uint8Array([1]); }) };
+    const transcriber = { transcribe: vi.fn(async () => ({
+      text: "상태를 알려줘", provider: "openai" as const, sourceFileSha256: "e".repeat(64)
+    })) };
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 2 }, {
+      ingress,
+      identities,
+      cursorStore,
+      outbox: { enqueue: vi.fn(async () => undefined) },
+      approvalPort: { request: vi.fn(async () => undefined) },
+      voice: {
+        media,
+        transcriber,
+        confirmations: { request: vi.fn(async () => undefined) }
+      }
+    });
+
+    await expect(adapter.handleUpdate({
+      update_id: 501,
+      message: { ...message, voice: { ...message.voice, file_size: 3 } }
+    })).rejects.toThrow("voice media exceeds");
+
+    expect(media.download).not.toHaveBeenCalled();
+    expect(transcriber.transcribe).not.toHaveBeenCalled();
+    expect(ingress.accept).not.toHaveBeenCalled();
+    expect(cursorStore.save).not.toHaveBeenCalled();
+  });
+
+  it("stops an over-limit Telegram voice stream without temp audio, ingress, or offset", async () => {
+    // Break caught: streamed media larger than file_size can reach transcription and advance the update offset.
+    const temporaryDirectory = await voiceTemporaryDirectory();
+    const ingress = { accept: vi.fn(async () => ({ kind: "accepted" as const, commandId: "unused" })) };
+    const cursorStore = { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) };
+    const providerTranscribe = vi.fn(async () => ({ text: "상태를 알려줘" }));
+    const transcriber = createVoiceCommandTranscriber(createVoiceIngestionService({
+      temporaryDirectory,
+      transcriber: { id: "local-whisper", transcribe: providerTranscribe }
+    }));
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 3 }, {
+      ingress,
+      identities,
+      cursorStore,
+      outbox: { enqueue: vi.fn(async () => undefined) },
+      approvalPort: { request: vi.fn(async () => undefined) },
+      voice: {
+        media: {
+          download: vi.fn(async function* () {
+            yield new Uint8Array([1, 2]);
+            yield new Uint8Array([3, 4]);
+          })
+        },
+        transcriber,
+        confirmations: { request: vi.fn(async () => undefined) }
+      }
+    });
+
+    await expect(adapter.handleUpdate({ update_id: 501, message })).rejects.toThrow(
+      "voice media exceeds"
+    );
+
+    expect(providerTranscribe).not.toHaveBeenCalled();
+    expect(ingress.accept).not.toHaveBeenCalled();
+    expect(cursorStore.save).not.toHaveBeenCalled();
+    expect(await readdir(temporaryDirectory)).toEqual([]);
+  });
+
   it("ingests a confident voice update before advancing its cursor", async () => {
     // Break caught: a voice update falling through as ignored loses the command while advancing Telegram's offset.
     const ingress: CommandIngress & { accept: ReturnType<typeof vi.fn> } = {
@@ -38,7 +128,7 @@ describe("Telegram voice update", () => {
       }))
     };
     const confirmations = { request: vi.fn(async () => undefined) };
-    const adapter = createTelegramAdapter({ botIdentity: "bot-123" }, {
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 1024 }, {
       ingress,
       identities,
       cursorStore,
@@ -64,7 +154,7 @@ describe("Telegram voice update", () => {
     const ingress = { accept: vi.fn(async () => ({ kind: "accepted" as const, commandId: "unused" })) };
     const cursorStore = { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) };
     const confirmations = { request: vi.fn(async () => undefined) };
-    const adapter = createTelegramAdapter({ botIdentity: "bot-123" }, {
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 1024 }, {
       ingress,
       identities,
       cursorStore,
@@ -93,7 +183,7 @@ describe("Telegram voice update", () => {
   it("does not advance its cursor after voice transcription fails", async () => {
     // Break caught: saving Telegram's offset after a voice failure drops the update permanently.
     const cursorStore = { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) };
-    const adapter = createTelegramAdapter({ botIdentity: "bot-123" }, {
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 1024 }, {
       ingress: { accept: vi.fn(async () => ({ kind: "accepted" as const, commandId: "unused" })) },
       identities,
       cursorStore,
@@ -114,7 +204,7 @@ describe("Telegram voice update", () => {
   it("does not advance its cursor when confirmation delivery fails", async () => {
     // Break caught: a failed explicit-confirmation request must be redelivered with the same Telegram update.
     const cursorStore = { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) };
-    const adapter = createTelegramAdapter({ botIdentity: "bot-123" }, {
+    const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 1024 }, {
       ingress: { accept: vi.fn(async () => ({ kind: "accepted" as const, commandId: "unused" })) },
       identities,
       cursorStore,

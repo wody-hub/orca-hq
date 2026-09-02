@@ -21,6 +21,40 @@ export const TranscriptSchema = TranscriptionResponseSchema.extend({
 export type Transcript = z.infer<typeof TranscriptSchema>;
 export type TranscriptionResponse = z.infer<typeof TranscriptionResponseSchema>;
 
+export class VoiceMediaTooLargeError extends Error {
+  readonly code = "voice_media_too_large";
+
+  constructor() {
+    super("voice media exceeds the configured byte limit");
+    this.name = "VoiceMediaTooLargeError";
+  }
+}
+
+function validateVoiceByteLimit(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new TypeError("maxBytes must be a positive safe integer");
+  }
+}
+
+export function assertVoiceMediaSize(declaredBytes: number | undefined, maxBytes: number): void {
+  validateVoiceByteLimit(maxBytes);
+  if (declaredBytes !== undefined && declaredBytes > maxBytes) throw new VoiceMediaTooLargeError();
+}
+
+/** Counts untrusted media while consumed, before an over-limit chunk reaches temp storage. */
+export async function* limitVoiceMediaBytes(
+  stream: AsyncIterable<Uint8Array>,
+  maxBytes: number
+): AsyncGenerator<Uint8Array> {
+  validateVoiceByteLimit(maxBytes);
+  let byteCount = 0;
+  for await (const chunk of stream) {
+    if (chunk.byteLength > maxBytes - byteCount) throw new VoiceMediaTooLargeError();
+    byteCount += chunk.byteLength;
+    yield chunk;
+  }
+}
+
 export type TranscriptDecision =
   | Readonly<{ kind: "command"; transcript: Transcript }>
   | Readonly<{ kind: "confirmation_required"; confirmationText: string }>;

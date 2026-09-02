@@ -1,7 +1,12 @@
 import { Readable } from "node:stream";
 
-import type { CommandIngress, IdentityResolver } from "@orca-hq/core";
-import { decideTranscript, type VoiceCommandTranscriber } from "@orca-hq/voice";
+import { deriveIdempotencyKey, type CommandIngress, type IdentityResolver } from "@orca-hq/core";
+import {
+  assertVoiceMediaSize,
+  decideTranscript,
+  limitVoiceMediaBytes,
+  type VoiceCommandTranscriber
+} from "@orca-hq/voice";
 import { z } from "zod";
 
 import {
@@ -10,7 +15,7 @@ import {
 } from "./attachments.js";
 import {
   SlackVoiceMessageEventSchema,
-  slackVoiceFileId,
+  slackVoiceFile,
   toCommandEnvelope,
   toSlackVoiceCommandEnvelope
 } from "./events.js";
@@ -37,6 +42,7 @@ const SlackInteractiveActionSchema = z.object({
   container: z.object({ message_ts: z.string().min(1) }),
   actions: z.array(z.object({
     action_id: z.string().min(1),
+    action_ts: z.string().regex(/^\d+(?:\.\d+)?$/),
     value: z.string().min(1).optional()
   })).min(1)
 }).passthrough();
@@ -44,6 +50,11 @@ const SlackInteractiveActionSchema = z.object({
 const SlackSocketModeEnvelopeSchema = z.object({
   team_id: z.string().min(1)
 }).passthrough();
+
+const SlackApprovalRequestAcceptanceSchema = z.object({
+  kind: z.enum(["accepted", "duplicate"]),
+  requestId: z.string().min(1)
+}).strict();
 
 export type SlackApprovalRequest = Readonly<{
   channel: "slack";
@@ -53,7 +64,15 @@ export type SlackApprovalRequest = Readonly<{
   messageTs: string;
   actionId: string;
   value: string | undefined;
+  idempotencyKey: string;
   trusted: false;
+}>;
+
+export type SlackApprovalRequestPort = Readonly<{
+  accept(request: SlackApprovalRequest): Promise<Readonly<{
+    kind: "accepted" | "duplicate";
+    requestId: string;
+  }>>;
 }>;
 
 export type SlackSocketModeApp = Readonly<{
@@ -72,6 +91,8 @@ export type SlackAdapterConfig = Readonly<{
   channelId: string;
   maxAttachmentBytes: number;
   stagingDirectory: string;
+  stagedArtifactRetentionMs?: number;
+  interactiveActionsEnabled?: boolean;
 }>;
 
 export type SlackVoicePorts = Readonly<{
@@ -97,10 +118,12 @@ export type SlackAdapterPorts = Readonly<{
   files: SlackFileDownloader;
   voice?: SlackVoicePorts;
   messages?: SlackMessagePort;
-  approvalRequests?: Readonly<{ accept(request: SlackApprovalRequest): Promise<void> }>;
+  approvalRequests?: SlackApprovalRequestPort;
 }>;
 
 export type SlackAdapter = Readonly<{
+  ready(): Promise<void>;
+  interactiveActionsEnabled: boolean;
   handleEvent(event: unknown, workspaceId?: string): Promise<void>;
   reconcile(): Promise<void>;
   deliver(message: SlackOutboundMessage): Promise<Readonly<{ providerMessageId: string }>>;
@@ -112,23 +135,36 @@ export function createSlackAdapter(config: SlackAdapterConfig, ports: SlackAdapt
     teamId: z.string().min(1),
     channelId: z.string().min(1),
     maxAttachmentBytes: z.number().int().nonnegative(),
-    stagingDirectory: z.string().min(1)
+    stagingDirectory: z.string().min(1),
+    stagedArtifactRetentionMs: z.number().int().positive().optional(),
+    interactiveActionsEnabled: z.boolean().default(false)
   }).strict().parse(config);
+  if (parsedConfig.interactiveActionsEnabled && ports.approvalRequests === undefined) {
+    throw new TypeError("interactive actions require a durable approval-request port");
+  }
   const stageAttachment = createSlackAttachmentStager({
     maxAttachmentBytes: parsedConfig.maxAttachmentBytes,
     stagingDirectory: parsedConfig.stagingDirectory,
+    ...(parsedConfig.stagedArtifactRetentionMs === undefined
+      ? {}
+      : { stagedArtifactRetentionMs: parsedConfig.stagedArtifactRetentionMs }),
     files: ports.files
   });
 
   const handleEvent = async (event: unknown, workspaceId?: string): Promise<void> => {
+    await stageAttachment.ready;
     if (workspaceId !== undefined && workspaceId !== parsedConfig.teamId) return;
     const voiceEvent = SlackVoiceMessageEventSchema.safeParse(event);
-    const voiceFileId = slackVoiceFileId(event, parsedConfig);
-    if (voiceEvent.success && voiceFileId !== undefined) {
+    const voiceFile = slackVoiceFile(event, parsedConfig);
+    if (voiceEvent.success && voiceFile !== undefined) {
       const identity = ports.identities.resolve("slack", voiceEvent.data.user, parsedConfig.teamId);
       if (!("kind" in identity)) {
         if (ports.voice === undefined) throw new Error("Slack voice port is not configured");
-        const stream = Readable.from(await ports.files.download(voiceFileId));
+        assertVoiceMediaSize(voiceFile.size, parsedConfig.maxAttachmentBytes);
+        const stream = Readable.from(limitVoiceMediaBytes(
+          await ports.files.download(voiceFile.id),
+          parsedConfig.maxAttachmentBytes
+        ));
         const decision = decideTranscript(await ports.voice.transcriber.transcribe(stream));
         if (decision === undefined) throw new Error("Slack voice transcript is invalid");
         if (decision.kind === "command") {
@@ -151,14 +187,23 @@ export function createSlackAdapter(config: SlackAdapterConfig, ports: SlackAdapt
       }
       return;
     }
-    const command = await toCommandEnvelope(event, parsedConfig, {
+    const prepared = await toCommandEnvelope(event, parsedConfig, {
       identities: ports.identities,
       stageAttachment
     });
-    if (command !== undefined) await ports.ingress.accept(command);
+    if (prepared !== undefined) {
+      try {
+        const result = await ports.ingress.accept(prepared.command);
+        if (result.kind === "duplicate") await prepared.removeStagedArtifacts();
+      } catch (error) {
+        await prepared.removeStagedArtifacts();
+        throw error;
+      }
+    }
   };
 
   const handleInteractiveAction = async (payload: unknown): Promise<SlackApprovalRequest | undefined> => {
+    if (!parsedConfig.interactiveActionsEnabled) return undefined;
     const parsed = SlackInteractiveActionSchema.safeParse(payload);
     if (!parsed.success || parsed.data.team.id !== parsedConfig.teamId ||
       parsed.data.channel.id !== parsedConfig.channelId) return undefined;
@@ -176,13 +221,16 @@ export function createSlackAdapter(config: SlackAdapterConfig, ports: SlackAdapt
       messageTs: parsed.data.container.message_ts,
       actionId: action.action_id,
       value: action.value,
+      idempotencyKey: deriveIdempotencyKey(`slack-action:${parsedConfig.teamId}`, action.action_ts),
       trusted: false
     };
-    await ports.approvalRequests?.accept(request);
+    SlackApprovalRequestAcceptanceSchema.parse(await ports.approvalRequests!.accept(request));
     return request;
   };
 
   return Object.freeze({
+    ready: async () => stageAttachment.ready,
+    interactiveActionsEnabled: parsedConfig.interactiveActionsEnabled,
     handleEvent,
     reconcile: async () => reconcileSlackHistory({
       channelId: parsedConfig.channelId,
@@ -205,8 +253,10 @@ export function registerSlackSocketModeHandlers(app: SlackSocketModeApp, adapter
     if (!envelope.success) return;
     await adapter.handleEvent(event, envelope.data.team_id);
   });
-  app.action(/.*/, async ({ body, ack }) => {
-    await ack();
-    await adapter.handleInteractiveAction(body);
-  });
+  if (adapter.interactiveActionsEnabled) {
+    app.action(/.*/, async ({ body, ack }) => {
+      await adapter.handleInteractiveAction(body);
+      await ack();
+    });
+  }
 }

@@ -137,6 +137,15 @@ interface CommandRow {
   payload_json: string;
 }
 
+interface CommandIdentityRow {
+  id: string;
+}
+
+type CommandInsertResult = Readonly<{
+  kind: "accepted" | "duplicate";
+  commandId: string;
+}>;
+
 interface InboxEventRow {
   id: string;
   command_id: string;
@@ -234,24 +243,23 @@ export class ControlStore implements CommandIngress {
     commandId: string;
   }>> {
     const command = CommandEnvelopeSchema.parse(input);
-    const status = this.insertCommand(command);
-    return Object.freeze({
-      kind: status === "inserted" ? "accepted" : "duplicate",
-      commandId: command.commandId
-    });
+    return this.#insertCommand(command);
   }
 
   insertCommand(commandInput: CommandEnvelope): "inserted" | "duplicate" {
     const command = CommandEnvelopeSchema.parse(commandInput);
+    return this.#insertCommand(command).kind === "accepted" ? "inserted" : "duplicate";
+  }
 
-    return this.database.transaction(() => {
+  #insertCommand(command: CommandEnvelope): CommandInsertResult {
+    const insert = this.database.transaction((): CommandInsertResult => {
       const now = new Date().toISOString();
       const result = this.database.prepare(`
         INSERT INTO commands (
           id, idempotency_key, channel, external_message_id, external_thread_id,
           principal_id, received_at, payload_json, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT(idempotency_key) DO NOTHING
       `).run(
         command.commandId,
         command.idempotencyKey,
@@ -264,7 +272,15 @@ export class ControlStore implements CommandIngress {
         now
       );
 
-      if (result.changes === 0) return "duplicate";
+      if (result.changes === 0) {
+        const existing = this.database.prepare(`
+          SELECT id
+          FROM commands
+          WHERE idempotency_key = ?
+        `).get(command.idempotencyKey) as CommandIdentityRow | undefined;
+        if (existing === undefined) throw new Error("Command idempotency conflict could not be resolved");
+        return Object.freeze({ kind: "duplicate", commandId: existing.id });
+      }
 
       this.database.prepare(`
         INSERT INTO principals (id, payload_json, created_at, updated_at)
@@ -290,8 +306,9 @@ export class ControlStore implements CommandIngress {
         eventType: "command.accepted",
         data: {}
       });
-      return "inserted";
-    })();
+      return Object.freeze({ kind: "accepted", commandId: command.commandId });
+    });
+    return insert.immediate();
   }
 
   listCommands(): CommandEnvelope[] {

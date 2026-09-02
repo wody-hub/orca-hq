@@ -1,7 +1,12 @@
 import { Readable } from "node:stream";
 
 import type { CommandIngress, IdentityResolver } from "@orca-hq/core";
-import { decideTranscript, type VoiceCommandTranscriber } from "@orca-hq/voice";
+import {
+  assertVoiceMediaSize,
+  decideTranscript,
+  limitVoiceMediaBytes,
+  type VoiceCommandTranscriber
+} from "@orca-hq/voice";
 import { z } from "zod";
 
 import {
@@ -70,7 +75,10 @@ export type TelegramVoicePorts = Readonly<{
   }>;
 }>;
 
-export type TelegramAdapterConfig = Readonly<{ botIdentity: string }>;
+export type TelegramAdapterConfig = Readonly<{
+  botIdentity: string;
+  maxVoiceBytes: number;
+}>;
 export type TelegramAdapterPorts = Readonly<{
   ingress: CommandIngress;
   identities: IdentityResolver;
@@ -93,7 +101,10 @@ function approvalIdentity(callback: TelegramApprovalCallback) {
 }
 
 export function createTelegramAdapter(config: TelegramAdapterConfig, ports: TelegramAdapterPorts): TelegramAdapter {
-  const parsedConfig = z.object({ botIdentity: z.string().min(1) }).strict().parse(config);
+  const parsedConfig = z.object({
+    botIdentity: z.string().min(1),
+    maxVoiceBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+  }).strict().parse(config);
   return Object.freeze({
     handleUpdate: async (input: unknown): Promise<void> => {
       const parsed = TelegramUpdateSchema.safeParse(input);
@@ -118,7 +129,11 @@ export function createTelegramAdapter(config: TelegramAdapterConfig, ports: Tele
         const identity = ports.identities.resolve("telegram", userId, chatId);
         if (!("kind" in identity)) {
           if (ports.voice === undefined) throw new Error("Telegram voice port is not configured");
-          const stream = Readable.from(await ports.voice.media.download(voiceMessage.data.voice.file_id));
+          assertVoiceMediaSize(voiceMessage.data.voice.file_size, parsedConfig.maxVoiceBytes);
+          const stream = Readable.from(limitVoiceMediaBytes(
+            await ports.voice.media.download(voiceMessage.data.voice.file_id),
+            parsedConfig.maxVoiceBytes
+          ));
           const decision = decideTranscript(await ports.voice.transcriber.transcribe(stream));
           if (decision === undefined) throw new Error("Telegram voice transcript is invalid");
           if (decision.kind === "command") {

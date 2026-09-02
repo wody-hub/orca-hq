@@ -1,0 +1,31 @@
+{
+  "type": "message",
+  "subtype": "file_share",
+  "channel": "C123",
+  "user": "U123",
+  "text": "",
+  "ts": "171.004",
+  "files": [
+    {
+      "id": "FVOICE",
+      "created": 1725148800,
+      "timestamp": 1725148800,
+      "name": "voice-message.m4a",
+      "title": "voice-message.m4a",
+      "mimetype": "audio/mp4",
+      "filetype": "m4a",
+      "pretty_type": "MPEG-4 Audio",
+      "user": "U123",
+      "user_team": "T123",
+      "editable": false,
+      "size": 3,
+      "mode": "hosted",
+      "is_external": false,
+      "external_type": "",
+      "is_public": false,
+      "public_url_shared": false,
+      "url_private": "https://files.slack.com/files-pri/T123-FVOICE/voice-message.m4a",
+      "url_private_download": "https://files.slack.com/files-pri/T123-FVOICE/download/voice-message.m4a"
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import {
+  InvalidOutboundMessageError,
   OutboundDeliveryReceiptSchema,
   OutboundMessageSchema,
   type OutboundMessageFor
@@ -41,7 +42,9 @@ export async function deliverSlackMessage(
   messageInput: SlackOutboundMessage,
   messages: SlackMessagePort
 ): Promise<SlackDeliveryReceipt> {
-  const message = SlackOutboundMessageSchema.parse(messageInput);
+  const parsed = SlackOutboundMessageSchema.safeParse(messageInput);
+  if (!parsed.success) throw new InvalidOutboundMessageError();
+  const message = parsed.data;
   const response = await messages.send({
     channel: message.destination,
     text: message.payload.text,

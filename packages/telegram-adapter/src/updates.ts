@@ -26,7 +26,8 @@ export const TelegramVoiceMessageSchema = z.object({
   voice: z.object({
     file_id: z.string().min(1),
     file_unique_id: z.string().min(1),
-    duration: z.number().int().nonnegative()
+    duration: z.number().int().nonnegative(),
+    file_size: z.number().int().nonnegative().optional()
   }).passthrough()
 }).passthrough();
 

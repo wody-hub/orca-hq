@@ -19,7 +19,7 @@ const identities = new IdentityResolver({
     tailscaleLoginNames: [],
     roles: ["owner"]
   }],
-  allowedSlackWorkspaceIds: []
+  allowedSlackWorkspaceIds: ["T123"]
 });
 
 function acceptedIngress(): CommandIngress & { accept: ReturnType<typeof vi.fn> } {
@@ -44,7 +44,7 @@ function adapterFor(options: {
   };
   const outbox = options.outbox ?? { enqueue: vi.fn(async () => undefined) };
   const approvalPort = options.approvalPort ?? { request: vi.fn(async () => undefined) };
-  const adapter = createTelegramAdapter({ botIdentity: "bot-123" }, {
+  const adapter = createTelegramAdapter({ botIdentity: "bot-123", maxVoiceBytes: 1024 }, {
     ingress,
     identities,
     cursorStore,
@@ -67,6 +67,17 @@ function approvalCallback(riskLevel: "L0" | "L1" | "L2" | "L3") {
 }
 
 describe("Telegram adapter", () => {
+  it("requires an explicit Telegram voice byte limit at composition", () => {
+    // Break caught: an omitted voice limit silently creates an unbounded media ingestion path.
+    expect(() => createTelegramAdapter({ botIdentity: "bot-123" } as never, {
+      ingress: acceptedIngress(),
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      outbox: { enqueue: vi.fn(async () => undefined) },
+      approvalPort: { request: vi.fn(async () => undefined) }
+    })).toThrow("maxVoiceBytes");
+  });
+
   it("stores an update before advancing its offset", async () => {
     // Break caught: persisting the offset first loses a command if durable ingress crashes.
     const { adapter, ingress, cursorStore } = adapterFor();

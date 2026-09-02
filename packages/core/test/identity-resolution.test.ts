@@ -23,6 +23,14 @@ const resolver = new IdentityResolver({
 });
 
 describe("IdentityResolver", () => {
+  it("rejects configuration with more than one trusted Slack workspace", () => {
+    // Break caught: a workspace-wide user binding becomes ambiguous when multiple Slack teams are trusted.
+    expect(() => new IdentityResolver({
+      bindings: [owner],
+      allowedSlackWorkspaceIds: ["T123", "T999"]
+    })).toThrow("exactly one trusted Slack workspace");
+  });
+
   it("maps the owner's Slack and Telegram identities to one principal", () => {
     expect(resolver.resolve("slack", "U123", "T123")).toMatchObject({
       principalId: "owner",
@@ -86,7 +94,7 @@ describe("CommandIngress", () => {
       });
       await expect(ingress.accept({ ...command, commandId: "cmd-redelivered" })).resolves.toEqual({
         kind: "duplicate",
-        commandId: "cmd-redelivered"
+        commandId: "cmd-1"
       });
       expect(ingress.listInboxEvents()).toHaveLength(1);
     } finally {

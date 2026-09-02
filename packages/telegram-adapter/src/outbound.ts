@@ -1,4 +1,5 @@
 import {
+  InvalidOutboundMessageError,
   OutboundDeliveryReceiptSchema,
   OutboundMessageSchema,
   type OutboundMessageFor
@@ -32,7 +33,9 @@ export async function deliverTelegramMessage(
   input: TelegramOutboundMessage,
   messages: TelegramMessagePort
 ): Promise<Readonly<{ providerMessageId: string }>> {
-  const message = TelegramOutboundMessageSchema.parse(input);
+  const parsed = TelegramOutboundMessageSchema.safeParse(input);
+  if (!parsed.success) throw new InvalidOutboundMessageError();
+  const message = parsed.data;
   const rendered = renderTelegramMessage(message.template, message.payload);
   const response = await messages.send({
     chatId: message.destination,
@@ -51,12 +54,16 @@ function renderTelegramMessage(
   payload: unknown
 ): Readonly<{ text: string; replyToMessageId?: number }> {
   if (template === "approval_channel_not_allowed") {
-    const denied = TelegramApprovalDeniedPayloadSchema.parse(payload);
+    const parsed = TelegramApprovalDeniedPayloadSchema.safeParse(payload);
+    if (!parsed.success) throw new InvalidOutboundMessageError();
+    const denied = parsed.data;
     return {
       text: `Telegram에서는 ${denied.riskLevel} 승인을 처리할 수 없습니다. Slack HQ에서 승인해 주세요.`
     };
   }
-  const text = TelegramTextPayloadSchema.parse(payload);
+  const parsed = TelegramTextPayloadSchema.safeParse(payload);
+  if (!parsed.success) throw new InvalidOutboundMessageError();
+  const text = parsed.data;
   return {
     text: text.text,
     ...(text.replyToMessageId === undefined ? {} : { replyToMessageId: text.replyToMessageId })

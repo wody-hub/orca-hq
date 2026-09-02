@@ -65,7 +65,7 @@ export class OutboxDispatcher {
       nextAttemptAt: claimed.nextAttemptAt
     });
     try {
-      this.#enqueueSlackHqMirror(message, now);
+      this.#prepareSlackHqMirror(message, now);
       const receipt = OutboundDeliveryReceiptSchema.parse(await this.#deliver(message));
       this.#store.markOutboxDelivered(message.id, receipt.providerMessageId, now);
     } catch (error) {
@@ -100,7 +100,7 @@ export class OutboxDispatcher {
     }
   }
 
-  #enqueueSlackHqMirror(message: OutboundMessage, now: string): void {
+  #prepareSlackHqMirror(message: OutboundMessage, now: string): void {
     if (message.channel !== "telegram" || message.template !== "final_summary") return;
     const payloadRecord = typeof message.payload === "object" && message.payload !== null
       && !Array.isArray(message.payload)
@@ -110,27 +110,43 @@ export class OutboxDispatcher {
 
     const payload = TelegramCompanyFinalPayloadSchema.safeParse(message.payload);
     if (!payload.success) {
-      throw Object.assign(new Error("invalid_company_final_summary"), {
-        code: "invalid_company_final_summary",
-        retryable: false
-      });
+      this.#recordMirrorFailure(message, "invalid_company_final_summary");
+      return;
     }
     if (this.#slackHqDestination === undefined || this.#slackHqDestination.length === 0) {
-      throw Object.assign(new Error("slack_hq_not_configured"), {
-        code: "slack_hq_not_configured",
-        retryable: false
-      });
+      this.#recordMirrorFailure(message, "slack_hq_not_configured");
+      return;
     }
 
-    this.#store.enqueueOutbox({
-      id: `${message.id}:slack-hq`,
-      ...(message.commandId === undefined ? {} : { commandId: message.commandId }),
-      channel: "slack",
-      destination: this.#slackHqDestination,
-      template: "final_summary",
-      payload: { text: payload.data.redactedSummary },
-      nextAttemptAt: now
-    });
+    try {
+      this.#store.enqueueOutbox({
+        id: `${message.id}:slack-hq`,
+        ...(message.commandId === undefined ? {} : { commandId: message.commandId }),
+        channel: "slack",
+        destination: this.#slackHqDestination,
+        template: "final_summary",
+        payload: { text: payload.data.redactedSummary },
+        nextAttemptAt: now
+      });
+    } catch {
+      this.#recordMirrorFailure(message, "mirror_enqueue_failed");
+    }
+  }
+
+  #recordMirrorFailure(message: OutboundMessage, code: string): void {
+    try {
+      this.#store.appendAudit({
+        subjectId: `${message.id}:slack-hq`,
+        eventType: "outbox.mirror_failed",
+        data: {
+          originMessageId: message.id,
+          channel: "slack",
+          failure: { code, retryable: false }
+        }
+      });
+    } catch {
+      // Mirror observability cannot make an independently deliverable origin retry or fail.
+    }
   }
 }
 

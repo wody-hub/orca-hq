@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import {
   SlackAttachmentTooLargeError,
   writeFully
 } from "../src/index.js";
+import slackFileShareFixture from "./fixtures/file-share-message.json" with { type: "json" };
 import slackMessageFixture from "./fixtures/message.json" with { type: "json" };
 
 const identities = new IdentityResolver({
@@ -53,11 +54,29 @@ async function stagingDirectory(): Promise<string> {
   return directory;
 }
 
+function unusedStagingDirectory(): string {
+  const directory = join(tmpdir(), `orca-slack-unused-test-${randomUUID()}`);
+  stagedDirectories.push(directory);
+  return directory;
+}
+
+async function stagedFileNames(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true });
+  return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+}
+
+async function stagedFilePaths(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true });
+  return entries.filter((entry) => entry.isFile()).map((entry) => join(entry.parentPath, entry.name));
+}
+
 function adapterFor(options: {
   ingress?: CommandIngress & { accept: ReturnType<typeof vi.fn> };
   cursorStore?: { load: ReturnType<typeof vi.fn>; save: ReturnType<typeof vi.fn> };
   history?: { listMessages: ReturnType<typeof vi.fn> };
   files?: { download: ReturnType<typeof vi.fn> };
+  interactiveActionsEnabled?: boolean;
+  approvalRequests?: { accept: ReturnType<typeof vi.fn> };
 } = {}) {
   const ingress = options.ingress ?? acceptedIngress();
   const cursorStore = options.cursorStore ?? {
@@ -76,8 +95,20 @@ function adapterFor(options: {
       teamId: "T123",
       channelId: "C123",
       maxAttachmentBytes: 1024,
-      stagingDirectory: "unused-in-this-test"
-    }, { ingress, identities, cursorStore, history, files }),
+      stagingDirectory: unusedStagingDirectory(),
+      ...(options.interactiveActionsEnabled === undefined
+        ? {}
+        : { interactiveActionsEnabled: options.interactiveActionsEnabled })
+    }, {
+      ingress,
+      identities,
+      cursorStore,
+      history,
+      files,
+      ...(options.approvalRequests === undefined
+        ? {}
+        : { approvalRequests: options.approvalRequests })
+    }),
     ingress,
     cursorStore,
     history
@@ -85,6 +116,23 @@ function adapterFor(options: {
 }
 
 describe("Slack adapter", () => {
+  it("requires a durable approval-request port when interactive actions are enabled", () => {
+    // Break caught: an enabled action handler with optional persistence can acknowledge and discard approvals.
+    expect(() => createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: unusedStagingDirectory(),
+      interactiveActionsEnabled: true
+    }, {
+      ingress: acceptedIngress(),
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: { download: vi.fn(async function* () { yield new Uint8Array(); }) }
+    })).toThrow("durable approval-request port");
+  });
+
   it("normalizes one channel message and keeps its thread", async () => {
     // Break caught: using only thread_ts would lose the root-thread association.
     const { adapter, ingress } = adapterFor();
@@ -100,10 +148,80 @@ describe("Slack adapter", () => {
     }));
   });
 
+  it("accepts a validated Slack file_share message through the production adapter", async () => {
+    // Break caught: rejecting every message subtype discards real user file uploads before staging.
+    const directory = await stagingDirectory();
+    const ingress = acceptedIngress();
+    const fileBytes = new TextEncoder().encode("requirements");
+    const adapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory
+    }, {
+      ingress,
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: { download: vi.fn(async function* () { yield fileBytes; }) }
+    });
+
+    await adapter.handleEvent(slackFileShareFixture, "T123");
+
+    expect(ingress.accept).toHaveBeenCalledWith(expect.objectContaining({
+      externalMessageId: "171.003",
+      text: "Review the attached requirements",
+      attachments: [expect.objectContaining({
+        providerFileId: "F123",
+        name: "requirements.pdf"
+      })]
+    }));
+    expect(JSON.stringify(ingress.accept.mock.calls)).not.toContain("https://files.slack.com/");
+  });
+
+  it("rejects a bot-authored Slack file_share even when it carries a user field", async () => {
+    // Break caught: subtype=file_share alone is insufficient to distinguish a human upload from a bot event.
+    const ingress = acceptedIngress();
+    const files = { download: vi.fn(async function* () { yield new Uint8Array([1]); }) };
+    const { adapter } = adapterFor({ ingress, files });
+
+    await adapter.handleEvent({
+      ...slackFileShareFixture,
+      bot_id: "B123",
+      bot_profile: { id: "B123", name: "automation" }
+    }, "T123");
+
+    expect(files.download).not.toHaveBeenCalled();
+    expect(ingress.accept).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "bot_message",
+    "message_changed",
+    "message_deleted",
+    "channel_join",
+    "thread_broadcast"
+  ])("rejects the Slack %s subtype", async (subtype) => {
+    // Break caught: widening subtype acceptance beyond validated file_share admits bot/system/mutation events.
+    const { adapter, ingress } = adapterFor();
+
+    await adapter.handleEvent({ ...slackMessageFixture, subtype }, "T123");
+
+    expect(ingress.accept).not.toHaveBeenCalled();
+  });
+
   it("registers Socket Mode message and interactive-action handlers", async () => {
     // Break caught: registering an action handler without a Bolt action constraint leaves approvals undeliverable.
     const ingress = acceptedIngress();
-    const { adapter } = adapterFor({ ingress });
+    const approvalAccept = vi.fn(async () => ({
+      kind: "accepted" as const,
+      requestId: "approval-request-1"
+    }));
+    const { adapter } = adapterFor({
+      ingress,
+      interactiveActionsEnabled: true,
+      approvalRequests: { accept: approvalAccept }
+    });
     const app = {
       event: vi.fn(),
       action: vi.fn()
@@ -131,10 +249,41 @@ describe("Slack adapter", () => {
         user: { id: "U123" },
         channel: { id: "C123" },
         container: { message_ts: "171.001" },
-        actions: [{ action_id: "approve", value: "proposal-1" }]
+        actions: [{ action_id: "approve", action_ts: "171.001100", value: "proposal-1" }]
       }
     });
     expect(ack).toHaveBeenCalledTimes(1);
+    expect(approvalAccept.mock.invocationCallOrder[0]).toBeLessThan(ack.mock.invocationCallOrder[0]!);
+  });
+
+  it("does not acknowledge an interactive action when durable persistence fails", async () => {
+    // Break caught: acknowledging before durable acceptance loses the request and prevents Slack retry.
+    const accept = vi.fn(async () => { throw new Error("approval request store unavailable"); });
+    const { adapter } = adapterFor({
+      interactiveActionsEnabled: true,
+      approvalRequests: { accept }
+    });
+    const app = { event: vi.fn(), action: vi.fn() };
+    registerSlackSocketModeHandlers(app, adapter);
+    const actionHandler = app.action.mock.calls[0]?.[1] as (payload: {
+      body: unknown;
+      ack: () => Promise<void>;
+    }) => Promise<void>;
+    const ack = vi.fn(async () => undefined);
+
+    await expect(actionHandler({
+      ack,
+      body: {
+        team: { id: "T123" },
+        user: { id: "U123" },
+        channel: { id: "C123" },
+        container: { message_ts: "171.001" },
+        actions: [{ action_id: "approve", action_ts: "171.001100", value: "proposal-1" }]
+      }
+    })).rejects.toThrow("approval request store unavailable");
+
+    expect(accept).toHaveBeenCalledTimes(1);
+    expect(ack).not.toHaveBeenCalled();
   });
 
   it("advances the history cursor only after ingress stores the event", async () => {
@@ -227,7 +376,9 @@ describe("Slack adapter", () => {
       })]
     });
     expect(JSON.stringify(command)).not.toContain("https://files.slack.com/");
-    await expect(readFile(join(directory, "F123"))).resolves.toEqual(Buffer.from(fileBytes));
+    const [stagedPath] = await stagedFilePaths(directory);
+    expect(stagedPath).toBeDefined();
+    await expect(readFile(stagedPath!)).resolves.toEqual(Buffer.from(fileBytes));
   });
 
   it("persists attachment size from the streamed bytes rather than untrusted Slack metadata", async () => {
@@ -294,6 +445,146 @@ describe("Slack adapter", () => {
     await expect(readFile(join(directory, "F789"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("removes every completed sibling when a later Slack file fails to stage", async () => {
+    // Break caught: Promise.all rejects on one file while already-created sibling artifacts remain unmanaged.
+    const directory = await stagingDirectory();
+    let finishFirstDownload: (() => void) | undefined;
+    const firstDownloadFinished = new Promise<void>((resolve) => { finishFirstDownload = resolve; });
+    const adapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory
+    }, {
+      ingress: acceptedIngress(),
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: {
+        download: vi.fn(async function* (fileId: string) {
+          if (fileId === "F-FIRST") {
+            yield new Uint8Array([1, 2, 3]);
+            finishFirstDownload?.();
+            return;
+          }
+          await firstDownloadFinished;
+          throw new Error("second file download failed");
+        })
+      }
+    });
+
+    await expect(adapter.handleEvent({
+      ...slackMessageFixture,
+      subtype: "file_share",
+      files: [
+        { id: "F-FIRST", name: "first.txt" },
+        { id: "F-SECOND", name: "second.txt" }
+      ]
+    }, "T123")).rejects.toThrow("second file download failed");
+
+    await vi.waitFor(async () => {
+      expect(await stagedFileNames(directory)).toEqual([]);
+    });
+  });
+
+  it("rolls back all staged Slack files when durable ingress rejects the command", async () => {
+    // Break caught: losing ephemeral ownership before ingress leaves every staged file behind on database failure.
+    const directory = await stagingDirectory();
+    const ingress = acceptedIngress();
+    ingress.accept.mockRejectedValueOnce(new Error("durable ingress unavailable"));
+    const adapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory
+    }, {
+      ingress,
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: { download: vi.fn(async function* () { yield new Uint8Array([1, 2, 3]); }) }
+    });
+
+    await expect(adapter.handleEvent({
+      ...slackMessageFixture,
+      subtype: "file_share",
+      files: [
+        { id: "F-FIRST", name: "first.txt" },
+        { id: "F-SECOND", name: "second.txt" }
+      ]
+    }, "T123")).rejects.toThrow("durable ingress unavailable");
+
+    expect(await stagedFileNames(directory)).toEqual([]);
+  });
+
+  it("expires successfully handed-off Slack artifacts after the configured retention window", async () => {
+    // Break caught: successful ingress without a bounded owner leaves raw Slack files on disk indefinitely.
+    const directory = await stagingDirectory();
+    const adapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory,
+      stagedArtifactRetentionMs: 10
+    }, {
+      ingress: acceptedIngress(),
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: { download: vi.fn(async function* () { yield new Uint8Array([1, 2, 3]); }) }
+    });
+
+    await adapter.handleEvent({
+      ...slackMessageFixture,
+      subtype: "file_share",
+      files: [{ id: "F-EXPIRING", name: "expiring.txt" }]
+    }, "T123");
+    expect(await stagedFileNames(directory)).toHaveLength(1);
+
+    await vi.waitFor(async () => {
+      expect(await stagedFileNames(directory)).toEqual([]);
+    });
+  });
+
+  it("removes expired managed Slack artifacts during adapter startup", async () => {
+    // Break caught: process exit cancels in-memory TTL timers unless startup takes ownership of stale artifacts.
+    const directory = await stagingDirectory();
+    const ports = {
+      ingress: acceptedIngress(),
+      identities,
+      cursorStore: { load: vi.fn(async () => undefined), save: vi.fn(async () => undefined) },
+      history: { listMessages: vi.fn(async () => ({ messages: [], nextCursor: undefined })) },
+      files: { download: vi.fn(async function* () { yield new Uint8Array([1, 2, 3]); }) }
+    };
+    const firstAdapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory,
+      stagedArtifactRetentionMs: 60_000
+    }, ports);
+    await firstAdapter.handleEvent({
+      ...slackMessageFixture,
+      subtype: "file_share",
+      files: [{ id: "F-STALE", name: "stale.txt" }]
+    }, "T123");
+    const [stalePath] = await stagedFilePaths(directory);
+    expect(stalePath).toBeDefined();
+    await utimes(stalePath!, new Date(0), new Date(0));
+
+    const restartedAdapter = createSlackAdapter({
+      teamId: "T123",
+      channelId: "C123",
+      maxAttachmentBytes: 1024,
+      stagingDirectory: directory,
+      stagedArtifactRetentionMs: 1_000
+    }, ports);
+
+    await restartedAdapter.ready();
+
+    expect(await stagedFileNames(directory)).toEqual([]);
+  });
+
   it("silently denies an unknown Slack user", async () => {
     // Break caught: passing an unbound provider user into command ingress grants command authority.
     const { adapter, ingress } = adapterFor();
@@ -346,7 +637,7 @@ describe("Slack adapter", () => {
       teamId: "T123",
       channelId: "C123",
       maxAttachmentBytes: 1024,
-      stagingDirectory: "unused-in-this-test"
+      stagingDirectory: unusedStagingDirectory()
     }, {
       ingress: acceptedIngress(),
       identities,
@@ -376,7 +667,7 @@ describe("Slack adapter", () => {
       teamId: "T123",
       channelId: "C123",
       maxAttachmentBytes: 1024,
-      stagingDirectory: "unused-in-this-test"
+      stagingDirectory: unusedStagingDirectory()
     }, {
       ingress: acceptedIngress(),
       identities,
@@ -399,6 +690,28 @@ describe("Slack adapter", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("marks local Slack outbound validation as a safe non-retryable failure", async () => {
+    // Break caught: a raw ZodError is treated by the dispatcher as a retryable provider outage forever.
+    const send = vi.fn(async () => ({ ts: "172.001" }));
+    const secretBody = "private outbound body";
+
+    await expect(deliverSlackMessage({
+      id: "outbox-invalid-slack",
+      channel: "slack",
+      destination: "C123",
+      template: "progress",
+      payload: { text: secretBody },
+      attempts: 1,
+      nextAttemptAt: "2026-09-01T00:00:00.000Z"
+    }, { send })).rejects.toMatchObject({
+      message: "invalid_outbound_message",
+      code: "invalid_outbound_message",
+      retryable: false
+    });
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("propagates a failed Slack delivery for the shared Outbox to retry", async () => {
     // Break caught: swallowing a provider failure lets a dispatcher mark an undelivered message complete.
     const send = vi.fn(async () => { throw new Error("socket_closed"); });
@@ -406,7 +719,7 @@ describe("Slack adapter", () => {
       teamId: "T123",
       channelId: "C123",
       maxAttachmentBytes: 1024,
-      stagingDirectory: "unused-in-this-test"
+      stagingDirectory: unusedStagingDirectory()
     }, {
       ingress: acceptedIngress(),
       identities,
@@ -450,12 +763,13 @@ describe("Slack adapter", () => {
 
   it("normalizes an interactive approval request without approving it", async () => {
     // Break caught: treating an interactive action as an approval bypasses the approval service.
-    const accept = vi.fn(async () => undefined);
+    const accept = vi.fn(async () => ({ kind: "accepted" as const, requestId: "approval-request-1" }));
     const actionAdapter = createSlackAdapter({
       teamId: "T123",
       channelId: "C123",
       maxAttachmentBytes: 1024,
-      stagingDirectory: "unused-in-this-test"
+      stagingDirectory: unusedStagingDirectory(),
+      interactiveActionsEnabled: true
     }, {
       ingress: acceptedIngress(),
       identities,
@@ -470,7 +784,7 @@ describe("Slack adapter", () => {
       user: { id: "U123" },
       channel: { id: "C123" },
       container: { message_ts: "171.001" },
-      actions: [{ action_id: "approve", value: "proposal-1" }]
+      actions: [{ action_id: "approve", action_ts: "171.001100", value: "proposal-1" }]
     });
 
     expect(accept).toHaveBeenCalledWith({
@@ -481,6 +795,7 @@ describe("Slack adapter", () => {
       messageTs: "171.001",
       actionId: "approve",
       value: "proposal-1",
+      idempotencyKey: "abea470796680235f914426fb56547cde1fccff29a93dabf28d412544b34be45",
       trusted: false
     });
   });

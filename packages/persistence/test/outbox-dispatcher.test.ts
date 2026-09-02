@@ -5,6 +5,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ControlStore, openDatabase, OutboxDispatcher } from "../src/index.js";
+import { deliverTelegramMessage } from "../../telegram-adapter/src/outbound.js";
 
 const now = "2026-09-01T00:00:00.000Z";
 const nextAttempt = "2026-09-01T00:00:01.000Z";
@@ -154,6 +155,87 @@ describe("OutboxDispatcher", () => {
     })).not.toContain(tokenShapedMessage);
   });
 
+  it("terminally fails local template validation with a redacted invalid_outbound_message audit", async () => {
+    // Break caught: local template/schema errors are otherwise rescheduled forever as provider failures.
+    database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
+    const secretBody = "raw private outbound body";
+    store.enqueueOutbox({
+      id: "telegram-invalid-template",
+      commandId: "command-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "approval_channel_not_allowed",
+      payload: { riskLevel: "L1", text: secretBody },
+      nextAttemptAt: now
+    });
+    const send = vi.fn(async () => ({ messageId: 43 }));
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      providers: {
+        telegram: {
+          deliver: async (message) => deliverTelegramMessage(message, { send })
+        }
+      }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(store.getOutbox("telegram-invalid-template")).toMatchObject({
+      state: "failed",
+      attempts: 1,
+      providerMessageId: null,
+      lastError: { code: "invalid_outbound_message", retryable: false }
+    });
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "telegram-invalid-template",
+      eventType: "outbox.delivery_failed",
+      data: {
+        channel: "telegram",
+        attempts: 1,
+        failure: { code: "invalid_outbound_message", retryable: false }
+      }
+    }));
+    expect(JSON.stringify({
+      lastError: store.getOutbox("telegram-invalid-template")?.lastError,
+      audit: store.listAuditEvents()
+    })).not.toContain(secretBody);
+  });
+
+  it("keeps an actual Telegram provider failure retryable", async () => {
+    // Break caught: broadly converting every adapter exception into local validation would drop network recovery.
+    database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
+    store.enqueueOutbox({
+      id: "telegram-network-failure",
+      commandId: "command-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "progress",
+      payload: { text: "Working", replyToMessageId: 42 },
+      nextAttemptAt: now
+    });
+    const send = vi.fn(async () => { throw new Error("network unavailable"); });
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      providers: {
+        telegram: {
+          deliver: async (message) => deliverTelegramMessage(message, { send })
+        }
+      }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(store.getOutbox("telegram-network-failure")).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      lastError: { code: "provider_delivery_failed", retryable: true }
+    });
+  });
+
   it("fans a Telegram company-work final result out to Slack with only its redacted summary", async () => {
     // Break caught: enqueueing the mirror after Telegram delivery can lose the official Slack record on a crash.
     database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
@@ -227,6 +309,143 @@ describe("OutboxDispatcher", () => {
       WHERE id = 'telegram-result:slack-hq'
     `).get()).toEqual({ count: 1 });
     expect(store.getTask("t1")).toMatchObject({ state: "completed" });
+  });
+
+  it("delivers the Telegram origin when Slack HQ mirror configuration is missing", async () => {
+    // Break caught: treating mirror configuration as an origin validation error terminally fails Telegram delivery.
+    database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
+    store.enqueueOutbox({
+      id: "telegram-missing-mirror-config",
+      commandId: "command-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "final_summary",
+      payload: {
+        text: "Private Telegram result",
+        companyWork: true,
+        redactedSummary: "Safe company summary"
+      },
+      nextAttemptAt: now
+    });
+    const telegram = deliveryPort().mockResolvedValue({ providerMessageId: "43" });
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      providers: { telegram: { deliver: telegram } }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(telegram).toHaveBeenCalledTimes(1);
+    expect(store.getOutbox("telegram-missing-mirror-config")).toMatchObject({
+      state: "delivered",
+      providerMessageId: "43",
+      lastError: null
+    });
+    expect(store.getOutbox("telegram-missing-mirror-config:slack-hq")).toBeUndefined();
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "telegram-missing-mirror-config:slack-hq",
+      eventType: "outbox.mirror_failed",
+      data: {
+        originMessageId: "telegram-missing-mirror-config",
+        channel: "slack",
+        failure: { code: "slack_hq_not_configured", retryable: false }
+      }
+    }));
+  });
+
+  it("delivers Telegram and assigns a mirror enqueue failure only to the mirror", async () => {
+    // Break caught: a local Slack mirror insert failure currently enters the Telegram origin retry path.
+    database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
+    store.enqueueOutbox({
+      id: "telegram-mirror-enqueue-failure",
+      commandId: "command-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "final_summary",
+      payload: {
+        text: "Private Telegram result",
+        companyWork: true,
+        redactedSummary: "Safe company summary"
+      },
+      nextAttemptAt: now
+    });
+    database.exec(`
+      CREATE TRIGGER force_mirror_enqueue_failure
+      BEFORE INSERT ON outbox_messages
+      WHEN NEW.id = 'telegram-mirror-enqueue-failure:slack-hq'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced mirror enqueue failure');
+      END
+    `);
+    const telegram = deliveryPort().mockResolvedValue({ providerMessageId: "43" });
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      slackHqDestination: "C-HQ",
+      providers: { telegram: { deliver: telegram } }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(telegram).toHaveBeenCalledTimes(1);
+    expect(store.getOutbox("telegram-mirror-enqueue-failure")).toMatchObject({
+      state: "delivered",
+      providerMessageId: "43",
+      lastError: null
+    });
+    expect(store.getOutbox("telegram-mirror-enqueue-failure:slack-hq")).toBeUndefined();
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "telegram-mirror-enqueue-failure:slack-hq",
+      eventType: "outbox.mirror_failed",
+      data: {
+        originMessageId: "telegram-mirror-enqueue-failure",
+        channel: "slack",
+        failure: { code: "mirror_enqueue_failed", retryable: false }
+      }
+    }));
+  });
+
+  it("delivers Telegram when only its Slack mirror payload is invalid", async () => {
+    // Break caught: mirror-only redacted-summary validation must not classify the valid Telegram origin as failed.
+    database.prepare("DELETE FROM outbox_messages WHERE id = 'm1'").run();
+    store.enqueueOutbox({
+      id: "telegram-invalid-mirror",
+      commandId: "command-1",
+      channel: "telegram",
+      destination: "9900",
+      template: "final_summary",
+      payload: {
+        text: "Valid Telegram result",
+        companyWork: true
+      },
+      nextAttemptAt: now
+    });
+    const telegram = deliveryPort().mockResolvedValue({ providerMessageId: "43" });
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      slackHqDestination: "C-HQ",
+      providers: { telegram: { deliver: telegram } }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(telegram).toHaveBeenCalledTimes(1);
+    expect(store.getOutbox("telegram-invalid-mirror")).toMatchObject({
+      state: "delivered",
+      providerMessageId: "43",
+      lastError: null
+    });
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "telegram-invalid-mirror:slack-hq",
+      eventType: "outbox.mirror_failed",
+      data: {
+        originMessageId: "telegram-invalid-mirror",
+        channel: "slack",
+        failure: { code: "invalid_company_final_summary", retryable: false }
+      }
+    }));
   });
 
   it.each([

@@ -1,0 +1,31 @@
+{
+  "type": "message",
+  "subtype": "file_share",
+  "channel": "C123",
+  "user": "U123",
+  "text": "Review the attached requirements",
+  "ts": "171.003",
+  "files": [
+    {
+      "id": "F123",
+      "created": 1725148800,
+      "timestamp": 1725148800,
+      "name": "requirements.pdf",
+      "title": "requirements.pdf",
+      "mimetype": "application/pdf",
+      "filetype": "pdf",
+      "pretty_type": "PDF",
+      "user": "U123",
+      "user_team": "T123",
+      "editable": false,
+      "size": 12,
+      "mode": "hosted",
+      "is_external": false,
+      "external_type": "",
+      "is_public": false,
+      "public_url_shared": false,
+      "url_private": "https://files.slack.com/files-pri/T123-F123/requirements.pdf",
+      "url_private_download": "https://files.slack.com/files-pri/T123-F123/download/requirements.pdf"
+    }
+  ]
+}
