@@ -2732,6 +2732,109 @@ describe("worker lifecycle", () => {
     }
   });
 
+  it("keeps original worker_done replay idempotent after its obligation advances to a Fix", async () => {
+    // Break caught: replaying cycle-0 worker_done must not revalidate it as the latest Fix lineage.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-original-replay-after-fix");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      const originalDone: WorkerMessage = {
+        kind: "worker_done",
+        messageId: "original-implementation-before-fix",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "original implementation complete"
+      };
+
+      await service.start(authorized());
+      await service.recordWorkerMessage(originalDone);
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "original-verifier-found-defect",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "cycle 0 verifier found a defect"
+      });
+      const verifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier === undefined) throw new Error("cycle 0 verifier missing");
+      await service.recordVerificationReport(
+        durableReport(verifier, "fail", "report:durable:original-replay-after-fix")
+      );
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "first-fix-complete-before-original-replay",
+        dispatchId: "orca-dispatch-3",
+        outcome: "completed",
+        summary: "first Fix complete"
+      });
+
+      const runPayloadBefore = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<Record<string, unknown>>;
+      };
+      expect(runPayloadBefore.verificationObligations).toEqual([expect.objectContaining({
+        rootImplementationTaskId: "task:proposal-1:implement",
+        currentImplementationTaskId: "task:proposal-1:implement:fix:1",
+        cycle: 1,
+        status: "verifier_running"
+      })]);
+      const tasksBefore = store.listTasks();
+      const dispatchesBefore = database.prepare(`
+        SELECT id, task_id, state, payload_json FROM dispatches ORDER BY id
+      `).all();
+      const auditBefore = store.listAuditEvents();
+      const outboxBefore = store.listOutbox();
+      const orcaCallsBefore = structuredClone(orca.calls);
+
+      await expect(service.recordWorkerMessage(structuredClone(originalDone)))
+        .resolves.toMatchObject({ kind: "recorded", verificationRequired: true });
+
+      const runPayloadAfter = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<Record<string, unknown>>;
+      };
+      expect(runPayloadAfter.verificationObligations)
+        .toEqual(runPayloadBefore.verificationObligations);
+      expect(store.listTasks()).toEqual(tasksBefore);
+      expect(store.listTasks().filter(({ role }) => role === "verify")).toHaveLength(2);
+      expect(database.prepare(`
+        SELECT id, task_id, state, payload_json FROM dispatches ORDER BY id
+      `).all()).toEqual(dispatchesBefore);
+      expect(store.listAuditEvents()).toEqual(auditBefore);
+      expect(store.listOutbox()).toEqual(outboxBefore);
+      expect(orca.calls).toEqual(orcaCallsBefore);
+
+      const currentFixDispatchId = runPayloadBefore.verificationObligations[0]
+        ?.implementationDispatchId;
+      if (typeof currentFixDispatchId !== "string") {
+        throw new Error("current Fix Dispatch identity missing");
+      }
+      expect(() => store.ensureVerificationObligations("run:proposal-1", [{
+        rootImplementationTaskId: "task:proposal-1:implement",
+        currentImplementationTaskId: "task:proposal-1:implement",
+        implementationDispatchId: currentFixDispatchId,
+        cycle: 0,
+        status: "pending",
+        verificationTaskId: "task:proposal-1:implement:verify:0"
+      }])).toThrow("initial verification obligation");
+      const runPayloadAfterConflict = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<Record<string, unknown>>;
+      };
+      expect(runPayloadAfterConflict.verificationObligations)
+        .toEqual(runPayloadBefore.verificationObligations);
+    } finally {
+      database.close();
+    }
+  });
+
   it("keeps the original obligation root through the second Fix lineage", async () => {
     // Break caught: cycle-2 verifier creation must not treat the cycle-1 Fix as a new root.
     const database = openDatabase(":memory:");

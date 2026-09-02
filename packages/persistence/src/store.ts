@@ -645,6 +645,67 @@ function assertObligationsOwnLatestLineages(
   return lineages;
 }
 
+function assertInitialVerificationObligations(
+  database: Database.Database,
+  runId: string,
+  obligations: readonly VerificationObligation[],
+  existing?: readonly VerificationObligation[]
+): void {
+  const existingByRoot = existing === undefined
+    ? undefined
+    : new Map(existing.map((obligation) => [obligation.rootImplementationTaskId, obligation]));
+  for (const obligation of obligations) {
+    const task = database.prepare(`
+      SELECT run_id, state, payload_json FROM tasks WHERE id = ?
+    `).get(obligation.rootImplementationTaskId) as Omit<StoredTaskRow, "id"> | undefined;
+    const taskPayload = objectValue(task === undefined ? undefined : parseJson(task.payload_json));
+    const dispatch = database.prepare(`
+      SELECT task_id, state FROM dispatches WHERE id = ?
+    `).get(obligation.implementationDispatchId) as {
+      task_id: string;
+      state: string;
+    } | undefined;
+    const verificationTaskId = `${obligation.rootImplementationTaskId}:verify:0`;
+    if (
+      obligation.currentImplementationTaskId !== obligation.rootImplementationTaskId
+      || obligation.cycle !== 0
+      || obligation.status !== "pending"
+      || obligation.verificationTaskId !== verificationTaskId
+      || task === undefined
+      || task.run_id !== runId
+      || task.state !== "worker_done"
+      || taskPayload?.role !== "implement"
+      || taskPayload.sourceVerificationTaskId !== undefined
+      || dispatch?.task_id !== obligation.rootImplementationTaskId
+      || dispatch.state !== "worker_done"
+    ) {
+      throw new TypeError("initial verification obligation is not bound to its root Task");
+    }
+    if (existing === undefined) continue;
+    const verificationTask = database.prepare(`
+      SELECT run_id, payload_json FROM tasks WHERE id = ?
+    `).get(verificationTaskId) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+    const verificationTaskPayload = objectValue(
+      verificationTask === undefined ? undefined : parseJson(verificationTask.payload_json)
+    );
+    const existingObligation = existingByRoot?.get(obligation.rootImplementationTaskId);
+    const ownsOriginalRequest = verificationTask === undefined
+      ? existingObligation?.currentImplementationTaskId === obligation.rootImplementationTaskId
+        && existingObligation.implementationDispatchId === obligation.implementationDispatchId
+        && existingObligation.cycle === 0
+        && existingObligation.verificationTaskId === verificationTaskId
+      : verificationTask.run_id === runId
+        && verificationTaskPayload?.taskId === verificationTaskId
+        && verificationTaskPayload.role === "verify"
+        && verificationTaskPayload.implementationTaskId === obligation.rootImplementationTaskId
+        && verificationTaskPayload.implementationDispatchId === obligation.implementationDispatchId
+        && verificationTaskPayload.cycle === 0;
+    if (!ownsOriginalRequest) {
+      throw new Error(`Run ${runId} has conflicting verification obligations`);
+    }
+  }
+}
+
 function verificationDecisionFor(
   report: z.infer<typeof VerificationReportStoreSchema>
 ): z.infer<typeof VerificationDecisionStoreSchema> {
@@ -823,41 +884,10 @@ export class ControlStore implements CommandIngress {
       if (row === undefined) throw new Error(`Run ${runId} is not persisted`);
       const payload = objectValue(parseJson(row.payload_json));
       if (payload === undefined) throw new TypeError(`Run ${runId} payload is invalid`);
-      const lineages = assertObligationsOwnLatestLineages(this.database, runId, obligations);
-      for (const obligation of obligations) {
-        const lineage = lineages.get(obligation.rootImplementationTaskId);
-        const task = this.database.prepare(`
-          SELECT run_id, state, payload_json FROM tasks WHERE id = ?
-        `).get(obligation.rootImplementationTaskId) as Omit<StoredTaskRow, "id"> | undefined;
-        const taskPayload = objectValue(
-          task === undefined ? undefined : parseJson(task.payload_json)
-        );
-        const dispatch = this.database.prepare(`
-          SELECT task_id, state FROM dispatches WHERE id = ?
-        `).get(obligation.implementationDispatchId) as {
-          task_id: string;
-          state: string;
-        } | undefined;
-        if (
-          lineage?.cycle !== 0
-          || obligation.currentImplementationTaskId !== obligation.rootImplementationTaskId
-          || obligation.status !== "pending"
-          || obligation.verificationTaskId !==
-            `${obligation.rootImplementationTaskId}:verify:0`
-          || task === undefined
-          || task.run_id !== runId
-          || task.state !== "worker_done"
-          || taskPayload?.role !== "implement"
-          || taskPayload.sourceVerificationTaskId !== undefined
-          || dispatch?.task_id !== obligation.rootImplementationTaskId
-          || dispatch.state !== "worker_done"
-        ) {
-          throw new TypeError("initial verification obligation is not bound to its root Task");
-        }
-      }
       if (payload.verificationObligations !== undefined) {
         const existing = z.array(VerificationObligationStoreSchema).min(1)
           .parse(payload.verificationObligations);
+        assertObligationsOwnLatestLineages(this.database, runId, existing);
         const existingRoots = existing.map(({ rootImplementationTaskId }) =>
           rootImplementationTaskId
         ).sort();
@@ -867,8 +897,14 @@ export class ControlStore implements CommandIngress {
         if (!isDeepStrictEqual(existingRoots, requestedRoots)) {
           throw new Error(`Run ${runId} has conflicting verification obligations`);
         }
+        assertInitialVerificationObligations(this.database, runId, obligations, existing);
         return;
       }
+      const lineages = assertObligationsOwnLatestLineages(this.database, runId, obligations);
+      if ([...lineages.values()].some(({ cycle }) => cycle !== 0)) {
+        throw new TypeError("initial verification obligation is not bound to its root Task");
+      }
+      assertInitialVerificationObligations(this.database, runId, obligations);
       const updated = JsonValueSchema.parse({ ...payload, verificationObligations: obligations });
       this.database.prepare(`
         UPDATE runs SET payload_json = ?, updated_at = ? WHERE id = ?
