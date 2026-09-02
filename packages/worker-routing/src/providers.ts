@@ -283,7 +283,7 @@ export class WorkerProviderError extends Error {
   readonly phase: "start" | "inspect";
   readonly retryable = false;
   readonly workerMayBeLive: boolean;
-  readonly orcaDispatchId?: string | undefined;
+  readonly trustedDispatchId?: string | undefined;
 
   constructor(
     code: WorkerProviderFailureCode,
@@ -291,7 +291,7 @@ export class WorkerProviderError extends Error {
     phase: "start" | "inspect",
     options: Readonly<{
       workerMayBeLive?: boolean;
-      orcaDispatchId?: string;
+      trustedDispatchId?: string;
     }> = {}
   ) {
     super(`Worker provider ${phase} failed`);
@@ -300,7 +300,9 @@ export class WorkerProviderError extends Error {
     this.provider = provider;
     this.phase = phase;
     this.workerMayBeLive = options.workerMayBeLive === true;
-    if (options.orcaDispatchId !== undefined) this.orcaDispatchId = options.orcaDispatchId;
+    if (options.trustedDispatchId !== undefined) {
+      this.trustedDispatchId = options.trustedDispatchId;
+    }
   }
 }
 
@@ -314,7 +316,7 @@ function classifiedProviderError(
     code?: unknown;
     orcaCode?: unknown;
     workerMayBeLive?: unknown;
-    orcaDispatchId?: unknown;
+    trustedDispatchId?: unknown;
   };
   if (value?.code === "orca_stale_handle") {
     return new WorkerProviderError("stale_dispatch", provider, phase);
@@ -322,8 +324,8 @@ function classifiedProviderError(
   if (value?.code === "invalid_orca_receipt") {
     return new WorkerProviderError("invalid_provider_receipt", provider, phase, {
       workerMayBeLive: value.workerMayBeLive === true,
-      ...(typeof value.orcaDispatchId === "string" && value.orcaDispatchId.length > 0
-        ? { orcaDispatchId: value.orcaDispatchId }
+      ...(typeof value.trustedDispatchId === "string" && value.trustedDispatchId.length > 0
+        ? { trustedDispatchId: value.trustedDispatchId }
         : {})
     });
   }
@@ -346,16 +348,11 @@ function classifiedProviderError(
   return new WorkerProviderError("provider_process_failed", provider, phase);
 }
 
-function possibleStartDispatchId(value: unknown): string | undefined {
-  const dispatchId = (value as { result?: { dispatchId?: unknown } })?.result?.dispatchId;
-  return typeof dispatchId === "string" && dispatchId.length > 0 ? dispatchId : undefined;
-}
-
 function explicitOrcaRejection(error: unknown): boolean {
   return (error as { code?: unknown })?.code === "orca_command_failed";
 }
 
-function startResult(receipt: OrcaReceipt): Readonly<{
+function startResult(receipt: OrcaReceipt, expectedTaskId: string): Readonly<{
   dispatchId: string;
   taskId: string;
   providerEnvironmentIsolation: Extract<
@@ -380,6 +377,12 @@ function startResult(receipt: OrcaReceipt): Readonly<{
       code: "invalid_orca_receipt"
     });
   }
+  if (result.taskId !== expectedTaskId) {
+    throw Object.assign(new Error("provider start receipt Task mismatch"), {
+      code: "invalid_orca_receipt",
+      workerMayBeLive: true
+    });
+  }
   const isolation = ProviderChildEnvironmentIsolationSchema.safeParse(
     result.launch?.providerEnvironment
   );
@@ -387,7 +390,7 @@ function startResult(receipt: OrcaReceipt): Readonly<{
     throw Object.assign(new Error("invalid provider start environment attestation"), {
       code: "invalid_orca_receipt",
       workerMayBeLive: true,
-      orcaDispatchId: result.dispatchId
+      trustedDispatchId: result.dispatchId
     });
   }
   return Object.freeze({
@@ -505,20 +508,17 @@ export class OrcaWorkerProvider implements WorkerProvider {
       ...(context.retryOf === undefined ? {} : { retryOf: context.retryOf })
     };
 
-    let possibleDispatchId: string | undefined;
     try {
       const rawReceipt = await this.#orca.execute(operation);
-      possibleDispatchId = possibleStartDispatchId(rawReceipt);
       const orcaReceipt = parseOrcaOperationReceipt("dispatch_worker", rawReceipt);
-      const result = startResult(orcaReceipt);
+      const result = startResult(orcaReceipt, context.orcaTaskId);
       if (
-        result.taskId !== context.orcaTaskId
-        || JSON.stringify(result.providerEnvironmentIsolation.effectiveEnvironmentKeys)
+        JSON.stringify(result.providerEnvironmentIsolation.effectiveEnvironmentKeys)
           !== JSON.stringify(context.providerEnvironmentIsolation.effectiveEnvironmentKeys)
       ) {
         throw new WorkerProviderError("invalid_provider_receipt", this.id, "start", {
           workerMayBeLive: true,
-          orcaDispatchId: result.dispatchId
+          trustedDispatchId: result.dispatchId
         });
       }
       return Object.freeze(ProviderStartReceiptSchema.parse({
@@ -544,14 +544,8 @@ export class OrcaWorkerProvider implements WorkerProvider {
     } catch (error) {
       const classified = classifiedProviderError(this.id, "start", error);
       if (classified.workerMayBeLive || explicitOrcaRejection(error)) throw classified;
-      const errorDispatchId = (error as { orcaDispatchId?: unknown })?.orcaDispatchId;
       throw new WorkerProviderError(classified.code, this.id, "start", {
-        workerMayBeLive: true,
-        ...(possibleDispatchId !== undefined
-          ? { orcaDispatchId: possibleDispatchId }
-          : typeof errorDispatchId === "string" && errorDispatchId.length > 0
-            ? { orcaDispatchId: errorDispatchId }
-            : {})
+        workerMayBeLive: true
       });
     }
   }

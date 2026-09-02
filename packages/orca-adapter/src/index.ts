@@ -123,23 +123,24 @@ export class OrcaClient {
       raw = await runOrca(operationArguments(operation), this.#options);
       const receipt = parseOrcaReceipt(raw);
       assertSuccessfulReceipt(receipt);
-      return parseOrcaOperationReceipt(operation.kind, receipt);
+      const parsed = parseOrcaOperationReceipt(operation.kind, receipt);
+      if (operation.kind === "dispatch_worker") {
+        const result = parsed.result as { taskId?: unknown };
+        if (result.taskId !== operation.taskId) throw new OrcaInvalidReceiptError();
+      }
+      return parsed;
     } catch (error) {
       if (
         operation.kind !== "dispatch_worker"
         || (error as { code?: unknown })?.code === "orca_command_failed"
       ) throw error;
-      const dispatchId = (raw as { result?: { dispatchId?: unknown } })?.result?.dispatchId;
       const uncertain = error instanceof Error
         ? error
         : Object.assign(new Error("Orca worker-start outcome is uncertain"), {
             code: "orca_worker_start_uncertain"
           });
       Object.assign(uncertain, {
-        workerMayBeLive: true,
-        ...(typeof dispatchId === "string" && dispatchId.length > 0
-          ? { orcaDispatchId: dispatchId }
-          : {})
+        workerMayBeLive: true
       });
       throw uncertain;
     }

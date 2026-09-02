@@ -155,7 +155,10 @@ export type LaunchFailureResult =
     }>
   | Readonly<{
       kind: "intervention_required";
-      reason: "launch_retry_exhausted" | "replacement_not_conflict_free";
+      reason:
+        | "launch_retry_exhausted"
+        | "replacement_not_conflict_free"
+        | "assignment_artifact_cleanup_failed";
       dispatchId: string;
     }>;
 
@@ -165,6 +168,7 @@ interface DispatchContext {
   readonly assignment: WorkerAssignment;
   placement: ReadyWorktreePlacement;
   orcaDispatchId?: string;
+  assignmentArtifact?: AssignmentArtifact;
   editingLeaseHeld: boolean;
   leaseReleaseBlocked: boolean;
 }
@@ -370,6 +374,19 @@ function releaseFailure(error: unknown): WorkerReleaseFailure {
     code: typeof value?.code === "string" && value.code.trim().length > 0
       ? value.code
       : "orca_release_failed",
+    retryable: value?.retryable === true
+  });
+}
+
+function assignmentArtifactCleanupFailure(
+  error: unknown,
+  fallbackCode: string
+): WorkerReleaseFailure {
+  const value = error as { code?: unknown; retryable?: unknown };
+  return Object.freeze({
+    code: typeof value?.code === "string" && value.code.trim().length > 0
+      ? value.code
+      : fallbackCode,
     retryable: value?.retryable === true
   });
 }
@@ -590,7 +607,10 @@ export class ExecutionService {
     const workerReleaseReview = await this.#releaseOrcaWorker(lookup);
     if (workerReleaseReview !== undefined) return workerReleaseReview;
     const artifactCleanupReview = await this.#cleanupAssignmentArtifact(lookup);
-    if (artifactCleanupReview !== undefined) return artifactCleanupReview;
+    if (artifactCleanupReview !== undefined) {
+      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+      return artifactCleanupReview;
+    }
 
     if (lookup.dispatch.placement.requiresEditingLease) {
       const released = await this.#release(lookup.run, lookup.dispatch);
@@ -649,6 +669,15 @@ export class ExecutionService {
     });
     const recorded = await this.#lifecycle.recordLaunchFailure(message, lookup.dispatch.localId);
     if (recorded === "duplicate") return Object.freeze({ kind: "duplicate" });
+    const artifactCleanupReview = await this.#cleanupAssignmentArtifact(lookup);
+    if (artifactCleanupReview !== undefined) {
+      await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+      return Object.freeze({
+        kind: "intervention_required",
+        reason: "assignment_artifact_cleanup_failed",
+        dispatchId: input.dispatchId
+      });
+    }
     if (lookup.dispatch.placement.requiresEditingLease) await this.#release(lookup.run, lookup.dispatch);
 
     if (lookup.dispatch.attempt >= 2) {
@@ -890,6 +919,7 @@ export class ExecutionService {
       ownerDispatchId: dispatch.localId,
       content: prompt
     });
+    dispatch.assignmentArtifact = assignmentArtifact;
     await this.#lifecycle.recordAssignmentArtifact(dispatch.localId, assignmentArtifact);
     const providerStartReceipt = this.#validatedStartReceipt(
       provider.id,
@@ -958,7 +988,7 @@ export class ExecutionService {
     if (!parsed.success) {
       throw new WorkerProviderError("invalid_provider_receipt", provider, "start", {
         workerMayBeLive: true,
-        ...(boundDispatchId === undefined ? {} : { orcaDispatchId: boundDispatchId })
+        ...(boundDispatchId === undefined ? {} : { trustedDispatchId: boundDispatchId })
       });
     }
     if (
@@ -988,7 +1018,7 @@ export class ExecutionService {
     ) {
       throw new WorkerProviderError("invalid_provider_receipt", provider, "start", {
         workerMayBeLive: true,
-        ...(boundDispatchId === undefined ? {} : { orcaDispatchId: boundDispatchId })
+        ...(boundDispatchId === undefined ? {} : { trustedDispatchId: boundDispatchId })
       });
     }
     return parsed.data as ProviderStartReceipt;
@@ -1025,10 +1055,10 @@ export class ExecutionService {
       const lookup = { run: context, task, dispatch };
       if (error instanceof WorkerProviderError && error.workerMayBeLive) {
         safeToReleaseLease = false;
-        if (error.orcaDispatchId !== undefined) {
-          dispatch.orcaDispatchId = error.orcaDispatchId;
+        if (error.trustedDispatchId !== undefined) {
+          dispatch.orcaDispatchId = error.trustedDispatchId;
           this.#dispatchLookup.set(dispatch.localId, lookup);
-          this.#dispatchLookup.set(error.orcaDispatchId, lookup);
+          this.#dispatchLookup.set(error.trustedDispatchId, lookup);
           const fenced = await this.#fenceUntrustedWorker(lookup);
           safeToReleaseLease = fenced;
           if (fenced) {
@@ -1037,7 +1067,8 @@ export class ExecutionService {
           }
         }
       } else if (safeToReleaseLease) {
-        const artifact = this.#lifecycle.dispatch(dispatch.localId).assignmentArtifact;
+        const artifact = dispatch.assignmentArtifact
+          ?? this.#lifecycle.dispatch(dispatch.localId).assignmentArtifact;
         if (artifact !== undefined) {
           const cleanupReview = await this.#cleanupAssignmentArtifact(lookup);
           if (cleanupReview !== undefined) safeToReleaseLease = false;
@@ -1183,21 +1214,47 @@ export class ExecutionService {
   async #cleanupAssignmentArtifact(
     lookup: DispatchLookup
   ): Promise<ExecutionReviewRequired | undefined> {
-    const artifact = this.#lifecycle.dispatch(lookup.dispatch.localId).assignmentArtifact;
+    const artifact = lookup.dispatch.assignmentArtifact
+      ?? this.#lifecycle.dispatch(lookup.dispatch.localId).assignmentArtifact;
     if (artifact === undefined) {
       throw new Error(`Dispatch ${lookup.dispatch.localId} has no assignment artifact`);
     }
+    let result: Awaited<ReturnType<AssignmentArtifactStore["cleanup"]>>;
     try {
-      const result = await this.#assignmentArtifacts.cleanup(artifact);
-      await this.#lifecycle.recordAssignmentArtifactCleanup(lookup.dispatch.localId, result);
-      return undefined;
-    } catch {
-      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
-      return Object.freeze({
-        kind: "review_required",
-        reason: "assignment_artifact_cleanup_failed",
-        dispatchId: lookup.dispatch.orcaDispatchId ?? lookup.dispatch.localId
-      });
+      result = await this.#assignmentArtifacts.cleanup(artifact);
+    } catch (error) {
+      await this.#lifecycle.recordAssignmentArtifactCleanupFailure(
+        lookup.dispatch.localId,
+        artifact,
+        assignmentArtifactCleanupFailure(error, "assignment_artifact_cleanup_failed")
+      ).catch(() => undefined);
+      return this.#assignmentArtifactCleanupReview(lookup);
     }
+    try {
+      await this.#lifecycle.recordAssignmentArtifactCleanup(
+        lookup.dispatch.localId,
+        artifact,
+        result
+      );
+      return undefined;
+    } catch (error) {
+      await this.#lifecycle.recordAssignmentArtifactCleanupFailure(
+        lookup.dispatch.localId,
+        artifact,
+        assignmentArtifactCleanupFailure(
+          error,
+          "assignment_artifact_cleanup_persistence_failed"
+        )
+      ).catch(() => undefined);
+      return this.#assignmentArtifactCleanupReview(lookup);
+    }
+  }
+
+  #assignmentArtifactCleanupReview(lookup: DispatchLookup): ExecutionReviewRequired {
+    return Object.freeze({
+      kind: "review_required",
+      reason: "assignment_artifact_cleanup_failed",
+      dispatchId: lookup.dispatch.orcaDispatchId ?? lookup.dispatch.localId
+    });
   }
 }

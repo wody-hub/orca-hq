@@ -61,6 +61,7 @@ class FakeProviderOrca {
   malformedStart = false;
   malformedStartWithDispatch = false;
   staleObservation = false;
+  startTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
 
   async execute(operation: OrcaOperation): Promise<OrcaReceipt> {
@@ -74,7 +75,7 @@ class FakeProviderOrca {
               : {})
           : receipt("worker-start-1", {
               dispatchId: "orca-dispatch-2",
-              taskId: operation.taskId,
+              taskId: this.startTaskId ?? operation.taskId,
               runId: "orca-run-1",
               state: "ready",
               stage: "ready",
@@ -317,22 +318,43 @@ describe("Orca-backed worker providers", () => {
     });
   });
 
-  it("preserves a Dispatch ID from a malformed post-start receipt", async () => {
-    // Break caught: schema rejection after worker creation must not discard the exact fence target.
+  it("does not trust a raw Dispatch ID from a malformed post-start receipt", async () => {
+    // Break caught: field presence before operation-specific parsing cannot authorize stop_worker.
     const orca = new FakeProviderOrca();
     orca.malformedStart = true;
     orca.malformedStartWithDispatch = true;
     const currentAssignment = assignment();
 
-    await expect(providers(orca).get("codex").start(
+    const caught = await providers(orca).get("codex").start(
       currentAssignment,
       startContext(currentAssignment)
-    )).rejects.toMatchObject({
+    ).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
       code: "invalid_provider_receipt",
       provider: "codex",
-      workerMayBeLive: true,
-      orcaDispatchId: "orca-dispatch-2"
+      workerMayBeLive: true
     });
+    expect((caught as { trustedDispatchId?: string }).trustedDispatchId).toBeUndefined();
+    expect((caught as { orcaDispatchId?: string }).orcaDispatchId).toBeUndefined();
+  });
+
+  it("does not trust a fully parsed start receipt whose Task differs from the request", async () => {
+    // Break caught: a valid receipt for another Task must not authorize fencing its Dispatch.
+    const orca = new FakeProviderOrca();
+    orca.startTaskId = "orca-task-unrelated";
+    const currentAssignment = assignment();
+
+    const caught = await providers(orca).get("codex").start(
+      currentAssignment,
+      startContext(currentAssignment)
+    ).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: "invalid_provider_receipt",
+      provider: "codex",
+      workerMayBeLive: true
+    });
+    expect((caught as { trustedDispatchId?: string }).trustedDispatchId).toBeUndefined();
+    expect((caught as { orcaDispatchId?: string }).orcaDispatchId).toBeUndefined();
   });
 
   it("rejects a worker-start receipt whose effective environment differs from preflight", async () => {
@@ -348,7 +370,7 @@ describe("Orca-backed worker providers", () => {
       code: "invalid_provider_receipt",
       provider: "codex",
       workerMayBeLive: true,
-      orcaDispatchId: "orca-dispatch-2"
+      trustedDispatchId: "orca-dispatch-2"
     });
   });
 

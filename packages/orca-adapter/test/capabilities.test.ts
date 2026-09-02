@@ -540,8 +540,8 @@ describe("Orca CLI capability adapter", () => {
     ]);
   });
 
-  it("marks a malformed worker-start receipt uncertain and preserves its Dispatch ID", async () => {
-    // Break caught: operation-specific parsing must not erase a worker that may already be live.
+  it("marks a malformed worker-start receipt uncertain without trusting its raw Dispatch ID", async () => {
+    // Break caught: an unparsed result field must never become a stop_worker target.
     const fake = await fakeOrca();
     await enqueueStartup(fake);
     await fake.enqueueJson([
@@ -553,16 +553,18 @@ describe("Orca CLI capability adapter", () => {
       result: { dispatchId: "dispatch-1" }
     });
 
-    await expect(clientFor(fake).execute({
+    const caught = await clientFor(fake).execute({
       kind: "dispatch_worker",
       taskId: "task-1",
       worktree: "current",
       agent: "codex"
-    })).rejects.toMatchObject({
+    }).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
       code: "invalid_orca_receipt",
-      workerMayBeLive: true,
-      orcaDispatchId: "dispatch-1"
+      workerMayBeLive: true
     });
+    expect(caught).not.toHaveProperty("orcaDispatchId");
+    expect(caught).not.toHaveProperty("trustedDispatchId");
   });
 
   it("rejects an empty result for every exposed orchestration operation", async () => {

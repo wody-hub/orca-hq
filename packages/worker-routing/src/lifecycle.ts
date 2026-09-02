@@ -150,6 +150,7 @@ export type DispatchRecord = Readonly<{
   assignmentArtifactCleanup?: Readonly<{
     kind: AssignmentArtifactCleanupResult;
   }> | undefined;
+  assignmentArtifactCleanupFailure?: WorkerReleaseFailure | undefined;
   retryOf?: string | undefined;
   orcaDispatchId?: string | undefined;
   receipt?: OrcaReceipt | undefined;
@@ -324,6 +325,7 @@ export class ExecutionLifecycle {
       | "providerStartReceipt"
       | "assignmentArtifact"
       | "assignmentArtifactCleanup"
+      | "assignmentArtifactCleanupFailure"
       | "fenceReceipt"
       | "fenceFailure"
       | "launchFailureId"
@@ -430,12 +432,36 @@ export class ExecutionLifecycle {
 
   async recordAssignmentArtifactCleanup(
     localDispatchId: string,
+    artifact: AssignmentArtifact,
     kind: AssignmentArtifactCleanupResult
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (artifact.ownerDispatchId !== localDispatchId) {
+      throw new TypeError("assignment artifact owner does not match the Dispatch");
+    }
     const updated = Object.freeze({
       ...current,
+      assignmentArtifact: artifact,
       assignmentArtifactCleanup: Object.freeze({ kind })
+    });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordAssignmentArtifactCleanupFailure(
+    localDispatchId: string,
+    artifact: AssignmentArtifact,
+    failure: WorkerReleaseFailure
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (artifact.ownerDispatchId !== localDispatchId) {
+      throw new TypeError("assignment artifact owner does not match the Dispatch");
+    }
+    const updated = Object.freeze({
+      ...current,
+      assignmentArtifact: artifact,
+      assignmentArtifactCleanupFailure: failure
     });
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);

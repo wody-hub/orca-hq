@@ -98,6 +98,9 @@ class RecordingOrca {
   readonly calls: OrcaOperation[] = [];
   releaseError: Error | undefined;
   dispatchErrorOnCall: number | undefined;
+  malformedDispatchId: string | undefined;
+  dispatchTaskId: string | undefined;
+  effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
   #task = 0;
   #dispatch = 0;
 
@@ -125,9 +128,14 @@ class RecordingOrca {
             orcaCode: "worker_start_rejected"
           });
         }
+        if (this.malformedDispatchId !== undefined) {
+          return receipt(`dispatch-receipt-${this.#dispatch}`, {
+            dispatchId: this.malformedDispatchId
+          });
+        }
         return receipt(`dispatch-receipt-${this.#dispatch}`, {
           dispatchId: `orca-dispatch-${this.#dispatch}`,
-          taskId: operation.taskId,
+          taskId: this.dispatchTaskId ?? operation.taskId,
           runId: "orca-run-1",
           state: "ready",
           stage: "ready",
@@ -136,7 +144,7 @@ class RecordingOrca {
           launch: {
             providerEnvironment: {
               kind: "verified_effective_allowlist",
-              effectiveEnvironmentKeys: ["HOME", "PATH"]
+              effectiveEnvironmentKeys: this.effectiveEnvironmentKeys
             }
           }
         });
@@ -210,6 +218,8 @@ class MemoryLifecycleStore implements LifecycleStore {
   readonly #messageIds = new Set<string>();
   readonly #doneDispatches = new Set<string>();
   failWorkerDoneCommitOnce = false;
+  failAssignmentArtifactSaveOnce = false;
+  failAssignmentArtifactCleanupSaveOnce = false;
 
   async saveRun(record: RunRecord): Promise<void> {
     this.runs.set(record.id, structuredClone(record));
@@ -220,6 +230,25 @@ class MemoryLifecycleStore implements LifecycleStore {
   }
 
   async saveDispatch(record: DispatchRecord): Promise<void> {
+    const current = this.dispatches.get(record.id);
+    if (
+      this.failAssignmentArtifactSaveOnce
+      && current?.assignmentArtifact === undefined
+      && record.assignmentArtifact !== undefined
+      && record.assignmentArtifactCleanup === undefined
+      && (record as { assignmentArtifactCleanupFailure?: unknown })
+        .assignmentArtifactCleanupFailure === undefined
+    ) {
+      this.failAssignmentArtifactSaveOnce = false;
+      throw new Error("synthetic assignment artifact persistence failure");
+    }
+    if (
+      this.failAssignmentArtifactCleanupSaveOnce
+      && record.assignmentArtifactCleanup !== undefined
+    ) {
+      this.failAssignmentArtifactCleanupSaveOnce = false;
+      throw new Error("synthetic assignment artifact cleanup persistence failure");
+    }
     this.dispatches.set(record.id, structuredClone(record));
   }
 
@@ -277,6 +306,7 @@ class MemoryAssignmentArtifactStore implements AssignmentArtifactStore {
   readonly staged: AssignmentArtifact[] = [];
   readonly cleaned: AssignmentArtifact[] = [];
   readonly #current = new Map<string, AssignmentArtifact>();
+  cleanupError: Error | undefined;
 
   constructor(readonly events: string[] = []) {}
 
@@ -304,6 +334,7 @@ class MemoryAssignmentArtifactStore implements AssignmentArtifactStore {
   }
 
   async cleanup(artifact: AssignmentArtifact): Promise<"removed" | "missing" | "superseded"> {
+    if (this.cleanupError !== undefined) throw this.cleanupError;
     const current = this.#current.get(artifact.artifactId);
     if (current === undefined) return "missing";
     if (
@@ -858,6 +889,78 @@ describe("ExecutionService preflight and dispatch", () => {
     });
   });
 
+  it("cleans the exact staged artifact when its first lifecycle write fails", async () => {
+    // Break caught: a failed metadata write must not erase the only cleanup handle before mutation.
+    const setupResult = setup();
+    setupResult.store.failAssignmentArtifactSaveOnce = true;
+
+    await expect(setupResult.service.start(authorized()))
+      .rejects.toThrow("synthetic assignment artifact persistence failure");
+
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        assignmentArtifact: setupResult.artifacts.staged[0],
+        assignmentArtifactCleanup: { kind: "removed" },
+        state: "intervention_required"
+      });
+  });
+
+  it("retains the lease and persists ownership when pre-start artifact cleanup fails", async () => {
+    // Break caught: cleanup uncertainty cannot free edit authority or orphan an unowned file.
+    const setupResult = setup();
+    setupResult.store.failAssignmentArtifactSaveOnce = true;
+    setupResult.artifacts.cleanupError = Object.assign(
+      new Error("synthetic assignment artifact cleanup failure"),
+      { code: "assignment_artifact_cleanup_failed", retryable: false }
+    );
+
+    await expect(setupResult.service.start(authorized()))
+      .rejects.toThrow("synthetic assignment artifact persistence failure");
+
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        assignmentArtifact: setupResult.artifacts.staged[0],
+        assignmentArtifactCleanupFailure: {
+          code: "assignment_artifact_cleanup_failed",
+          retryable: false
+        },
+        state: "intervention_required"
+      });
+  });
+
+  it("retains the lease when a safe rejection cleanup outcome cannot be persisted", async () => {
+    // Break caught: deleting the file is insufficient until its exact cleanup outcome is durable.
+    const setupResult = setup();
+    setupResult.store.failAssignmentArtifactCleanupSaveOnce = true;
+    setupResult.orca.dispatchErrorOnCall = 1;
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "provider_process_failed",
+      workerMayBeLive: false
+    });
+
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        assignmentArtifact: setupResult.artifacts.staged[0],
+        assignmentArtifactCleanupFailure: {
+          code: "assignment_artifact_cleanup_persistence_failed",
+          retryable: false
+        },
+        state: "intervention_required"
+      });
+  });
+
   it.each([
     {
       name: "content",
@@ -899,7 +1002,7 @@ describe("ExecutionService preflight and dispatch", () => {
       provider: "codex",
       phase: "start",
       workerMayBeLive: true,
-      orcaDispatchId: "orca-dispatch-1"
+      trustedDispatchId: "orca-dispatch-1"
     });
     expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
       kind: "stop_worker",
@@ -944,10 +1047,70 @@ describe("ExecutionService preflight and dispatch", () => {
       phase: "start",
       workerMayBeLive: true
     });
-    expect((caught as WorkerProviderError).orcaDispatchId).toBeUndefined();
+    expect((caught as { trustedDispatchId?: string }).trustedDispatchId).toBeUndefined();
     expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
     expect(setupResult.artifacts.cleaned).toEqual([]);
     expect(setupResult.locks.released).toEqual([]);
+  });
+
+  it("retains resources when a malformed raw start receipt contains an unrelated Dispatch ID", async () => {
+    // Break caught: an unparsed result ID must not authorize stop or release the project fence.
+    const setupResult = setup();
+    setupResult.orca.malformedDispatchId = "orca-dispatch-unrelated";
+
+    const caught = await setupResult.service.start(authorized()).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: "invalid_provider_receipt",
+      workerMayBeLive: true
+    });
+    expect((caught as { trustedDispatchId?: string }).trustedDispatchId).toBeUndefined();
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
+  });
+
+  it("retains resources when a parsed start receipt belongs to another Task", async () => {
+    // Break caught: exact Dispatch syntax is insufficient without exact expected Task binding.
+    const setupResult = setup();
+    setupResult.orca.dispatchTaskId = "orca-task-unrelated";
+
+    const caught = await setupResult.service.start(authorized()).catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: "invalid_provider_receipt",
+      workerMayBeLive: true
+    });
+    expect((caught as { trustedDispatchId?: string }).trustedDispatchId).toBeUndefined();
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+    expect(setupResult.artifacts.cleaned).toEqual([]);
+    expect(setupResult.locks.released).toEqual([]);
+  });
+
+  it("fences only the fully bound Dispatch when later environment attestation fails", async () => {
+    // Break caught: post-binding validation may stop the exact worker, never a raw or mismatched ID.
+    const setupResult = setup();
+    setupResult.orca.effectiveEnvironmentKeys = ["HOME"];
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt",
+      workerMayBeLive: true,
+      trustedDispatchId: "orca-dispatch-1"
+    });
+    expect(setupResult.orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    }]);
+    expect(setupResult.artifacts.cleaned).toEqual([setupResult.artifacts.staged[0]]);
+    expect(setupResult.locks.released).toEqual([{
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    }]);
+    expect(setupResult.store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        orcaDispatchId: "orca-dispatch-1",
+        fenceReceipt: {
+          result: { dispatchId: "orca-dispatch-1", verdict: "stopped" }
+        }
+      });
   });
 
   it("persists immutable inputs, public receipts, and every lifecycle transition", async () => {
@@ -1177,6 +1340,38 @@ describe("worker lifecycle", () => {
 
     await expect(service.recordWorkerMessage(done)).resolves.toEqual({ kind: "duplicate" });
     expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toHaveLength(1);
+  });
+
+  it("persists terminal artifact cleanup failure and moves the Run to intervention", async () => {
+    // Break caught: worker_done must not leave an active-looking Run when artifact ownership is unresolved.
+    const { service, locks, store, artifacts } = setup();
+    await service.start(authorized());
+    artifacts.cleanupError = Object.assign(new Error("synthetic terminal cleanup failure"), {
+      code: "assignment_artifact_cleanup_failed",
+      retryable: true
+    });
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "done-cleanup-failure",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).resolves.toEqual({
+      kind: "review_required",
+      reason: "assignment_artifact_cleanup_failed",
+      dispatchId: "orca-dispatch-1"
+    });
+
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        assignmentArtifactCleanupFailure: {
+          code: "assignment_artifact_cleanup_failed",
+          retryable: true
+        }
+      });
+    expect(locks.released).toEqual([]);
   });
 
   it("persists worker_done once and dispatches each newly unblocked dependency once", async () => {
@@ -1410,6 +1605,10 @@ describe("worker lifecycle", () => {
       }
     });
     expect(artifacts.staged).toHaveLength(2);
+    expect(artifacts.cleaned).toEqual([artifacts.staged[0]]);
+    expect(persistedDispatches[0]).toMatchObject({
+      assignmentArtifactCleanup: { kind: "removed" }
+    });
     expect(artifacts.staged.map(({ artifactId, path, version, ownerDispatchId }) => ({
       artifactId,
       path,
@@ -1451,7 +1650,42 @@ describe("worker lifecycle", () => {
       reason: "launch_retry_exhausted",
       dispatchId: "orca-dispatch-2"
     });
+    expect(artifacts.cleaned).toEqual(artifacts.staged);
+    expect(store.dispatches.get("dispatch:proposal-1:implement:2"))
+      .toMatchObject({ assignmentArtifactCleanup: { kind: "removed" } });
     expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+  });
+
+  it("retains the launch-failed lease when its assignment artifact cannot be cleaned", async () => {
+    // Break caught: terminal launch evidence does not permit release while artifact ownership is unresolved.
+    const { service, orca, locks, store, artifacts } = setup();
+    await service.start(authorized());
+    artifacts.cleanupError = Object.assign(
+      new Error("synthetic launch-failure artifact cleanup failure"),
+      { code: "assignment_artifact_cleanup_failed", retryable: false }
+    );
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-cleanup-failed",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).resolves.toEqual({
+      kind: "intervention_required",
+      reason: "assignment_artifact_cleanup_failed",
+      dispatchId: "orca-dispatch-1"
+    });
+
+    expect(locks.released).toEqual([]);
+    expect(artifacts.cleaned).toEqual([]);
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1"))
+      .toMatchObject({
+        state: "intervention_required",
+        assignmentArtifactCleanupFailure: {
+          code: "assignment_artifact_cleanup_failed",
+          retryable: false
+        }
+      });
   });
 
   it("releases the replacement lease when retry worktree creation fails", async () => {
