@@ -7,7 +7,13 @@ import { IdentityResolver, type CommandEnvelope, type CommandIngress } from "@or
 import { ControlStore, openDatabase } from "@orca-hq/persistence";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createSlackAdapter, registerSlackSocketModeHandlers } from "../src/index.js";
+import {
+  createSlackAdapter,
+  createSlackAttachmentStager,
+  registerSlackSocketModeHandlers,
+  SlackAttachmentTooLargeError,
+  writeFully
+} from "../src/index.js";
 import slackMessageFixture from "./fixtures/message.json" with { type: "json" };
 
 const identities = new IdentityResolver({
@@ -249,6 +255,42 @@ describe("Slack adapter", () => {
     expect(ingress.accept.mock.calls[0]?.[0]).toMatchObject({
       attachments: [expect.objectContaining({ sizeBytes: fileBytes.byteLength })]
     });
+  });
+
+  it("writes every byte when the filesystem reports a short write", async () => {
+    // Break caught: one FileHandle.write call loses the unwritten suffix after a short write.
+    const written: number[] = [];
+    const handle = {
+      write: vi.fn(async (chunk: Uint8Array) => {
+        written.push(chunk[0] ?? -1);
+        return { bytesWritten: 1 };
+      })
+    };
+    const bytes = new Uint8Array([7, 8, 9]);
+
+    await writeFully(handle, bytes);
+
+    expect(written).toEqual([7, 8, 9]);
+  });
+
+  it("rejects an over-limit stream and removes its partial staging file", async () => {
+    // Break caught: writing the first chunk before enforcing the next limit leaves untrusted bytes staged after rejection.
+    const directory = await stagingDirectory();
+    const stager = createSlackAttachmentStager({
+      maxAttachmentBytes: 5,
+      stagingDirectory: directory,
+      files: {
+        download: async function* () {
+          yield new Uint8Array([1, 2, 3]);
+          yield new Uint8Array([4, 5, 6]);
+        }
+      }
+    });
+
+    await expect(stager({ id: "F789", name: "too-large.pdf" })).rejects.toBeInstanceOf(
+      SlackAttachmentTooLargeError
+    );
+    await expect(readFile(join(directory, "F789"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("silently denies an unknown Slack user", async () => {

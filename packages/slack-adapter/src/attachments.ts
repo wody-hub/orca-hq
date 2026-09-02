@@ -22,10 +22,27 @@ export type StagedSlackAttachment = Readonly<{
 
 export type SlackAttachmentStager = (file: SlackFile) => Promise<StagedSlackAttachment>;
 
+export type SlackAttachmentWriter = Readonly<{
+  write(chunk: Uint8Array): Promise<Readonly<{ bytesWritten: number }>>;
+}>;
+
 export class SlackAttachmentTooLargeError extends Error {
   constructor(readonly fileId: string, readonly maxBytes: number) {
     super(`Slack file ${fileId} exceeds the ${maxBytes}-byte limit`);
     this.name = "SlackAttachmentTooLargeError";
+  }
+}
+
+/** Ensures a filesystem short write cannot truncate untrusted staged content. */
+export async function writeFully(handle: SlackAttachmentWriter, chunk: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await handle.write(chunk.subarray(offset));
+    const remainingBytes = chunk.byteLength - offset;
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > remainingBytes) {
+      throw new Error("Slack attachment staging write was incomplete");
+    }
+    offset += bytesWritten;
   }
 }
 
@@ -51,12 +68,13 @@ export function createSlackAttachmentStager(options: Readonly<{
 
     try {
       for await (const chunk of await options.files.download(file.id)) {
-        byteCount += chunk.byteLength;
-        if (byteCount > options.maxAttachmentBytes) {
+        const nextByteCount = byteCount + chunk.byteLength;
+        if (nextByteCount > options.maxAttachmentBytes) {
           throw new SlackAttachmentTooLargeError(file.id, options.maxAttachmentBytes);
         }
+        await writeFully(handle, chunk);
         hash.update(chunk);
-        await handle.write(chunk);
+        byteCount = nextByteCount;
       }
     } catch (error) {
       await handle.close();
