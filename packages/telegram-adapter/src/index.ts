@@ -1,4 +1,7 @@
+import { Readable } from "node:stream";
+
 import type { CommandIngress, IdentityResolver } from "@orca-hq/core";
+import { decideTranscript, type VoiceCommandTranscriber } from "@orca-hq/voice";
 import { z } from "zod";
 
 import {
@@ -6,8 +9,10 @@ import {
   TelegramApprovalCallbackSchema,
   TelegramTextMessageSchema,
   TelegramUpdateSchema,
+  TelegramVoiceMessageSchema,
   telegramIdentifier,
   toTelegramCommand,
+  toTelegramVoiceCommand,
   type TelegramApprovalCallback
 } from "./updates.js";
 import {
@@ -47,6 +52,24 @@ export type TelegramApprovalPort = Readonly<{
   }>): Promise<void>;
 }>;
 
+export type TelegramVoicePorts = Readonly<{
+  /** Downloads by opaque file ID; no provider URLs are exposed to command construction. */
+  media: Readonly<{
+    download(fileId: string): AsyncIterable<Uint8Array> | Promise<AsyncIterable<Uint8Array>>;
+  }>;
+  transcriber: VoiceCommandTranscriber;
+  confirmations: Readonly<{
+    request(request: Readonly<{
+      channel: "telegram";
+      principalId: string;
+      chatId: string;
+      messageId: number;
+      confirmationText: string;
+      trusted: false;
+    }>): Promise<void>;
+  }>;
+}>;
+
 export type TelegramAdapterConfig = Readonly<{ botIdentity: string }>;
 export type TelegramAdapterPorts = Readonly<{
   ingress: CommandIngress;
@@ -55,6 +78,7 @@ export type TelegramAdapterPorts = Readonly<{
   outbox: TelegramOutbox;
   approvalPort: TelegramApprovalPort;
   messages?: TelegramMessagePort | undefined;
+  voice?: TelegramVoicePorts;
 }>;
 export type TelegramAdapter = Readonly<{
   handleUpdate(update: unknown): Promise<void>;
@@ -82,6 +106,35 @@ export function createTelegramAdapter(config: TelegramAdapterConfig, ports: Tele
         const identity = ports.identities.resolve("telegram", userId, chatId);
         if (!("kind" in identity)) {
           await ports.ingress.accept(toTelegramCommand({ message: message.data }, identity.principalId, parsedConfig.botIdentity));
+        }
+        await ports.cursorStore.save("telegram", update.update_id + 1);
+        return;
+      }
+
+      const voiceMessage = TelegramVoiceMessageSchema.safeParse(update.message);
+      if (voiceMessage.success) {
+        const userId = telegramIdentifier(voiceMessage.data.from.id);
+        const chatId = telegramIdentifier(voiceMessage.data.chat.id);
+        const identity = ports.identities.resolve("telegram", userId, chatId);
+        if (!("kind" in identity)) {
+          if (ports.voice === undefined) throw new Error("Telegram voice port is not configured");
+          const stream = Readable.from(await ports.voice.media.download(voiceMessage.data.voice.file_id));
+          const decision = decideTranscript(await ports.voice.transcriber.transcribe(stream));
+          if (decision === undefined) throw new Error("Telegram voice transcript is invalid");
+          if (decision.kind === "command") {
+            await ports.ingress.accept(toTelegramVoiceCommand(
+              { message: voiceMessage.data }, identity.principalId, parsedConfig.botIdentity, decision.transcript
+            ));
+          } else {
+            await ports.voice.confirmations.request({
+              channel: "telegram",
+              principalId: identity.principalId,
+              chatId,
+              messageId: voiceMessage.data.message_id,
+              confirmationText: decision.confirmationText,
+              trusted: false
+            });
+          }
         }
         await ports.cursorStore.save("telegram", update.update_id + 1);
         return;

@@ -60,6 +60,9 @@ importers:
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../core
+      '@orca-hq/voice':
+        specifier: workspace:*
+        version: link:../voice
       zod:
         specifier: ^3.24.2
         version: 3.25.76
@@ -69,6 +72,9 @@ importers:
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../core
+      '@orca-hq/voice':
+        specifier: workspace:*
+        version: link:../voice
       zod:
         specifier: ^3.24.2
         version: 3.25.76

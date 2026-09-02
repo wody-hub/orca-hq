@@ -5,7 +5,7 @@ import { Readable } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createOpenAiTranscriber, createVoiceIngestionService } from "../src/index.js";
+import { createOpenAiTranscriber, createVoiceIngestionService, decideTranscript } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -97,5 +97,32 @@ describe("voice ingestion", () => {
     const result = await service.ingest(fakeAudioStream(), { language: "ko", retain: true });
 
     expect(await exists(result.temporaryPath)).toBe(true);
+  });
+
+  it("deletes partial audio after a stream failure when retention is omitted", async () => {
+    // Break caught: stream errors after a first chunk must not leave a partial recording by default.
+    const directory = await temporaryDirectory();
+    const service = createVoiceIngestionService({
+      temporaryDirectory: directory,
+      transcriber: { id: "local-whisper", transcribe: vi.fn(async () => ({ text: "진행해" })) }
+    });
+    const failingStream = Readable.from((async function* () {
+      yield new Uint8Array([1, 2, 3]);
+      throw new Error("stream interrupted");
+    })());
+
+    await expect(service.ingest(failingStream, { language: "ko" })).rejects.toThrow("stream interrupted");
+
+    await expect(readdir(directory)).resolves.toEqual([]);
+  });
+
+  it("centralizes low-confidence confirmation without retaining transcript provenance", () => {
+    // Break caught: adapter-specific confidence policies can drift and make uncertain text executable.
+    expect(decideTranscript({
+      text: "프로덕션을 삭제해",
+      provider: "openai",
+      sourceFileSha256: "e".repeat(64),
+      confidence: 0.79
+    })).toEqual({ kind: "confirmation_required", confirmationText: "프로덕션을 삭제해" });
   });
 });

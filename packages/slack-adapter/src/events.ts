@@ -5,6 +5,7 @@ import {
   type CommandEnvelope,
   type IdentityResolver
 } from "@orca-hq/core";
+import type { Transcript } from "@orca-hq/voice";
 import { z } from "zod";
 
 import type { StagedSlackAttachment, SlackAttachmentStager } from "./attachments.js";
@@ -36,15 +37,9 @@ export const SlackVoiceMessageEventSchema = z.object({
   user: z.string().min(1),
   ts: SlackTimestampSchema,
   thread_ts: SlackTimestampSchema.optional(),
-  subtype: z.string().min(1).optional()
+  subtype: z.string().min(1).optional(),
+  files: z.array(SlackFileSchema).length(1)
 }).passthrough();
-
-const VoiceTranscriptSchema = z.object({
-  text: z.string().min(1),
-  provider: z.enum(["openai", "local-whisper"]),
-  sourceFileSha256: z.string().regex(/^[a-f0-9]{64}$/),
-  confidence: z.number().min(0).max(1).optional()
-}).strict();
 
 export type SlackMessageEvent = z.infer<typeof SlackMessageEventSchema>;
 export type SlackVoiceMessageEvent = z.infer<typeof SlackVoiceMessageEventSchema>;
@@ -58,10 +53,6 @@ export type SlackCommandPorts = Readonly<{
   identities: IdentityResolver;
   stageAttachment: SlackAttachmentStager;
 }>;
-
-export type SlackVoiceCommandResult =
-  | Readonly<{ kind: "command"; command: CommandEnvelope }>
-  | Readonly<{ kind: "confirmation_required"; confirmationText: string }>;
 
 function receivedAtFromSlackTimestamp(timestamp: string): string {
   return new Date(Number(timestamp) * 1_000).toISOString();
@@ -116,45 +107,38 @@ export async function toCommandEnvelope(
 }
 
 /**
- * Creates a command only after Korean voice text has been transcribed with sufficient confidence.
- * This boundary deliberately receives no download URL, bytes, or temporary audio path.
+ * Matches exactly one audio attachment without exposing its provider URL or bytes.
  */
+export function slackVoiceFileId(eventInput: unknown, config: SlackCommandConfig): string | undefined {
+  const event = SlackVoiceMessageEventSchema.safeParse(eventInput);
+  if (!event.success || event.data.subtype !== undefined || event.data.channel !== config.channelId) return undefined;
+  const file = event.data.files[0];
+  if (file?.mimetype === undefined || !file.mimetype.startsWith("audio/")) return undefined;
+  return file.id;
+}
+
+/** Creates a durable command only from a centrally validated, confident transcript. */
 export function toSlackVoiceCommandEnvelope(
   eventInput: unknown,
   config: SlackCommandConfig,
-  identities: IdentityResolver,
-  transcriptInput: unknown
-): SlackVoiceCommandResult | undefined {
+  principalId: string,
+  transcript: Transcript
+): CommandEnvelope | undefined {
   const event = SlackVoiceMessageEventSchema.safeParse(eventInput);
-  const transcript = VoiceTranscriptSchema.safeParse(transcriptInput);
-  if (!event.success || !transcript.success || event.data.subtype !== undefined ||
-    event.data.channel !== config.channelId) return undefined;
-
-  const identity = identities.resolve("slack", event.data.user, config.teamId);
-  if ("kind" in identity) return undefined;
-
-  const text = transcript.data.text.trim();
-  if (text.length === 0) return undefined;
-  if (transcript.data.confidence !== undefined && transcript.data.confidence < 0.8) {
-    return { kind: "confirmation_required", confirmationText: text };
-  }
-
+  if (!event.success || event.data.subtype !== undefined || event.data.channel !== config.channelId) return undefined;
   return {
-    kind: "command",
-    command: {
-      commandId: randomUUID(),
-      idempotencyKey: deriveIdempotencyKey(`slack:${config.teamId}`, event.data.ts),
-      channel: "slack",
-      externalMessageId: event.data.ts,
-      externalThreadId: event.data.thread_ts ?? event.data.ts,
-      principalId: identity.principalId,
-      receivedAt: receivedAtFromSlackTimestamp(event.data.ts),
-      text,
-      transcript: {
-        provider: transcript.data.provider,
-        sourceFileSha256: transcript.data.sourceFileSha256,
-        ...(transcript.data.confidence === undefined ? {} : { confidence: transcript.data.confidence })
-      }
+    commandId: randomUUID(),
+    idempotencyKey: deriveIdempotencyKey(`slack:${config.teamId}`, event.data.ts),
+    channel: "slack",
+    externalMessageId: event.data.ts,
+    externalThreadId: event.data.thread_ts ?? event.data.ts,
+    principalId,
+    receivedAt: receivedAtFromSlackTimestamp(event.data.ts),
+    text: transcript.text,
+    transcript: {
+      provider: transcript.provider,
+      sourceFileSha256: transcript.sourceFileSha256,
+      ...(transcript.confidence === undefined ? {} : { confidence: transcript.confidence })
     }
   };
 }

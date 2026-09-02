@@ -21,6 +21,20 @@ export const TranscriptSchema = TranscriptionResponseSchema.extend({
 export type Transcript = z.infer<typeof TranscriptSchema>;
 export type TranscriptionResponse = z.infer<typeof TranscriptionResponseSchema>;
 
+export type TranscriptDecision =
+  | Readonly<{ kind: "command"; transcript: Transcript }>
+  | Readonly<{ kind: "confirmation_required"; confirmationText: string }>;
+
+/** Parses once for every adapter and prevents low-confidence text becoming command text. */
+export function decideTranscript(input: unknown): TranscriptDecision | undefined {
+  const transcript = TranscriptSchema.safeParse(input);
+  if (!transcript.success) return undefined;
+  if (transcript.data.confidence !== undefined && transcript.data.confidence < 0.8) {
+    return { kind: "confirmation_required", confirmationText: transcript.data.text };
+  }
+  return { kind: "command", transcript: transcript.data };
+}
+
 export type VoiceTranscriber = Readonly<{
   id: z.infer<typeof TranscriberIdSchema>;
   transcribe(input: Readonly<{ path: string; language: "ko" }>): Promise<TranscriptionResponse>;
@@ -37,6 +51,11 @@ export type VoiceIngestionOptions = Readonly<{
 
 export type VoiceIngestionService = Readonly<{
   ingest(stream: Readable, options: VoiceIngestionOptions): Promise<IngestedTranscript>;
+}>;
+
+/** A channel-facing port deliberately omits the ephemeral temporary path. */
+export type VoiceCommandTranscriber = Readonly<{
+  transcribe(stream: Readable): Promise<Transcript>;
 }>;
 
 export type VoiceOptions = VoiceIngestionOptions & Readonly<{
@@ -68,5 +87,14 @@ export function createVoiceIngestionService(options: Readonly<{
 }>): VoiceIngestionService {
   return {
     ingest: (stream, ingestOptions) => ingestVoice(stream, { ...options, ...ingestOptions })
+  };
+}
+
+export function createVoiceCommandTranscriber(service: VoiceIngestionService): VoiceCommandTranscriber {
+  return {
+    transcribe: async (stream) => {
+      const { temporaryPath: _temporaryPath, ...transcript } = await service.ingest(stream, { language: "ko" });
+      return transcript;
+    }
   };
 }

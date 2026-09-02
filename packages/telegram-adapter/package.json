@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@orca-hq/core": "workspace:*",
+    "@orca-hq/voice": "workspace:*",
     "zod": "^3.24.2"
   }
 }

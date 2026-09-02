@@ -1,11 +1,19 @@
+import { Readable } from "node:stream";
+
 import type { CommandIngress, IdentityResolver } from "@orca-hq/core";
+import { decideTranscript, type VoiceCommandTranscriber } from "@orca-hq/voice";
 import { z } from "zod";
 
 import {
   createSlackAttachmentStager,
   type SlackFileDownloader
 } from "./attachments.js";
-import { toCommandEnvelope } from "./events.js";
+import {
+  SlackVoiceMessageEventSchema,
+  slackVoiceFileId,
+  toCommandEnvelope,
+  toSlackVoiceCommandEnvelope
+} from "./events.js";
 import {
   deliverSlackMessage,
   type SlackMessagePort,
@@ -66,12 +74,28 @@ export type SlackAdapterConfig = Readonly<{
   stagingDirectory: string;
 }>;
 
+export type SlackVoicePorts = Readonly<{
+  transcriber: VoiceCommandTranscriber;
+  confirmations: Readonly<{
+    request(request: Readonly<{
+      channel: "slack";
+      teamId: string;
+      channelId: string;
+      principalId: string;
+      messageTs: string;
+      confirmationText: string;
+      trusted: false;
+    }>): Promise<void>;
+  }>;
+}>;
+
 export type SlackAdapterPorts = Readonly<{
   ingress: CommandIngress;
   identities: IdentityResolver;
   cursorStore: ChannelCursorStore;
   history: SlackHistoryPort;
   files: SlackFileDownloader;
+  voice?: SlackVoicePorts;
   messages?: SlackMessagePort;
   approvalRequests?: Readonly<{ accept(request: SlackApprovalRequest): Promise<void> }>;
 }>;
@@ -98,6 +122,35 @@ export function createSlackAdapter(config: SlackAdapterConfig, ports: SlackAdapt
 
   const handleEvent = async (event: unknown, workspaceId?: string): Promise<void> => {
     if (workspaceId !== undefined && workspaceId !== parsedConfig.teamId) return;
+    const voiceEvent = SlackVoiceMessageEventSchema.safeParse(event);
+    const voiceFileId = slackVoiceFileId(event, parsedConfig);
+    if (voiceEvent.success && voiceFileId !== undefined) {
+      const identity = ports.identities.resolve("slack", voiceEvent.data.user, parsedConfig.teamId);
+      if (!("kind" in identity)) {
+        if (ports.voice === undefined) throw new Error("Slack voice port is not configured");
+        const stream = Readable.from(await ports.files.download(voiceFileId));
+        const decision = decideTranscript(await ports.voice.transcriber.transcribe(stream));
+        if (decision === undefined) throw new Error("Slack voice transcript is invalid");
+        if (decision.kind === "command") {
+          const command = toSlackVoiceCommandEnvelope(
+            voiceEvent.data, parsedConfig, identity.principalId, decision.transcript
+          );
+          if (command === undefined) throw new Error("Slack voice event is invalid");
+          await ports.ingress.accept(command);
+        } else {
+          await ports.voice.confirmations.request({
+            channel: "slack",
+            teamId: parsedConfig.teamId,
+            channelId: parsedConfig.channelId,
+            principalId: identity.principalId,
+            messageTs: voiceEvent.data.ts,
+            confirmationText: decision.confirmationText,
+            trusted: false
+          });
+        }
+      }
+      return;
+    }
     const command = await toCommandEnvelope(event, parsedConfig, {
       identities: ports.identities,
       stageAttachment
