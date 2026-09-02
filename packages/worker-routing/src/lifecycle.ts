@@ -9,6 +9,12 @@ import {
 import type { OrcaReceipt } from "@orca-hq/orca-adapter";
 import { z } from "zod";
 
+import type {
+  ProviderInspectReceipt,
+  ProviderStartReceipt,
+  WorkerProviderId
+} from "./providers.js";
+
 const NonBlankStringSchema = z.string().trim().min(1);
 const AbsolutePathSchema = NonBlankStringSchema.refine(isAbsolute, "must be an absolute path");
 const StringListSchema = z.array(NonBlankStringSchema);
@@ -139,6 +145,9 @@ export type DispatchRecord = Readonly<{
   retryOf?: string | undefined;
   orcaDispatchId?: string | undefined;
   receipt?: OrcaReceipt | undefined;
+  providerId?: WorkerProviderId | undefined;
+  providerStartReceipt?: ProviderStartReceipt | undefined;
+  providerInspectReceipts?: readonly ProviderInspectReceipt[] | undefined;
   launchFailureId?: string | undefined;
   releaseReceipt?: OrcaReceipt | undefined;
   releaseFailure?: WorkerReleaseFailure | undefined;
@@ -299,7 +308,13 @@ export class ExecutionLifecycle {
     state: DispatchState,
     patch: Readonly<Partial<Pick<
       DispatchRecord,
-      "orcaDispatchId" | "receipt" | "launchFailureId" | "releaseReceipt" | "releaseFailure"
+      | "orcaDispatchId"
+      | "receipt"
+      | "providerId"
+      | "providerStartReceipt"
+      | "launchFailureId"
+      | "releaseReceipt"
+      | "releaseFailure"
     >>> = {}
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", id);
@@ -365,6 +380,27 @@ export class ExecutionLifecycle {
   ): Promise<DispatchRecord> {
     const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
     const updated = Object.freeze({ ...current, ...outcome });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordProviderInspection(
+    localDispatchId: string,
+    receipt: ProviderInspectReceipt
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (current.providerId === undefined || receipt.provider !== current.providerId) {
+      throw new TypeError("provider inspection does not match the persisted provider");
+    }
+    if (current.orcaDispatchId === undefined || receipt.dispatchId !== current.orcaDispatchId) {
+      throw new TypeError("provider inspection does not match the persisted Orca Dispatch");
+    }
+    const providerInspectReceipts = Object.freeze([
+      ...(current.providerInspectReceipts ?? []),
+      receipt
+    ]);
+    const updated = Object.freeze({ ...current, providerInspectReceipts });
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);
     return updated;

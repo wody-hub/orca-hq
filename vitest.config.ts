@@ -17,6 +17,9 @@ export default defineConfig({
   resolve: {
     alias: {
       "@orca-hq/core": fileURLToPath(new URL("./packages/core/src/index.ts", import.meta.url)),
+      "@orca-hq/orca-adapter": fileURLToPath(
+        new URL("./packages/orca-adapter/src/index.ts", import.meta.url)
+      ),
       "@orca-hq/persistence": fileURLToPath(
         new URL("./packages/persistence/src/index.ts", import.meta.url)
       ),

@@ -30,6 +30,22 @@ import {
   type WorktreePlacement,
   type WorktreePlacementPort
 } from "./worktree-placement.js";
+import { ClaudeWorkerProvider } from "./claude-worker.js";
+import { CodexWorkerProvider } from "./codex-worker.js";
+import {
+  DEFAULT_PROVIDER_CAPABILITIES,
+  ProviderCapabilitiesSchema,
+  ProviderInspectReceiptSchema,
+  ProviderStartReceiptSchema,
+  WorkerProviderError,
+  WorkerProviderRegistry,
+  selectProvider,
+  type ProviderCapabilities,
+  type ProviderInspectReceipt,
+  type ProviderStartReceipt,
+  type WorkerProvider,
+  type WorkerProviderId
+} from "./providers.js";
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -42,6 +58,10 @@ export type AuthorizedProposal = Readonly<{
 
 export interface OrcaExecutionPort {
   execute(operation: OrcaOperation): Promise<OrcaReceipt>;
+}
+
+export interface WorkerProviderRegistryPort {
+  get(id: WorkerProviderId): WorkerProvider;
 }
 
 export type EditingLeaseRequest = Readonly<{
@@ -280,14 +300,6 @@ function taskIdFrom(receipt: OrcaReceipt): string {
   return value;
 }
 
-function dispatchIdFrom(receipt: OrcaReceipt): string {
-  const result = receipt.result as { dispatchId?: unknown };
-  if (typeof result.dispatchId !== "string" || result.dispatchId.length === 0) {
-    throw new Error("validated Dispatch receipt has no Dispatch ID");
-  }
-  return result.dispatchId;
-}
-
 function releaseDispatchIdFrom(receipt: OrcaReceipt): string {
   const result = receipt.result as { dispatchId?: unknown };
   if (typeof result.dispatchId !== "string" || result.dispatchId.length === 0) {
@@ -371,6 +383,8 @@ export class ExecutionService {
   readonly #placements: WorktreePlacementPort;
   readonly #locks: EditingLockPort;
   readonly #lifecycle: ExecutionLifecycle;
+  readonly #providers: WorkerProviderRegistryPort;
+  readonly #providerCapabilities: ProviderCapabilities;
   readonly #dispatchLookup = new Map<string, DispatchLookup>();
   readonly #runs = new Map<string, RunContext>();
 
@@ -379,11 +393,20 @@ export class ExecutionService {
     placements: WorktreePlacementPort;
     locks: EditingLockPort;
     lifecycle: ExecutionLifecycle;
+    providers?: WorkerProviderRegistryPort | undefined;
+    providerCapabilities?: ProviderCapabilities | undefined;
   }>) {
     this.#orca = options.orca;
     this.#placements = options.placements;
     this.#locks = options.locks;
     this.#lifecycle = options.lifecycle;
+    this.#providers = options.providers ?? new WorkerProviderRegistry([
+      new CodexWorkerProvider({ orca: options.orca }),
+      new ClaudeWorkerProvider({ orca: options.orca })
+    ]);
+    this.#providerCapabilities = Object.freeze(ProviderCapabilitiesSchema.parse(
+      options.providerCapabilities ?? DEFAULT_PROVIDER_CAPABILITIES
+    ));
   }
 
   async start(input: AuthorizedProposal): Promise<ExecutionStart> {
@@ -415,6 +438,7 @@ export class ExecutionService {
     if (placement.kind !== "ready") return placement;
 
     const context = this.#context(input, proposal, project, sortedTasks, placement);
+    for (const task of context.tasks) this.#providerFor(task.initialAssignment);
     const initialTasks = context.tasks.filter(({ task }) => task.dependsOn.length === 0);
     const permittedInitialTasks = placement.requiresEditingLease ? initialTasks.slice(0, 1) : initialTasks;
     const initialDispatches = permittedInitialTasks.map((task) =>
@@ -482,7 +506,9 @@ export class ExecutionService {
         dispatchIds: immutableStrings(dispatchIds)
       });
     } catch (error) {
-      if (editingDispatch !== undefined) await this.#release(context, editingDispatch);
+      if (editingDispatch !== undefined && editingDispatch.orcaDispatchId === undefined) {
+        await this.#release(context, editingDispatch);
+      }
       throw error;
     }
   }
@@ -637,6 +663,23 @@ export class ExecutionService {
     return Object.freeze({ kind: "retried", dispatchId, retryOf: input.dispatchId });
   }
 
+  async inspectWorker(dispatchId: string): Promise<ProviderInspectReceipt> {
+    const lookup = this.#dispatchLookup.get(dispatchId);
+    if (lookup === undefined) throw new Error(`Dispatch ${dispatchId} is not known`);
+    const orcaDispatchId = lookup.dispatch.orcaDispatchId;
+    if (orcaDispatchId === undefined) {
+      throw new Error(`Dispatch ${lookup.dispatch.localId} has no Orca receipt`);
+    }
+    const provider = this.#providerFor(lookup.dispatch.assignment);
+    const receipt = this.#validatedInspectReceipt(
+      provider.id,
+      orcaDispatchId,
+      await provider.inspect(orcaDispatchId)
+    );
+    await this.#lifecycle.recordProviderInspection(lookup.dispatch.localId, receipt);
+    return receipt;
+  }
+
   #context(
     authorized: AuthorizedProposal,
     proposal: ExecutionProposal,
@@ -766,25 +809,92 @@ export class ExecutionService {
   ): Promise<string> {
     if (task.orcaTaskId === undefined) throw new Error(`Task ${task.localId} has no Orca receipt`);
     await this.#lifecycle.transitionDispatch(dispatch.localId, "launching");
-    const dispatchReceipt = await this.#orca.execute({
-      kind: "dispatch_worker",
-      taskId: task.orcaTaskId,
-      worktree: dispatch.placement.worktree.path,
-      agent: task.task.preferredAgent,
-      name: task.task.localId,
-      setup: context.project.setupPolicy,
-      ...(retryOf === undefined ? {} : { retryOf })
-    });
-    dispatch.orcaDispatchId = dispatchIdFrom(dispatchReceipt);
+    const provider = this.#providerFor(dispatch.assignment);
+    const providerStartReceipt = this.#validatedStartReceipt(
+      provider.id,
+      dispatch.assignment,
+      task.orcaTaskId,
+      /*
+       * Public worker-start owns placement and process lifecycle but has no prompt flag.
+       * The complete prompt therefore stays in the persisted start receipt while Orca
+       * injects live Dispatch context. No post-start mail or environment is forwarded.
+       */
+      await provider.start(dispatch.assignment, {
+        orcaTaskId: task.orcaTaskId,
+        name: task.task.localId,
+        setup: context.project.setupPolicy,
+        ...(retryOf === undefined ? {} : { retryOf })
+      })
+    );
+    dispatch.orcaDispatchId = providerStartReceipt.orcaDispatchId;
     await this.#lifecycle.transitionDispatch(dispatch.localId, "running", {
       orcaDispatchId: dispatch.orcaDispatchId,
-      receipt: dispatchReceipt
+      receipt: providerStartReceipt.orcaReceipt,
+      providerId: provider.id,
+      providerStartReceipt
     });
     await this.#lifecycle.transitionTask(task.localId, "running");
     const lookup = { run: context, task, dispatch };
     this.#dispatchLookup.set(dispatch.localId, lookup);
     this.#dispatchLookup.set(dispatch.orcaDispatchId, lookup);
+    await this.inspectWorker(dispatch.orcaDispatchId);
     return dispatch.orcaDispatchId;
+  }
+
+  #providerFor(assignment: WorkerAssignment): WorkerProvider {
+    const selection = selectProvider({
+      role: assignment.role,
+      preferredAgent: assignment.preferredAgent
+    }, this.#providerCapabilities);
+    if (selection.kind === "unavailable") {
+      const code = selection.reason === "provider_authentication_required"
+        ? "provider_authentication_required"
+        : "provider_unavailable";
+      throw new WorkerProviderError(code, selection.provider, "start");
+    }
+    const provider = this.#providers.get(selection.provider);
+    if (provider.id !== assignment.preferredAgent) {
+      throw new WorkerProviderError("provider_mismatch", provider.id, "start");
+    }
+    return provider;
+  }
+
+  #validatedStartReceipt(
+    provider: WorkerProviderId,
+    assignment: WorkerAssignment,
+    orcaTaskId: string,
+    value: ProviderStartReceipt
+  ): ProviderStartReceipt {
+    const parsed = ProviderStartReceiptSchema.safeParse(value);
+    if (
+      !parsed.success
+      || !parsed.data.orcaReceipt.ok
+      || parsed.data.provider !== provider
+      || parsed.data.assignmentTaskId !== assignment.taskId
+      || parsed.data.assignmentDispatchId !== assignment.dispatchId
+      || parsed.data.orcaTaskId !== orcaTaskId
+    ) {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "start");
+    }
+    return parsed.data as ProviderStartReceipt;
+  }
+
+  #validatedInspectReceipt(
+    provider: WorkerProviderId,
+    dispatchId: string,
+    value: ProviderInspectReceipt
+  ): ProviderInspectReceipt {
+    const parsed = ProviderInspectReceiptSchema.safeParse(value);
+    if (
+      !parsed.success
+      || !parsed.data.showReceipt.ok
+      || !parsed.data.readReceipt.ok
+      || parsed.data.provider !== provider
+      || parsed.data.dispatchId !== dispatchId
+    ) {
+      throw new WorkerProviderError("invalid_provider_receipt", provider, "inspect");
+    }
+    return parsed.data as ProviderInspectReceipt;
   }
 
   async #launchWithIntervention(
@@ -799,7 +909,9 @@ export class ExecutionService {
       try {
         await this.#markIntervention(context, task, dispatch);
       } finally {
-        if (dispatch.placement.requiresEditingLease) await this.#release(context, dispatch);
+        if (dispatch.placement.requiresEditingLease && dispatch.orcaDispatchId === undefined) {
+          await this.#release(context, dispatch);
+        }
       }
       throw error;
     }

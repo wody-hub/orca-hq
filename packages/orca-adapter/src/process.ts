@@ -13,6 +13,37 @@ export interface RunOrcaOptions {
   readonly terminationGraceMs: number;
 }
 
+const ORCA_ENVIRONMENT_KEYS = Object.freeze([
+  "HOME",
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TERM",
+  "COLORTERM",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_RUNTIME_DIR",
+  "__CF_USER_TEXT_ENCODING"
+] as const);
+
+export function boundedOrcaEnvironment(
+  source: Readonly<NodeJS.ProcessEnv>
+): Readonly<NodeJS.ProcessEnv> {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const key of ORCA_ENVIRONMENT_KEYS) {
+    const value = source[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return Object.freeze(environment);
+}
+
 export class OrcaProcessError extends Error {
   readonly code = "orca_process_failed";
   readonly retryable = false;
@@ -89,6 +120,7 @@ export async function runOrca(
 
   return new Promise<unknown>((resolve, reject) => {
     const child = spawn(options.executablePath, [...args, "--json"], {
+      env: boundedOrcaEnvironment(process.env),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });

@@ -4,7 +4,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFakeOrca, type FakeOrca } from "../../test-support/src/index.js";
 import { OrcaClient } from "../src/index.js";
-import { runOrca } from "../src/process.js";
+import { boundedOrcaEnvironment, runOrca } from "../src/process.js";
 
 const officialSkillText = {
   "orca-cli": "orca cli reference",
@@ -87,6 +87,30 @@ function statusWith(change: { version?: string; capabilities?: readonly string[]
 }
 
 describe("Orca CLI capability adapter", () => {
+  it("forwards only the bounded CLI environment required for normal authenticated profiles", () => {
+    // Break caught: worker-start may otherwise expose HQ channel or voice secrets to a provider process.
+    expect(boundedOrcaEnvironment({
+      HOME: "/Users/operator",
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      LANG: "en_US.UTF-8",
+      TMPDIR: "/tmp/session/",
+      TERM: "xterm-256color",
+      XDG_CONFIG_HOME: "/Users/operator/.config",
+      SLACK_BOT_TOKEN: "slack-secret",
+      TELEGRAM_BOT_TOKEN: "telegram-secret",
+      TAILSCALE_AUTH_KEY: "tailscale-secret",
+      OPENAI_API_KEY: "voice-secret",
+      ARBITRARY_MODEL_ENV: "must-not-pass"
+    })).toEqual({
+      HOME: "/Users/operator",
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      LANG: "en_US.UTF-8",
+      TMPDIR: "/tmp/session/",
+      TERM: "xterm-256color",
+      XDG_CONFIG_HOME: "/Users/operator/.config"
+    });
+  });
+
   it("accepts 1.4.194 and binds both official skill hashes to that version", async () => {
     // Break caught: a status-only probe could mutate through stale, unversioned command grammar.
     const fake = await fakeOrca();

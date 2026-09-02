@@ -23,6 +23,7 @@ import {
   type LifecycleMessageSink,
   type LifecycleStore,
   type LifecycleTransition,
+  type ProviderCapabilities,
   type RunRecord,
   type TaskRecord,
   type UserVisibleLifecycleMessage,
@@ -117,6 +118,43 @@ class RecordingOrca {
           effects: []
         });
       }
+      case "show_worker":
+        return receipt(`show-receipt-${operation.dispatchId}`, {
+          dispatch: {
+            id: operation.dispatchId,
+            task_id: "orca-task-1",
+            run_id: "orca-run-1",
+            status: "dispatched"
+          },
+          worker: {
+            dispatch_id: operation.dispatchId,
+            state: "ready",
+            stage: "ready",
+            agent_terminal_handle: `terminal-${operation.dispatchId}`
+          },
+          terminal: null,
+          observation: { status: "ready", exactWorker: true },
+          terminalResource: {
+            id: `resource-${operation.dispatchId}`,
+            ownershipState: "owned",
+            releaseState: "active"
+          }
+        });
+      case "read_worker":
+        return receipt(`read-receipt-${operation.dispatchId}`, {
+          dispatchId: operation.dispatchId,
+          source: "transcript",
+          cursor: "cursor-1",
+          status: { worker: "ready", terminal: "running" },
+          transcript: {
+            messages: [],
+            limited: false,
+            nextCursor: "cursor-1",
+            returnedMessageCount: 0
+          },
+          warnings: [],
+          archived: false
+        });
       case "release_worker":
         if (this.releaseError !== undefined) throw this.releaseError;
         return receipt(`release-receipt-${operation.dispatchId}`, {
@@ -257,7 +295,10 @@ class MemoryGit implements GitWorktreePort {
   }
 }
 
-function setup(git = new MemoryGit()): {
+function setup(
+  git = new MemoryGit(),
+  providerCapabilities?: ProviderCapabilities
+): {
   service: ExecutionService;
   orca: RecordingOrca;
   git: MemoryGit;
@@ -275,7 +316,8 @@ function setup(git = new MemoryGit()): {
       orca,
       placements: new GitWorktreePlacementService(git),
       locks,
-      lifecycle
+      lifecycle,
+      ...(providerCapabilities === undefined ? {} : { providerCapabilities })
     }),
     orca,
     git,
@@ -373,7 +415,9 @@ describe("ExecutionService preflight and dispatch", () => {
       "create_run",
       "create_task",
       "create_task",
-      "dispatch_worker"
+      "dispatch_worker",
+      "show_worker",
+      "read_worker"
     ]);
     expect(orca.calls[2]).toMatchObject({
       kind: "create_task",
@@ -478,7 +522,7 @@ describe("ExecutionService preflight and dispatch", () => {
 
     expect(locks.acquired).toEqual([]);
     expect(git.created).toEqual([]);
-    expect(orca.calls.at(-1)).toMatchObject({
+    expect(orca.calls.findLast(({ kind }) => kind === "dispatch_worker")).toMatchObject({
       kind: "dispatch_worker",
       worktree: project.absolutePath
     });
@@ -579,8 +623,11 @@ describe("ExecutionService preflight and dispatch", () => {
     const setupResult = setup();
     setupResult.orca.dispatchErrorOnCall = 1;
 
-    await expect(setupResult.service.start(authorized()))
-      .rejects.toThrow("synthetic worker-start failure 1");
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "provider_process_failed",
+      provider: "codex",
+      phase: "start"
+    });
 
     expect(setupResult.locks.released).toEqual([{
       lockKey: project.lockKey,
@@ -592,6 +639,27 @@ describe("ExecutionService preflight and dispatch", () => {
       .toBe("intervention_required");
     expect(setupResult.store.runs.get("run:proposal-1")?.state)
       .toBe("intervention_required");
+  });
+
+  it("fails before mutation instead of substituting an unavailable preferred provider", async () => {
+    // Break caught: falling back to Claude would execute an assignment that authorized Codex only.
+    const capabilities: ProviderCapabilities = {
+      codex: { worker: "unavailable", hq: "available" },
+      claude: { worker: "available", hq: "unavailable" }
+    };
+    const setupResult = setup(new MemoryGit(), capabilities);
+
+    await expect(setupResult.service.start(authorized())).rejects.toMatchObject({
+      code: "provider_unavailable",
+      provider: "codex",
+      phase: "start"
+    });
+
+    expect(setupResult.orca.calls).toEqual([]);
+    expect(setupResult.locks.acquired).toEqual([]);
+    expect(setupResult.store.runs.size).toBe(0);
+    expect(setupResult.store.tasks.size).toBe(0);
+    expect(setupResult.store.dispatches.size).toBe(0);
   });
 
   it("persists immutable inputs, public receipts, and every lifecycle transition", async () => {
@@ -616,7 +684,22 @@ describe("ExecutionService preflight and dispatch", () => {
       id: "dispatch:proposal-1:implement:1",
       state: "running",
       orcaDispatchId: "orca-dispatch-1",
-      receipt: { id: "dispatch-receipt-1", ok: true }
+      receipt: { id: "dispatch-receipt-1", ok: true },
+      providerId: "codex",
+      providerStartReceipt: {
+        kind: "provider_start",
+        provider: "codex",
+        assignmentDispatchId: "dispatch:proposal-1:implement:1",
+        orcaDispatchId: "orca-dispatch-1",
+        orcaReceipt: { id: "dispatch-receipt-1", ok: true }
+      },
+      providerInspectReceipts: [{
+        kind: "provider_inspect",
+        provider: "codex",
+        dispatchId: "orca-dispatch-1",
+        showReceipt: { id: "show-receipt-orca-dispatch-1", ok: true },
+        readReceipt: { id: "read-receipt-orca-dispatch-1", ok: true }
+      }]
     });
     expect(store.transitions.map(({ entity, to }) => `${entity}:${to}`)).toEqual([
       "run:creating",
@@ -837,8 +920,12 @@ describe("worker lifecycle", () => {
       "create_task",
       "create_task",
       "dispatch_worker",
+      "show_worker",
+      "read_worker",
       "release_worker",
-      "dispatch_worker"
+      "dispatch_worker",
+      "show_worker",
+      "read_worker"
     ]);
     expect(store.messages.filter(({ kind }) => kind === "worker_done")).toHaveLength(1);
   });
@@ -868,7 +955,11 @@ describe("worker lifecycle", () => {
       dispatchId: "orca-dispatch-1",
       outcome: "completed",
       summary: "implementation complete"
-    })).rejects.toThrow("synthetic worker-start failure 2");
+    })).rejects.toMatchObject({
+      code: "provider_process_failed",
+      provider: "claude",
+      phase: "start"
+    });
 
     expect(locks.released).toEqual([
       {
@@ -1082,7 +1173,11 @@ describe("worker lifecycle", () => {
       dispatchId: "orca-dispatch-1",
       failureId: "launch-failure-before-retry-start",
       evidence: { kind: "orca_worker_state", state: "launch_failed" }
-    })).rejects.toThrow("synthetic worker-start failure 2");
+    })).rejects.toMatchObject({
+      code: "provider_process_failed",
+      provider: "codex",
+      phase: "start"
+    });
 
     expect(locks.released.at(-1)).toEqual({
       lockKey: project.lockKey,

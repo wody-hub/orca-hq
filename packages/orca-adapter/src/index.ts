@@ -163,6 +163,7 @@ export {
   OrcaInvalidReceiptError,
   OrcaReceiptSchema,
   OrcaStaleHandleError,
+  parseOrcaOperationReceipt,
   type OrcaProject,
   type OrcaReceipt
 } from "./receipts.js";
