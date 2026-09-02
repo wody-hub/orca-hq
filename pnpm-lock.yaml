@@ -55,6 +55,15 @@ importers:
         specifier: ^3.24.2
         version: 3.25.76
 
+  packages/slack-adapter:
+    dependencies:
+      '@orca-hq/core':
+        specifier: workspace:*
+        version: link:../core
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':
