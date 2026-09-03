@@ -1639,16 +1639,24 @@ export class ControlStore implements CommandIngress {
       const dispatchPayload = objectValue(parseJson(dispatchRow.payload_json));
       const taskPayload = objectValue(parseJson(taskRow.payload_json));
       const runPayload = objectValue(parseJson(runRow.payload_json));
-      const terminalGraph = (
+      const terminalStates = (
         dispatchRow.state === "intervention_required"
         && taskRow.state === "intervention_required"
         && runRow.state === "intervention_required"
       );
-      if (!terminalGraph && (
-        !["launching", "running", "launch_failed"].includes(dispatchRow.state)
-        || !["ready", "running"].includes(taskRow.state)
-        || runRow.state !== "active"
-      )) {
+      const activeGraph = (
+        ["launching", "running", "launch_failure_reserved", "launch_failed"].includes(
+          dispatchRow.state
+        )
+        && ["ready", "running"].includes(taskRow.state)
+        && runRow.state === "active"
+      );
+      const partialInterventionGraph = (
+        dispatchRow.state === "intervention_required"
+        && ["ready", "running", "intervention_required"].includes(taskRow.state)
+        && ["active", "intervention_required"].includes(runRow.state)
+      );
+      if (!activeGraph && !partialInterventionGraph) {
         throw new Error(`Dispatch ${input.dispatch.id} changed during launch intervention`);
       }
       const hasFenceReceipt = input.dispatch.fenceReceipt !== undefined;
@@ -1754,6 +1762,18 @@ export class ControlStore implements CommandIngress {
       if (!isDeepStrictEqual(transitionIdentities, expectedTransitions)) {
         throw new TypeError("launch intervention transitions do not match durable states");
       }
+      const terminalGraph = terminalStates && (
+        (
+          dispatchPayload?.fenceReceipt !== undefined
+          && dispatchPayload.fenceFailure === undefined
+          && isDeepStrictEqual(dispatchPayload.fenceReceipt, input.dispatch.fenceReceipt)
+        )
+        || (
+          dispatchPayload?.fenceFailure !== undefined
+          && dispatchPayload.fenceReceipt === undefined
+          && isDeepStrictEqual(dispatchPayload.fenceFailure, input.dispatch.fenceFailure)
+        )
+      );
       if (terminalGraph) return "duplicate" as const;
       const updateDispatch = this.database.prepare(`
         UPDATE dispatches
@@ -1765,25 +1785,33 @@ export class ControlStore implements CommandIngress {
         input.dispatch.id,
         dispatchRow.state
       );
-      const updateTask = this.database.prepare(`
-        UPDATE tasks SET state = 'intervention_required', payload_json = ?, updated_at = ?
-        WHERE id = ? AND state = ?
-      `).run(
-        JSON.stringify(JsonValueSchema.parse({ ...(taskPayload ?? {}), ...input.task })),
-        new Date().toISOString(),
-        input.task.id,
-        taskRow.state
-      );
-      const updateRun = this.database.prepare(`
-        UPDATE runs SET state = 'intervention_required', payload_json = ?, updated_at = ?
-        WHERE id = ? AND state = ?
-      `).run(
-        JSON.stringify(JsonValueSchema.parse({ ...(runPayload ?? {}), ...input.run })),
-        new Date().toISOString(),
-        input.run.id,
-        runRow.state
-      );
-      if (updateDispatch.changes !== 1 || updateTask.changes !== 1 || updateRun.changes !== 1) {
+      const updateTask = taskRow.state === "intervention_required"
+        ? undefined
+        : this.database.prepare(`
+          UPDATE tasks SET state = 'intervention_required', payload_json = ?, updated_at = ?
+          WHERE id = ? AND state = ?
+        `).run(
+          JSON.stringify(JsonValueSchema.parse({ ...(taskPayload ?? {}), ...input.task })),
+          new Date().toISOString(),
+          input.task.id,
+          taskRow.state
+        );
+      const updateRun = runRow.state === "intervention_required"
+        ? undefined
+        : this.database.prepare(`
+          UPDATE runs SET state = 'intervention_required', payload_json = ?, updated_at = ?
+          WHERE id = ? AND state = ?
+        `).run(
+          JSON.stringify(JsonValueSchema.parse({ ...(runPayload ?? {}), ...input.run })),
+          new Date().toISOString(),
+          input.run.id,
+          runRow.state
+        );
+      if (
+        updateDispatch.changes !== 1
+        || updateTask?.changes === 0
+        || updateRun?.changes === 0
+      ) {
         throw new Error(`Dispatch ${input.dispatch.id} changed during launch intervention`);
       }
       for (const transition of input.transitions) this.appendTransition(transition);

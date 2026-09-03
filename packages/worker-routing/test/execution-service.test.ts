@@ -971,6 +971,48 @@ function rewriteDurableLaunchCheckpoint(
   `).run(dispatchRow.id, dispatchRow.task_id);
 }
 
+function rewriteDurableLaunchGraph(
+  database: Database.Database,
+  input: Readonly<{
+    dispatchState: DispatchRecord["state"];
+    taskState?: TaskRecord["state"] | undefined;
+    runState?: RunRecord["state"] | undefined;
+    mutateDispatch?: ((payload: Record<string, any>) => void) | undefined;
+  }>
+): void {
+  const dispatchRow = database.prepare(`
+    SELECT id, task_id, payload_json
+    FROM dispatches
+    WHERE json_extract(payload_json, '$.orcaDispatchId') = 'orca-dispatch-1'
+  `).get() as { id: string; task_id: string; payload_json: string };
+  const dispatchPayload = JSON.parse(dispatchRow.payload_json) as Record<string, any>;
+  dispatchPayload.state = input.dispatchState;
+  input.mutateDispatch?.(dispatchPayload);
+  database.prepare(`
+    UPDATE dispatches SET state = ?, payload_json = ? WHERE id = ?
+  `).run(input.dispatchState, JSON.stringify(dispatchPayload), dispatchRow.id);
+
+  const taskRow = database.prepare(`
+    SELECT run_id, payload_json FROM tasks WHERE id = ?
+  `).get(dispatchRow.task_id) as { run_id: string; payload_json: string };
+  const taskState = input.taskState ?? "running";
+  const taskPayload = JSON.parse(taskRow.payload_json) as Record<string, any>;
+  taskPayload.state = taskState;
+  database.prepare(`
+    UPDATE tasks SET state = ?, payload_json = ? WHERE id = ?
+  `).run(taskState, JSON.stringify(taskPayload), dispatchRow.task_id);
+
+  const runState = input.runState ?? "active";
+  const runRow = database.prepare(`
+    SELECT payload_json FROM runs WHERE id = ?
+  `).get(taskRow.run_id) as { payload_json: string };
+  const runPayload = JSON.parse(runRow.payload_json) as Record<string, any>;
+  runPayload.state = runState;
+  database.prepare(`
+    UPDATE runs SET state = ?, payload_json = ? WHERE id = ?
+  `).run(runState, JSON.stringify(runPayload), taskRow.run_id);
+}
+
 function durableReport(
   task: VerificationTask,
   verdict: "pass" | "fail",
@@ -5079,6 +5121,350 @@ describe("worker lifecycle", () => {
     } finally {
       database.close();
     }
+  });
+
+  it("recovery-round atomically rolls back reserved stop failure and clears stale fence failure on exact-stop replay", async () => {
+    // Break caught: a crash inside stop-failure intervention must not strand a partial graph, and later exact stop proof must replace stale failure evidence.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:recovery-round-reserved-stop-failure");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const initialLocks = new DurableLocks(store);
+      await durableExecutionService(
+        store,
+        orca,
+        undefined,
+        initialLocks,
+        artifacts,
+        git
+      ).start(authorized());
+      initialLocks.persistLatestAcquire();
+      rewriteDurableLaunchGraph(database, {
+        dispatchState: "launch_failure_reserved",
+        mutateDispatch: (payload) => {
+          payload.launchFailureId = "recovery-round-reserved-stop-failure";
+          payload.fenceFailure = {
+            code: "legacy_stop_ambiguous",
+            retryable: true
+          };
+          delete payload.fenceReceipt;
+        }
+      });
+      database.exec(`
+        CREATE TRIGGER fail_reserved_stop_intervention
+        BEFORE INSERT ON audit_events
+        WHEN NEW.event_type = 'lifecycle.transition'
+          AND json_extract(NEW.data_json, '$.entity') = 'task'
+          AND json_extract(NEW.data_json, '$.to') = 'intervention_required'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced reserved stop intervention failure');
+        END;
+      `);
+      orca.stopError = Object.assign(new Error("synthetic stop ambiguity"), {
+        code: "orca_stop_unavailable",
+        retryable: true
+      });
+
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "recovery-round-reserved-stop-failure",
+        evidence: { kind: "orca_worker_state", state: "process_failed" }
+      })).rejects.toThrow("forced reserved stop intervention failure");
+
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failure_reserved" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "running" });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({ state: "active" });
+
+      database.exec("DROP TRIGGER fail_reserved_stop_intervention");
+      orca.stopError = undefined;
+      const resumed = await durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "recovery-round-reserved-stop-failure",
+        evidence: { kind: "orca_worker_state", state: "process_failed" }
+      });
+
+      expect(resumed).toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      const dispatches = store.loadDispatchesForTask("task:proposal-1:implement") as Array<
+        Record<string, any>
+      >;
+      expect(dispatches[0]).toMatchObject({
+        state: "launch_failed",
+        fenceReceipt: {
+          ok: true,
+          result: {
+            dispatchId: "orca-dispatch-1",
+            state: "stopped",
+            verdict: "stopped"
+          }
+        },
+        assignmentArtifactCleanup: { kind: "removed" }
+      });
+      expect(dispatches[0]).not.toHaveProperty("fenceFailure");
+      expect(dispatches[1]).toMatchObject({
+        state: "running",
+        retryOf: "orca-dispatch-1",
+        attempt: 2
+      });
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("recovery-round atomically rolls back and retries pre-reservation inspection intervention", async () => {
+    // Break caught: inspection failure before reservation must atomically fence and intervene, never persist a Dispatch-only or Task-only terminal graph.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:recovery-round-pre-reservation-inspection");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      orca.showTaskId = "orca-task-mismatched";
+      database.exec(`
+        CREATE TRIGGER fail_pre_reservation_intervention
+        BEFORE INSERT ON audit_events
+        WHEN NEW.event_type = 'lifecycle.transition'
+          AND json_extract(NEW.data_json, '$.entity') = 'task'
+          AND json_extract(NEW.data_json, '$.to') = 'intervention_required'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced pre-reservation intervention failure');
+        END;
+      `);
+
+      await expect(durableExecutionService(store, orca).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "recovery-round-pre-reservation-inspection",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).rejects.toThrow("forced pre-reservation intervention failure");
+
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "running" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "running" });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({ state: "active" });
+
+      database.exec("DROP TRIGGER fail_pre_reservation_intervention");
+      await expect(durableExecutionService(store, orca).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "recovery-round-pre-reservation-inspection",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "intervention_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: "orca-dispatch-1"
+      });
+
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "intervention_required", fenceReceipt: { ok: true } }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(store.loadRunRecord("run:proposal-1"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([
+        { kind: "stop_worker", dispatchId: "orca-dispatch-1" },
+        { kind: "stop_worker", dispatchId: "orca-dispatch-1" }
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("recovery-round atomically rolls back and resumes attempt-two exhaustion intervention", async () => {
+    // Break caught: the exhausted retry must remain launch_failed on transaction failure and replay into one coherent intervention without a third launch.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:recovery-round-attempt-two-exhaustion");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const locks = new DurableLocks(store);
+      const service = durableExecutionService(store, orca, undefined, locks, artifacts, git);
+      await service.start(authorized());
+      locks.persistLatestAcquire();
+      await expect(service.recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "recovery-round-attempt-one",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      database.exec(`
+        CREATE TRIGGER fail_attempt_two_intervention
+        BEFORE INSERT ON audit_events
+        WHEN NEW.event_type = 'lifecycle.transition'
+          AND json_extract(NEW.data_json, '$.entity') = 'task'
+          AND json_extract(NEW.data_json, '$.to') = 'intervention_required'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced attempt-two intervention failure');
+        END;
+      `);
+
+      await expect(service.recordLaunchFailure({
+        dispatchId: "orca-dispatch-2",
+        failureId: "recovery-round-attempt-two",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).rejects.toThrow("forced attempt-two intervention failure");
+
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failed" }, { state: "launch_failed" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "running" });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({ state: "active" });
+
+      database.exec("DROP TRIGGER fail_attempt_two_intervention");
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-2",
+        failureId: "recovery-round-attempt-two",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "intervention_required",
+        reason: "launch_retry_exhausted",
+        dispatchId: "orca-dispatch-2"
+      });
+
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failed" }, { state: "intervention_required" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(store.loadRunRecord("run:proposal-1"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("recovery-round repairs legacy partial intervention graphs with durable or derived fence outcomes", async () => {
+    // Break caught: hydration must complete legacy Dispatch-only and Dispatch+Task intervention graphs instead of returning early or accepting completion.
+    const observations: Array<Record<string, unknown>> = [];
+    const variants = [
+      {
+        id: "durable-failure",
+        taskState: "running" as const,
+        durableFenceFailure: true
+      },
+      {
+        id: "missing-fence",
+        taskState: "intervention_required" as const,
+        durableFenceFailure: false
+      }
+    ];
+    for (const variant of variants) {
+      const database = openDatabase(":memory:");
+      try {
+        seedDurableCommand(database, `test:recovery-round-legacy-${variant.id}`);
+        const store = new ControlStore(database);
+        const orca = new RecordingOrca();
+        await durableExecutionService(store, orca).start(authorized());
+        rewriteDurableLaunchGraph(database, {
+          dispatchState: "intervention_required",
+          taskState: variant.taskState,
+          mutateDispatch: (payload) => {
+            delete payload.fenceReceipt;
+            delete payload.fenceFailure;
+            if (variant.durableFenceFailure) {
+              payload.fenceFailure = {
+                code: "legacy_stop_ambiguous",
+                retryable: true
+              };
+            }
+          }
+        });
+        let result: unknown;
+        try {
+          result = await durableExecutionService(store, orca).recordWorkerMessage({
+            kind: "worker_done",
+            messageId: `done-against-legacy-${variant.id}`,
+            dispatchId: "orca-dispatch-1",
+            outcome: "completed",
+            summary: "must not be accepted"
+          });
+        } catch {
+          result = { kind: "threw" };
+        }
+        const [dispatch] = store.loadDispatchesForTask(
+          "task:proposal-1:implement"
+        ) as Array<Record<string, any>>;
+        observations.push({
+          variant: variant.id,
+          result,
+          dispatchState: dispatch?.state,
+          taskState: (store.loadTaskRecord("task:proposal-1:implement") as any)?.state,
+          runState: (store.loadRunRecord("run:proposal-1") as any)?.state,
+          fenceKind: dispatch?.fenceReceipt !== undefined
+            ? "receipt"
+            : dispatch?.fenceFailure !== undefined
+              ? "failure"
+              : "none",
+          stopCalls: orca.calls.filter(({ kind }) => kind === "stop_worker").length
+        });
+      } finally {
+        database.close();
+      }
+    }
+
+    expect(observations).toEqual([
+      {
+        variant: "durable-failure",
+        result: {
+          kind: "review_required",
+          reason: "launch_terminal_unproven",
+          dispatchId: "orca-dispatch-1"
+        },
+        dispatchState: "intervention_required",
+        taskState: "intervention_required",
+        runState: "intervention_required",
+        fenceKind: "failure",
+        stopCalls: 0
+      },
+      {
+        variant: "missing-fence",
+        result: {
+          kind: "review_required",
+          reason: "launch_terminal_unproven",
+          dispatchId: "orca-dispatch-1"
+        },
+        dispatchState: "intervention_required",
+        taskState: "intervention_required",
+        runState: "intervention_required",
+        fenceKind: "receipt",
+        stopCalls: 1
+      }
+    ]);
   });
 
   it("keeps attempt-one fences and intervenes when authoritative launch terminal proof is ambiguous", async () => {

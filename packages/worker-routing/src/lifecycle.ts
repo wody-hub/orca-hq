@@ -581,8 +581,13 @@ export class ExecutionLifecycle {
     if (current.state !== "launch_failure_reserved" || current.orcaDispatchId === undefined) {
       throw new Error(`Dispatch ${localDispatchId} has no launch-failure reservation`);
     }
+    const {
+      fenceReceipt: _staleFenceReceipt,
+      fenceFailure: _staleFenceFailure,
+      ...currentWithoutFenceOutcome
+    } = current;
     const updated = Object.freeze({
-      ...current,
+      ...currentWithoutFenceOutcome,
       state: "launch_failed" as const,
       launchFailureId: message.messageId,
       fenceReceipt

@@ -1462,7 +1462,7 @@ export class ExecutionService {
       try {
         await this.#inspectLaunchFailureWorker(lookup);
       } catch {
-        await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+        await this.#interveneUnprovenLaunch(lookup);
         return Object.freeze({
           kind: "intervention_required",
           reason: "launch_terminal_unproven",
@@ -1495,12 +1495,18 @@ export class ExecutionService {
           });
         }
       } catch (error) {
-        await this.#lifecycle.recordWorkerFence(
-          lookup.dispatch.localId,
-          input.dispatchId,
-          { fenceFailure: releaseFailure(error) }
-        );
-        await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+        const failedStop = this.#lifecycle.dispatch(lookup.dispatch.localId);
+        if (failedStop.fenceReceipt !== undefined && failedStop.fenceFailure !== undefined) {
+          throw new TypeError(
+            `Dispatch ${failedStop.id} has conflicting durable fence outcomes`
+          );
+        }
+        const outcome = failedStop.fenceReceipt !== undefined
+          ? { fenceReceipt: failedStop.fenceReceipt }
+          : {
+              fenceFailure: failedStop.fenceFailure ?? releaseFailure(error)
+            };
+        await this.#lifecycle.recordLaunchIntervention(lookup.dispatch.localId, outcome);
         return Object.freeze({
           kind: "intervention_required",
           reason: "launch_terminal_unproven",
@@ -1615,9 +1621,7 @@ export class ExecutionService {
     if (lookup.dispatch.placement.requiresEditingLease) await this.#release(lookup.run, lookup.dispatch);
 
     if (lookup.dispatch.attempt >= 2) {
-      await this.#lifecycle.transitionDispatch(lookup.dispatch.localId, "intervention_required");
-      await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
-      await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+      await this.#markLaunchFailureIntervention(lookup);
       return Object.freeze({
         kind: "intervention_required",
         reason: "launch_retry_exhausted",
@@ -1727,10 +1731,29 @@ export class ExecutionService {
   ): Promise<ExecutionReviewRequired | undefined> {
     const durableDispatch = this.#lifecycle.dispatch(lookup.dispatch.localId);
     const durableTask = this.#lifecycle.task(lookup.task.localId);
-    if (
-      durableDispatch.state === "intervention_required"
-      && (durableDispatch.fenceReceipt !== undefined || durableDispatch.fenceFailure !== undefined)
-    ) {
+    const durableRun = this.#lifecycle.run(lookup.run.localId);
+    if (durableDispatch.state === "intervention_required") {
+      const hasFenceReceipt = durableDispatch.fenceReceipt !== undefined;
+      const hasFenceFailure = durableDispatch.fenceFailure !== undefined;
+      const coherentIntervention = durableTask.state === "intervention_required"
+        && durableRun.state === "intervention_required";
+      if (!coherentIntervention || hasFenceReceipt === hasFenceFailure) {
+        if (hasFenceReceipt && !hasFenceFailure) {
+          await this.#lifecycle.recordLaunchIntervention(lookup.dispatch.localId, {
+            fenceReceipt: durableDispatch.fenceReceipt as OrcaReceipt
+          });
+        } else if (hasFenceFailure && !hasFenceReceipt) {
+          await this.#lifecycle.recordLaunchIntervention(lookup.dispatch.localId, {
+            fenceFailure: durableDispatch.fenceFailure as WorkerReleaseFailure
+          });
+        } else if (!hasFenceReceipt && !hasFenceFailure) {
+          await this.#interveneUnprovenLaunch(lookup);
+        } else {
+          throw new TypeError(
+            `Dispatch ${durableDispatch.id} has conflicting durable fence outcomes`
+          );
+        }
+      }
       return Object.freeze({
         kind: "review_required",
         reason: "launch_terminal_unproven",
