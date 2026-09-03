@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { ZodError } from "zod";
@@ -27,6 +27,8 @@ export interface GatewayHttpOptions {
   readonly peerAddress?: (request: FastifyRequest) => string;
   /** The one HTTPS dashboard origin allowed to submit state-changing requests. */
   readonly allowedOrigin?: string;
+  /** At least 32 bytes of stable signing material for session-bound CSRF tokens. */
+  readonly csrfSigningKey?: Uint8Array;
   /** Redacted dashboard queries; never pass persistence rows or channel credentials here. */
   readonly commands?: CommandDashboardPort;
   readonly projects?: ProjectDashboardPort;
@@ -80,6 +82,33 @@ function recognizedRole(principal: AuthenticatedPrincipal): boolean {
     role === "owner" || role === "operator" || role === "viewer");
 }
 
+function isClientError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("statusCode" in error)) return false;
+  return typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 500;
+}
+
+function csrfSigningKey(value: Uint8Array | undefined): Buffer | undefined {
+  if (value === undefined) return undefined;
+  const key = Buffer.from(value);
+  return key.length >= 32 ? key : undefined;
+}
+
+function csrfToken(key: Buffer, sessionToken: string, principalId: string): string {
+  return createHmac("sha256", key)
+    .update(sessionToken)
+    .update("\u0000")
+    .update(principalId)
+    .digest("base64url");
+}
+
+function validCsrfToken(value: string | undefined, expected: string): boolean {
+  if (value === undefined || !/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
+  const received = Buffer.from(value, "base64url");
+  if (received.length !== 32 || received.toString("base64url") !== value) return false;
+  const expectedBytes = Buffer.from(expected, "base64url");
+  return received.length === expectedBytes.length && timingSafeEqual(received, expectedBytes);
+}
+
 export interface GatewayRouteContext {
   authenticate(request: FastifyRequest): AuthenticatedPrincipal | undefined;
   canView(principal: AuthenticatedPrincipal): boolean;
@@ -96,14 +125,17 @@ export interface GatewayRouteContext {
 
 export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: false });
-  app.setErrorHandler((error, _request, reply) => error instanceof ZodError ? badRequest(reply) : internalError(reply));
+  app.setErrorHandler((error, _request, reply) =>
+    error instanceof ZodError || isClientError(error)
+      ? badRequest(reply)
+      : internalError(reply));
   app.setNotFoundHandler((_request, reply) => notFound(reply));
   const peerAddress = options.peerAddress ?? ((request: FastifyRequest) => request.raw.socket.remoteAddress ?? "");
   const inputFor = (request: FastifyRequest) => ({
     remoteAddress: peerAddress(request),
     headers: request.headers
   });
-  const csrfSessions = new Map<string, Readonly<{ principalId: string; token: string }>>();
+  const csrfKey = csrfSigningKey(options.csrfSigningKey);
 
   const authenticate = (request: FastifyRequest): AuthenticatedPrincipal | undefined => {
     const sessionToken = readLocalSessionCookie(request.headers.cookie);
@@ -127,8 +159,8 @@ export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
       if (!isConfiguredHttpsOrigin(options.allowedOrigin) || origin !== options.allowedOrigin) return { kind: "forbidden" };
       const sessionToken = readLocalSessionCookie(request.headers.cookie);
       const csrf = singleHeader(request.headers["x-csrf-token"]);
-      const session = sessionToken === undefined ? undefined : csrfSessions.get(sessionToken);
-      if (session === undefined || session.principalId !== principal.principalId || csrf !== session.token) {
+      if (csrfKey === undefined || sessionToken === undefined ||
+        !validCsrfToken(csrf, csrfToken(csrfKey, sessionToken, principal.principalId))) {
         return { kind: "forbidden" };
       }
       const idempotencyKey = singleHeader(request.headers["idempotency-key"]);
@@ -145,10 +177,8 @@ export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
     const login = resolveTailnetLogin(inputFor(request), options.bindings);
     if ("kind" in login) return unauthorized(reply);
     const issued = options.sessions.startLocalSession(login);
-    const csrfToken = randomBytes(32).toString("base64url");
-    csrfSessions.set(issued.token, { principalId: login.principalId, token: csrfToken });
     reply.header("set-cookie", issued.cookie);
-    reply.header("x-csrf-token", csrfToken);
+    if (csrfKey !== undefined) reply.header("x-csrf-token", csrfToken(csrfKey, issued.token, login.principalId));
     return reply.code(204).send();
   });
 

@@ -79,7 +79,8 @@ function createPorts() {
 
 function createApp(
   bindings: readonly PrincipalBinding[] = [owner, operator, viewer],
-  allowedOrigin = origin
+  allowedOrigin = origin,
+  csrfSigningKey = new Uint8Array(32).fill(9)
 ) {
   const ports = createPorts();
   const app = createHttpApp({
@@ -88,6 +89,7 @@ function createApp(
     sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(7) }),
     peerAddress: () => "127.0.0.1",
     allowedOrigin,
+    csrfSigningKey,
     ...ports
   });
   return { app, ...ports };
@@ -261,6 +263,102 @@ describe("gateway dashboard API", () => {
         expect(response.json()).toEqual({ error: "bad_request" });
       }
       expect(calls).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns a generic bad request for malformed JSON before authentication", async () => {
+    // Break caught: a Fastify parser error is flattened into a generic internal error before route authentication.
+    const { app } = createApp();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/actions/stop",
+        payload: "{oops",
+        headers: { "content-type": "application/json" }
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual({ error: "bad_request" });
+      expect(response.body).not.toContain("oops");
+      expect(response.body).not.toContain("JSON");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("derives CSRF tokens across instances and rejects a different principal or signing key", async () => {
+    // Break caught: CSRF state is process-local, or a token is not bound to both its session and authenticated principal.
+    const csrfSigningKey = new Uint8Array(32).fill(9);
+    const first = createApp([owner, viewer], origin, csrfSigningKey);
+    const second = createApp([owner, viewer], origin, csrfSigningKey);
+    const differentKey = createApp([owner, viewer], origin, new Uint8Array(32).fill(8));
+    try {
+      const ownerLogin = await first.app.inject({
+        method: "POST",
+        url: "/auth/session",
+        headers: { "tailscale-user-login": owner.tailscaleLoginNames[0]! }
+      });
+      const viewerLogin = await first.app.inject({
+        method: "POST",
+        url: "/auth/session",
+        headers: { "tailscale-user-login": viewer.tailscaleLoginNames[0]! }
+      });
+      const ownerCookie = ownerLogin.headers["set-cookie"]?.split(";")[0]!;
+      const ownerCsrf = ownerLogin.headers["x-csrf-token"] as string;
+      const viewerCsrf = viewerLogin.headers["x-csrf-token"] as string;
+      const headers = {
+        "tailscale-user-login": owner.tailscaleLoginNames[0]!,
+        cookie: ownerCookie,
+        origin,
+        "x-csrf-token": ownerCsrf,
+        "idempotency-key": "cross-instance"
+      };
+
+      expect((await second.app.inject({ method: "POST", url: "/api/actions/stop", payload: { dispatchId: "dispatch-1" }, headers })).statusCode)
+        .toBe(200);
+      expect((await differentKey.app.inject({ method: "POST", url: "/api/actions/stop", payload: { dispatchId: "dispatch-1" }, headers })).statusCode)
+        .toBe(403);
+      expect((await second.app.inject({
+        method: "POST",
+        url: "/api/actions/stop",
+        payload: { dispatchId: "dispatch-1" },
+        headers: { ...headers, "x-csrf-token": viewerCsrf }
+      })).statusCode).toBe(403);
+    } finally {
+      await first.app.close();
+      await second.app.close();
+      await differentKey.app.close();
+    }
+  });
+
+  it("fails closed for mutation APIs when the CSRF signing key is shorter than 32 bytes", async () => {
+    // Break caught: a weak or missing CSRF signing key still permits a state-changing request.
+    const { app } = createApp([owner], origin, new Uint8Array(31).fill(9));
+    try {
+      const login = await app.inject({
+        method: "POST",
+        url: "/auth/session",
+        headers: { "tailscale-user-login": owner.tailscaleLoginNames[0]! }
+      });
+      const cookie = login.headers["set-cookie"]?.split(";")[0]!;
+      const csrfToken = typeof login.headers["x-csrf-token"] === "string"
+        ? login.headers["x-csrf-token"]
+        : "A".repeat(43);
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/actions/stop",
+        payload: { dispatchId: "dispatch-1" },
+        headers: {
+          "tailscale-user-login": owner.tailscaleLoginNames[0]!,
+          cookie,
+          origin,
+          "x-csrf-token": csrfToken,
+          "idempotency-key": "short-key"
+        }
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({ error: "forbidden" });
     } finally {
       await app.close();
     }
