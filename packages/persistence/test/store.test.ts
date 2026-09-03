@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ApprovalConfirmation, CommandEnvelope } from "@orca-hq/core";
+import type { ApprovalConfirmation, CommandEnvelope, PersistedApprovalRequest } from "@orca-hq/core";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZodError } from "zod";
@@ -64,6 +64,57 @@ afterEach(() => {
 });
 
 describe("ControlStore", () => {
+  it("durably persists a redacted pending approval request across a restart", () => {
+    // Break caught: an approval request only exists in process memory until it is confirmed.
+    const path = temporaryDatabasePath();
+    const firstDatabase = openDatabase(path);
+    const firstStore = new ControlStore(firstDatabase);
+    firstStore.insertCommand(command);
+    firstDatabase.prepare(`
+      INSERT INTO execution_proposals (
+        id, command_id, project_registry_entry_id, state, payload_json, created_at, updated_at
+      ) VALUES (?, ?, NULL, 'proposed', '{}', ?, ?)
+    `).run("proposal-pending", command.commandId, "2026-09-01T10:00:00.000Z", "2026-09-01T10:00:00.000Z");
+    const request = {
+      approvalId: "approval-pending",
+      proposal: {
+        proposalId: "proposal-pending",
+        commandId: command.commandId,
+        selectedProjectKey: "project-a",
+        routeCandidates: [{ projectKey: "project-a", score: 1, evidence: ["explicit"] }],
+        baseRef: "main",
+        allowedScope: ["src/**"],
+        prohibitedEffects: ["delete_data"],
+        acceptanceCommands: ["pnpm test"],
+        riskLevel: "L3",
+        tasks: [{ localId: "implement", title: "Implement", dependsOn: [], role: "implement", preferredAgent: "codex" }]
+      },
+      operation: "deploy_production",
+      commandDigest: "a".repeat(64),
+      diffSha256: "b".repeat(64),
+      targetEnvironment: "production",
+      channel: "slack",
+      allowedChannels: ["slack", "tailscale-web"],
+      proposalDigest: "c".repeat(64),
+      digest: "d".repeat(64),
+      riskLevel: "L3",
+      typedPhraseDigest: "e".repeat(64)
+    } satisfies PersistedApprovalRequest;
+
+    firstStore.persistApprovalRequest(request);
+    expect(firstStore.findApproval(request.approvalId)).toEqual({
+      request,
+      state: "pending"
+    });
+    expect(firstDatabase.prepare("SELECT payload_json FROM approvals WHERE id = ?").get(request.approvalId))
+      .not.toEqual(expect.objectContaining({ payload_json: expect.stringContaining("APPROVE ") }));
+    firstDatabase.close();
+
+    const reopened = openDatabase(path);
+    openDatabases.push(reopened);
+    expect(new ControlStore(reopened).findApproval(request.approvalId)).toEqual({ request, state: "pending" });
+  });
+
   it("persists, consumes, and audits an invalidated approval without persisting its phrase", () => {
     // Break caught: a changed operation can retain an active approval or its L3 phrase in SQLite.
     const database = openDatabase(temporaryDatabasePath());
@@ -86,24 +137,74 @@ describe("ControlStore", () => {
       typedPhraseDigest: "c".repeat(64),
       executionProposalId: "proposal-approval"
     } satisfies ApprovalConfirmation;
+    store.persistApprovalRequest({
+      approvalId: approval.approvalId,
+      proposal: {
+        proposalId: approval.executionProposalId,
+        commandId: command.commandId,
+        selectedProjectKey: "project-a",
+        routeCandidates: [{ projectKey: "project-a", score: 1, evidence: ["explicit"] }],
+        baseRef: "main",
+        allowedScope: ["src/**"],
+        prohibitedEffects: ["delete_data"],
+        acceptanceCommands: ["pnpm test"],
+        riskLevel: "L3",
+        tasks: [{ localId: "implement", title: "Implement", dependsOn: [], role: "implement", preferredAgent: "codex" }]
+      },
+      operation: "deploy_production",
+      commandDigest: "d".repeat(64),
+      diffSha256: "e".repeat(64),
+      targetEnvironment: "production",
+      channel: approval.channel,
+      allowedChannels: ["slack", "tailscale-web"],
+      proposalDigest: approval.proposalDigest,
+      digest: approval.operationDigest,
+      riskLevel: "L3",
+      typedPhraseDigest: approval.typedPhraseDigest
+    } satisfies PersistedApprovalRequest);
 
     expect(store.confirmApproval(approval)).toEqual(
       expect.objectContaining({ approvalId: approval.approvalId, typedPhraseDigest: approval.typedPhraseDigest })
     );
-    expect(store.findApproval(approval.approvalId)).toEqual({
+    expect(store.findApproval(approval.approvalId)).toEqual(expect.objectContaining({
       approval: expect.objectContaining({ approvalId: approval.approvalId }),
       state: "approved"
-    });
+    }));
     expect(store.consumeApproval(approval.approvalId)).toBe(true);
     expect(store.consumeApproval(approval.approvalId)).toBe(false);
 
     const changed = { ...approval, approvalId: "approval-changed" } satisfies ApprovalConfirmation;
+    store.persistApprovalRequest({
+      approvalId: changed.approvalId,
+      proposal: {
+        proposalId: changed.executionProposalId,
+        commandId: command.commandId,
+        selectedProjectKey: "project-a",
+        routeCandidates: [{ projectKey: "project-a", score: 1, evidence: ["explicit"] }],
+        baseRef: "main",
+        allowedScope: ["src/**"],
+        prohibitedEffects: ["delete_data"],
+        acceptanceCommands: ["pnpm test"],
+        riskLevel: "L3",
+        tasks: [{ localId: "implement", title: "Implement", dependsOn: [], role: "implement", preferredAgent: "codex" }]
+      },
+      operation: "deploy_production",
+      commandDigest: "d".repeat(64),
+      diffSha256: "e".repeat(64),
+      targetEnvironment: "production",
+      channel: changed.channel,
+      allowedChannels: ["slack", "tailscale-web"],
+      proposalDigest: changed.proposalDigest,
+      digest: changed.operationDigest,
+      riskLevel: "L3",
+      typedPhraseDigest: changed.typedPhraseDigest
+    } satisfies PersistedApprovalRequest);
     store.confirmApproval(changed);
     expect(store.invalidateApproval(changed.approvalId, "digest_changed")).toBe(true);
-    expect(store.findApproval(changed.approvalId)).toEqual({
+    expect(store.findApproval(changed.approvalId)).toEqual(expect.objectContaining({
       approval: expect.objectContaining({ approvalId: changed.approvalId }),
       state: "invalidated"
-    });
+    }));
     expect(store.listAuditEvents()).toEqual(expect.arrayContaining([
       expect.objectContaining({
         subjectId: changed.approvalId,

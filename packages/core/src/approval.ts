@@ -45,9 +45,16 @@ export const ApprovalRequestSchema = ApprovalRequestInputSchema.extend({
   typedPhraseDigest: Sha256Schema.optional()
 }).strict();
 
+export const PersistedApprovalRequestSchema = ApprovalRequestSchema.omit({
+  operationPhrase: true
+}).strict();
+
+export const ApprovalStateSchema = z.enum(["pending", "approved", "invalidated", "expired", "consumed"]);
+
 export const PersistedApprovalSchema = z.object({
-  approval: ApprovalRecordSchema,
-  state: z.enum(["approved", "consumed", "invalidated"])
+  request: PersistedApprovalRequestSchema,
+  approval: ApprovalRecordSchema.optional(),
+  state: ApprovalStateSchema
 }).strict();
 
 export const ApprovalConfirmationSchema = ApprovalRecordSchema.extend({
@@ -57,6 +64,7 @@ export const ApprovalConfirmationSchema = ApprovalRecordSchema.extend({
 export type ApprovalRequestInput = z.infer<typeof ApprovalRequestInputSchema>;
 export type ApprovalValidationInput = z.infer<typeof ApprovalValidationInputSchema>;
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
+export type PersistedApprovalRequest = z.infer<typeof PersistedApprovalRequestSchema>;
 export type PersistedApproval = z.infer<typeof PersistedApprovalSchema>;
 export type ApprovalConfirmation = z.infer<typeof ApprovalConfirmationSchema>;
 
@@ -64,16 +72,23 @@ export type ApprovalDecision =
   | Readonly<{ kind: "approved"; id?: string }>
   | Readonly<{
       kind: "denied";
-      reason: "channel_not_allowed" | "role" | "phrase_mismatch" | "not_found" | "replayed";
+      reason: "channel_not_allowed" | "role" | "phrase_mismatch" | "not_found" | "replayed" | "pending";
     }>
   | Readonly<{ kind: "expired" }>
   | Readonly<{ kind: "changed" }>;
 
 export interface ApprovalStore {
+  persistApprovalRequest(request: PersistedApprovalRequest): void;
   confirmApproval(approval: ApprovalConfirmation): ApprovalRecord;
   findApproval(approvalId: string): PersistedApproval | undefined;
   consumeApproval(approvalId: string): boolean;
   invalidateApproval(approvalId: string, reason: "digest_changed" | "manual"): boolean;
+  expireApproval(approvalId: string): boolean;
+  recordApprovalAudit(
+    approvalId: string,
+    eventType: "approval.denied" | "approval.tamper_rejected" | "approval.invalidation_rejected",
+    reason: string
+  ): void;
 }
 
 export type ApprovalPrincipal = z.infer<typeof PrincipalBindingSchema>;
