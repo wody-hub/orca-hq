@@ -239,7 +239,11 @@ function boundaries(
       projectRegistryPath,
       discoveredProjects: [{ orcaProjectId: "orca-sandbox", absolutePath: directory, approved: true }],
       assignmentArtifactRootDirectory: join(directory, "assignments"),
-      outboxWorkerId: "gateway-e2e"
+      outboxWorkerId: "gateway-e2e",
+      completionDestinations: {
+        slack: "C-HQ-COMPLETIONS",
+        tailscaleWeb: "/commands/completed"
+      }
     },
     secrets: { async validate() {} },
     orca,
@@ -300,6 +304,12 @@ function boundaries(
     telegram: { async start() {}, async stopIngress() {} },
     transactions: { async drain() {} },
     outboundProviders: {
+      slack: {
+        async deliver(message) {
+          deliveries.push((message.payload as { text: string }).text);
+          return { providerMessageId: "slack-9001" };
+        }
+      },
       telegram: {
         async deliver(message) {
           return deliverTelegramMessage(message, {
@@ -308,6 +318,12 @@ function boundaries(
               return { messageId: 9001 };
             }
           });
+        }
+      },
+      "tailscale-web": {
+        async deliver(message) {
+          deliveries.push((message.payload as { text: string }).text);
+          return { providerMessageId: "tailscale-9001" };
         }
       }
     },
@@ -346,6 +362,24 @@ async function acceptTelegram501(
     text: command.text
   });
   return command;
+}
+
+async function acceptDurableCommand(
+  composition: Awaited<ReturnType<typeof createProductionGateway>>,
+  channel: "slack" | "tailscale-web"
+) {
+  const commandId = `command-${channel}`;
+  composition.services.store.insertCommand({
+    commandId,
+    idempotencyKey: `test:${commandId}`,
+    channel,
+    externalMessageId: `${channel}:501`,
+    principalId: "owner",
+    receivedAt: "2026-09-03T00:00:00.000Z",
+    text: "샌드박스 프로젝트 테스트 수정해줘"
+  });
+  await composition.gateway.acceptCommand({ commandId, channel, text: "샌드박스 프로젝트 테스트 수정해줘" });
+  return composition.services.store.listCommands().find((command) => command.commandId === commandId);
 }
 
 async function completeImplementationAndVerifier(
@@ -425,6 +459,55 @@ describe("Gateway production state machine E2E", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["slack", "C-HQ-COMPLETIONS", "slack-9001"],
+    ["tailscale-web", "/commands/completed", "tailscale-9001"]
+  ] as const)(
+    "commits and delivers a verified-success Outbox for %s with a configured destination",
+    async (channel, destination, providerMessageId) => {
+      // Break caught: resolving a configured non-Telegram destination can interrupt the durable verification commit.
+      const directory = await mkdtemp(join(tmpdir(), `orca-production-e2e-${channel}-`));
+      const deliveries: string[] = [];
+      const orca = new FakeOrcaBoundary();
+      let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+      try {
+        const host = await createGatewayHost(async () => boundaries(directory, orca, deliveries));
+        composition = await createProductionGateway(host.config, host.dependencies);
+        await composition.gateway.start();
+        const command = await acceptDurableCommand(composition, channel);
+        if (command === undefined) throw new Error(`${channel} command missing`);
+        const verificationTask = await completeImplementationAndVerifier(composition);
+
+        await composition.services.execution.recordVerificationReport(reportFor(verificationTask, "pass"));
+        await composition.services.outbox.tick("2026-09-03T00:00:00.000Z");
+
+        expect(composition.services.store.listRunRecords()).toEqual([
+          expect.objectContaining({
+            id: "run:proposal-command-501",
+            commandId: command.commandId,
+            state: "verified_success"
+          })
+        ]);
+        expect(composition.services.store.listAuditEvents().map(({ eventType }) => eventType))
+          .toContain("verification.passed");
+        expect(composition.services.store.listOutbox()).toEqual([
+          expect.objectContaining({
+            id: "report-command-501:success",
+            commandId: command.commandId,
+            channel,
+            destination,
+            state: "delivered",
+            providerMessageId
+          })
+        ]);
+        expect(deliveries).toEqual(["검증 완료"]);
+      } finally {
+        await composition?.gateway.stop();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  );
 
   it("keeps failed verifier evidence durable and blocks verified success delivery", async () => {
     // Break caught: verifier failure can still mark the Run successful or enqueue the same success message.

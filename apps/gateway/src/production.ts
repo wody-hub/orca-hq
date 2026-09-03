@@ -83,10 +83,10 @@ export interface GatewayProductionDependencies {
   readonly dispatchControl: GatewayDispatchControlPort;
   /** Injectable clock for approval expiry tests; production defaults to the system clock. */
   readonly now?: () => Date;
-  readonly completionDestinations?: Readonly<{
-    slack?: string | undefined;
-    tailscaleWeb?: string | undefined;
-  }> | undefined;
+  readonly completionDestinations: Readonly<{
+    slack: string;
+    tailscaleWeb: string;
+  }>;
 }
 
 export interface GatewayProductionServices {
@@ -186,6 +186,27 @@ function repositoryHq(
   });
 }
 
+function requireCompletionDestinations(
+  value: unknown
+): GatewayProductionDependencies["completionDestinations"] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Gateway completion delivery configuration is unavailable");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.slack !== "string"
+    || candidate.slack.trim().length === 0
+    || typeof candidate.tailscaleWeb !== "string"
+    || candidate.tailscaleWeb.trim().length === 0
+  ) {
+    throw new Error("Gateway completion delivery configuration is unavailable");
+  }
+  return Object.freeze({
+    slack: candidate.slack.trim(),
+    tailscaleWeb: candidate.tailscaleWeb.trim()
+  });
+}
+
 function verificationCompletionTarget(
   store: ControlStore,
   report: VerificationReport,
@@ -205,9 +226,9 @@ function verificationCompletionTarget(
     const separator = command.externalMessageId.lastIndexOf(":");
     destination = separator > 0 ? command.externalMessageId.slice(0, separator) : undefined;
   } else if (command.channel === "slack") {
-    destination = destinations?.slack;
+    destination = destinations.slack;
   } else {
-    destination = destinations?.tailscaleWeb;
+    destination = destinations.tailscaleWeb;
   }
   if (destination === undefined || destination.length === 0) {
     throw new Error(`Verification delivery destination for ${command.channel} is unavailable`);
@@ -246,6 +267,9 @@ export async function createProductionGateway(
   config: GatewayConfig,
   dependencies: GatewayProductionDependencies
 ): Promise<Readonly<{ gateway: Gateway; services: GatewayProductionServices }>> {
+  const completionDestinations = requireCompletionDestinations(
+    dependencies.completionDestinations
+  );
   // Database construction is deliberately deferred to database.migrate: config/secret
   // validation is the first lifecycle operation and a rejected config leaves no handle.
   let services: GatewayProductionServices | undefined;
@@ -280,7 +304,7 @@ export async function createProductionGateway(
               store,
               report,
               now,
-              dependencies.completionDestinations
+              completionDestinations
             )
           });
           const execution = new ExecutionService({

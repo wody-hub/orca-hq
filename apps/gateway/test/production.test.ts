@@ -36,7 +36,8 @@ function dependencies(events: string[], valid = true): GatewayProductionDependen
     http: ingress("http"), slack: ingress("slack"), telegram: ingress("telegram"),
     transactions: { async drain() { events.push("transactions.drained"); } },
     outbox: { workerId: "test", providers: {} },
-    dispatchControl: { async stop() { return false; }, async retry() { return false; } }
+    dispatchControl: { async stop() { return false; }, async retry() { return false; } },
+    completionDestinations: { slack: "C-HQ-COMPLETIONS", tailscaleWeb: "/commands/completed" }
   };
 }
 
@@ -73,6 +74,33 @@ describe("production gateway composition", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["Slack", { tailscaleWeb: "/commands/completed" }],
+    ["tailscale-web", { slack: "C-HQ-COMPLETIONS" }]
+  ] as const)(
+    "rejects a missing %s completion destination before database or ingress use",
+    async (_channel, completionDestinations) => {
+      // Break caught: callers bypassing host validation can defer an incomplete delivery contract until verification commit.
+      const directory = await mkdtemp(join(tmpdir(), "orca-production-destination-"));
+      const path = join(directory, "control.sqlite");
+      const events: string[] = [];
+      const invalid = {
+        ...dependencies(events),
+        completionDestinations
+      } as unknown as GatewayProductionDependencies;
+      try {
+        await expect(createProductionGateway(
+          { databasePath: path, shutdownDrainMs: 1_000 },
+          invalid
+        )).rejects.toThrow("Gateway completion delivery configuration is unavailable");
+        await expect(access(path)).rejects.toThrow();
+        expect(events).toEqual([]);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  );
 
   it("closes the opened database when HTTP composition fails before lifecycle ownership", async () => {
     // Break caught: an http/httpOptions composition failure leaves the SQLite handle open after stop.

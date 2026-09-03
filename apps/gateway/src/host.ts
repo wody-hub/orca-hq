@@ -40,10 +40,10 @@ export type GatewayHostSettings = Readonly<{
   assignmentArtifactRootDirectory: string;
   outboxWorkerId: string;
   slackHqDestination?: string | undefined;
-  completionDestinations?: Readonly<{
-    slack?: string | undefined;
-    tailscaleWeb?: string | undefined;
-  }> | undefined;
+  completionDestinations: Readonly<{
+    slack: string;
+    tailscaleWeb: string;
+  }>;
 }>;
 
 /**
@@ -78,6 +78,10 @@ export type GatewayHost = Readonly<{
 export type GatewayHostFactory = () => Promise<GatewayHost>;
 
 const NonBlankStringSchema = z.string().trim().min(1);
+const CompletionDestinationsSchema = z.object({
+  slack: NonBlankStringSchema,
+  tailscaleWeb: NonBlankStringSchema
+}).strict();
 
 function unavailable(): Error {
   return new Error("Gateway configuration or secret provider is unavailable");
@@ -125,6 +129,9 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
       settings.assignmentArtifactRootDirectory
     );
     const outboxWorkerId = NonBlankStringSchema.parse(settings.outboxWorkerId);
+    const completionDestinations = CompletionDestinationsSchema.parse(
+      settings.completionDestinations
+    );
     requireMethods(candidate.secrets, ["validate"]);
     requireMethods(candidate.orca, ["health", "execute"]);
     requireMethods(candidate.proposalModel, ["plan"]);
@@ -160,12 +167,10 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
       ),
       assignmentArtifactRootDirectory,
       outboxWorkerId,
+      completionDestinations: Object.freeze({ ...completionDestinations }),
       ...(settings.slackHqDestination === undefined
         ? {}
-        : { slackHqDestination: NonBlankStringSchema.parse(settings.slackHqDestination) }),
-      ...(settings.completionDestinations === undefined
-        ? {}
-        : { completionDestinations: settings.completionDestinations as GatewayHostSettings["completionDestinations"] })
+        : { slackHqDestination: NonBlankStringSchema.parse(settings.slackHqDestination) })
     });
     return Object.freeze({
       ...(candidate as unknown as GatewayExternalBoundaries),
@@ -225,9 +230,7 @@ export function assembleGatewayHost(boundariesValue: unknown): GatewayHost {
         : { slackHqDestination: settings.slackHqDestination })
     },
     dispatchControl: boundaries.dispatchControl,
-    ...(settings.completionDestinations === undefined
-      ? {}
-      : { completionDestinations: settings.completionDestinations }),
+    completionDestinations: settings.completionDestinations,
     ...(boundaries.now === undefined ? {} : { now: boundaries.now })
   };
   return Object.freeze({ config: settings.gateway, dependencies: Object.freeze(dependencies) });

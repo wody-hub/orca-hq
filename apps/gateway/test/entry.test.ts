@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +47,11 @@ function externalBoundaries(directory: string, events: string[]): GatewayExterna
       projectRegistryPath,
       discoveredProjects: [{ orcaProjectId: "orca-sandbox", absolutePath: directory, approved: true }],
       assignmentArtifactRootDirectory: join(directory, "assignments"),
-      outboxWorkerId: "entry-test"
+      outboxWorkerId: "entry-test",
+      completionDestinations: {
+        slack: "C-HQ-COMPLETIONS",
+        tailscaleWeb: "/commands/completed"
+      }
     },
     secrets: { async validate() { events.push("config.valid"); } },
     orca: {
@@ -120,4 +124,37 @@ describe("gateway production entry", () => {
       dependencies: {}
     }))).rejects.toThrow("Gateway configuration or secret provider is unavailable");
   });
+
+  it.each([
+    ["Slack", "slack"],
+    ["tailscale-web", "tailscaleWeb"]
+  ] as const)(
+    "rejects a missing %s completion destination before database or ingress use",
+    async (_channel, omittedDestination) => {
+      // Break caught: an optional completion destination can fail after successful verification but before its durable commit.
+      const directory = await mkdtemp(join(tmpdir(), "orca-entry-destination-"));
+      const events: string[] = [];
+      const databasePath = join(directory, "control.sqlite");
+      try {
+        const complete = externalBoundaries(directory, events);
+        const invalid = {
+          ...complete,
+          settings: {
+            ...complete.settings,
+            completionDestinations: omittedDestination === "slack"
+              ? { tailscaleWeb: complete.settings.completionDestinations?.tailscaleWeb }
+              : { slack: complete.settings.completionDestinations?.slack }
+          }
+        };
+
+        await expect(createGatewayHost(async () => invalid)).rejects.toThrow(
+          "Gateway configuration or secret provider is unavailable"
+        );
+        await expect(access(databasePath)).rejects.toThrow();
+        expect(events).toEqual([]);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  );
 });
