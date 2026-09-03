@@ -28,6 +28,9 @@ export default defineConfig({
       "@orca-hq/orca-adapter": fileURLToPath(
         new URL("./packages/orca-adapter/src/index.ts", import.meta.url)
       ),
+      "@orca-hq/observability": fileURLToPath(
+        new URL("./packages/observability/src/index.ts", import.meta.url)
+      ),
       "@orca-hq/persistence": fileURLToPath(
         new URL("./packages/persistence/src/index.ts", import.meta.url)
       ),

@@ -8,6 +8,7 @@
       "@orca-hq/core": ["packages/core/src/index.ts"],
       "@orca-hq/codex-hq": ["packages/codex-hq/src/index.ts"],
       "@orca-hq/orca-adapter": ["packages/orca-adapter/src/index.ts"],
+      "@orca-hq/observability": ["packages/observability/src/index.ts"],
       "@orca-hq/persistence": ["packages/persistence/src/index.ts"],
       "@orca-hq/project-registry": ["packages/project-registry/src/index.ts"],
       "@orca-hq/slack-adapter": ["packages/slack-adapter/src/index.ts"],

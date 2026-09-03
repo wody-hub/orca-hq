@@ -1,4 +1,6 @@
 import { Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 import {
   createLogger,
@@ -7,9 +9,35 @@ import {
   redactDeep,
   safeErrorSerializer
 } from "@orca-hq/observability";
+import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 describe("observability privacy boundary", () => {
+  it("lets an external root TypeScript consumer resolve the public name to the source entry", () => {
+    // Break caught: workspace consumers fall back to an unavailable dist declaration instead of the source API.
+    const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
+    const configPath = resolve(workspaceRoot, "tsconfig.json");
+    const config = ts.readConfigFile(configPath, ts.sys.readFile);
+    const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, workspaceRoot);
+    const resolution = ts.resolveModuleName(
+      "@orca-hq/observability",
+      resolve(workspaceRoot, "packages/core/src/observability-consumer.ts"),
+      parsed.options,
+      ts.sys
+    );
+
+    expect(resolution.resolvedModule?.resolvedFileName).toBe(
+      resolve(workspaceRoot, "packages/observability/src/index.ts")
+    );
+  });
+
+  it("loads the public name at the Vitest runtime boundary", async () => {
+    // Break caught: a workspace alias is accepted by TypeScript but cannot load the public API in test runtime.
+    const publicApi = await import("@orca-hq/observability");
+
+    expect(publicApi.redactDeep({ token: "runtime-secret" })).toEqual({ token: "[Redacted]" });
+  });
+
   it.each(["authorization", "token", "cookie", "voiceUrl", "signedUrl"])(
     "redacts %s wherever it appears in structured data",
     (key) => {

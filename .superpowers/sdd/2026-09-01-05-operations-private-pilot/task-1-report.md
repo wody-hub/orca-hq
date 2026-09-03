@@ -92,3 +92,39 @@ git diff --check
 ### 남은 우려사항
 
 진단 staging 디렉터리의 archive 및 정리는 원래 범위대로 후속 명시적 확인 CLI의 책임으로 남아 있다. 이 패키지는 upload/telemetry 경로를 추가하지 않았다.
+
+## 수정 라운드 2/5
+
+### TDD 기록
+
+RED는 `packages/observability/test/redaction.test.ts`의 `lets an external root TypeScript consumer resolve the public name to the source entry`로 시작했다. 이 테스트는 `packages/core/src/observability-consumer.ts`를 consumer 위치로 하여 루트 `tsconfig.json`을 실제 TypeScript resolver에 전달하고, 공개 패키지 이름이 source entry로 해석되는지를 검증한다. 구현 전 `pnpm test packages/observability/test/redaction.test.ts`는 예상대로 `expected undefined to be '/Users/j.jaeyo/orca/workspaces/orca-hq/hq-channels-agents/packages/observability/src/index.ts'`로 실패했다.
+
+`tsconfig.json` paths와 `vitest.config.ts` alias에 `@orca-hq/observability`를 기존 워크스페이스 패키지와 같은 source entry 형식으로 각각 한 건씩 추가한 뒤 GREEN을 확인했다. 함께 추가한 `loads the public name at the Vitest runtime boundary`는 실제 dynamic import로 공개 이름의 Vitest runtime 로드를 검증하며, 설정 소스 문자열을 비교하지 않는다.
+
+### 검증
+
+실행 명령:
+
+```sh
+pnpm test packages/observability/test/redaction.test.ts
+pnpm --filter @orca-hq/observability typecheck
+pnpm typecheck
+pnpm test
+git diff --check
+```
+
+핵심 출력: focused test 1 파일 14 테스트 통과, observability package typecheck 통과, 루트 typecheck 통과, 전체 Vitest 31 파일 545 테스트 통과, `git diff --check` 통과.
+
+### 해결 근거
+
+관측성 패키지의 self-mapping이나 이미 생성된 `dist`에 의존하지 않고, 다른 컴포넌트인 `packages/core/src`를 기준으로 루트 TypeScript resolver가 `packages/observability/src/index.ts`를 반환한다. 같은 공개 이름은 Vitest runtime에서도 실제로 import되어 `redactDeep`의 public API 동작까지 확인한다. 라운드 1의 logger, redaction, diagnostics 및 package 설정은 변경하지 않아 앞선 7개 finding을 되돌리지 않았다.
+
+### 변경 파일
+
+- `tsconfig.json`
+- `vitest.config.ts`
+- `packages/observability/test/redaction.test.ts`
+
+### 남은 우려사항
+
+관측성 package build가 `dist/test/**`를 산출하는 기존 deferred minor는 이번 공개 이름 resolver finding의 해결에 필요하지 않아 변경하지 않았다.
