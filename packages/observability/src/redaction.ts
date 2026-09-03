@@ -10,8 +10,6 @@ const SENSITIVE_KEYS = new Set([
   "voiceurl"
 ]);
 
-const COMPANY_DATA_PATTERN = /company-[\w-]+/gi;
-
 export interface RedactionOptions {
   readonly secretPatterns?: readonly RegExp[];
   readonly pathDisclosure?: "basename" | "redact";
@@ -26,7 +24,7 @@ function isPathKey(key: string): boolean {
 }
 
 function redactString(value: string, secretPatterns: readonly RegExp[]): string {
-  let redacted = value.replace(COMPANY_DATA_PATTERN, REDACTED_VALUE);
+  let redacted = value;
   for (const pattern of secretPatterns) {
     const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
     redacted = redacted.replace(new RegExp(pattern.source, flags), REDACTED_VALUE);

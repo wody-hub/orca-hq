@@ -1,91 +1,114 @@
 import { Writable } from "node:stream";
 
+import {
+  createLogger,
+  createPilotCounters,
+  diagnostics,
+  redactDeep,
+  safeErrorSerializer
+} from "@orca-hq/observability";
 import { describe, expect, it } from "vitest";
-
-const observability = await import("../src/index.js").catch(() => ({}));
-const { createLogger, createPilotCounters, diagnostics, redactDeep } = observability as {
-  createLogger?: (destination?: Writable) => { info: (event: unknown, message?: string) => void };
-  createPilotCounters?: (initial?: Readonly<Record<string, number>>) => {
-    increment: (name: string, amount?: number) => void;
-    snapshot: () => Readonly<Record<string, number>>;
-  };
-  diagnostics?: {
-    create: (input: {
-      version: string;
-      capabilities: readonly string[];
-      schema: string;
-      health: unknown;
-      counters: Record<string, number>;
-      auditReferences: readonly string[];
-      includeFullContent: false;
-      secretPatterns: readonly RegExp[];
-      pathDisclosure: "basename";
-    }) => Promise<{
-      stagingPath: string;
-      manifest: { files: readonly string[]; auditReferences: readonly string[] };
-      text: () => string;
-    }>;
-  };
-  redactDeep?: (value: unknown, options?: { secretPatterns?: readonly RegExp[]; pathDisclosure?: "basename" }) => unknown;
-};
 
 describe("observability privacy boundary", () => {
   it.each(["authorization", "token", "cookie", "voiceUrl", "signedUrl"])(
     "redacts %s wherever it appears in structured data",
     (key) => {
       // Break caught: adding a new event field bypasses the key-based secret filter.
-      expect(redactDeep?.({ outer: { [key]: "secret-value" } })).toEqual({
+      expect(redactDeep({ outer: { [key]: "secret-value" } })).toEqual({
         outer: { [key]: "[Redacted]" }
       });
     }
   );
 
-  it("redacts configured patterns, company paths, prompts, and transcripts", () => {
-    // Break caught: an unrecognized secret or company content reaches a diagnostic payload.
+  it("redacts caller-configured company data and applies the path disclosure policy", () => {
+    // Break caught: a fixture-specific company rule hides only a literal instead of caller-provided private data.
     expect(
-      redactDeep?.(
+      redactDeep(
         {
-          note: "api_key=secret-pattern company-project-path",
-          prompt: "private customer prompt",
-          transcript: "private call transcript",
-          sourcePath: "/company-project-path/private/runtime.sqlite"
+          workspace: "/Users/someone/orca/workspaces/orca-hq/hq-channels-agents",
+          legacyFixture: "company-project-path",
+          sourcePath: "/Users/someone/orca/workspaces/orca-hq/hq-channels-agents/runtime.sqlite"
         },
-        { secretPatterns: [/api_key=[^\s]+/], pathDisclosure: "basename" }
+        {
+          secretPatterns: [
+            /\/Users\/someone\/orca\/workspaces\/orca-hq\/hq-channels-agents/,
+            /company-project-path/
+          ],
+          pathDisclosure: "basename"
+        }
       )
     ).toEqual({
-      note: "[Redacted] [Redacted]",
-      prompt: "[Redacted]",
-      transcript: "[Redacted]",
+      workspace: "[Redacted]",
+      legacyFixture: "[Redacted]",
       sourcePath: "runtime.sqlite"
     });
   });
 
-  it("exports a reviewable manifest without raw prompts or transcripts", async () => {
-    // Break caught: staged diagnostics include raw runtime data before user archive confirmation.
-    const bundle = await diagnostics?.create({
+  it("does not impose a universal company-name redaction rule", () => {
+    // Break caught: a fixture-specific company prefix becomes an undocumented global data policy.
+    expect(redactDeep({ label: "company-private-identifier" })).toEqual({
+      label: "company-private-identifier"
+    });
+  });
+
+  it("exports a complete redacted manifest without raw prompts or transcripts", async () => {
+    // Break caught: staged diagnostics include raw runtime data or omit the reviewable manifest contract.
+    const bundle = await diagnostics.create({
       version: "2026.09.01",
       capabilities: ["gateway.health"],
       schema: "orca-hq.diagnostics.v1",
-      health: { workspace: "company-project-path", authorization: "Bearer secret-value" },
+      health: {
+        workspace: "/Users/someone/orca/workspaces/orca-hq/hq-channels-agents",
+        authorization: "Bearer secret-value",
+        prompt: "private customer prompt",
+        transcript: "private call transcript",
+        nested: { token: "nested secret" }
+      },
       counters: { commandsProcessed: 3 },
       auditReferences: ["audit:dispatch:123"],
       includeFullContent: false,
-      secretPatterns: [/secret-value/],
+      secretPatterns: [
+        /\/Users\/someone\/orca\/workspaces\/orca-hq\/hq-channels-agents/,
+        /secret-value/,
+        /company-project-path/
+      ],
       pathDisclosure: "basename"
     });
 
-    expect(bundle?.stagingPath).toContain("diagnostics");
-    expect(bundle?.manifest.files).toEqual(["manifest.json"]);
-    expect(bundle?.manifest.files).not.toContain("runtime.sqlite");
-    expect(bundle?.manifest.auditReferences).toEqual(["audit:dispatch:123"]);
-    expect(bundle?.text()).not.toContain("company-project-path");
-    expect(bundle?.text()).not.toContain("secret-value");
-    expect(bundle?.text()).not.toContain("prompt");
-    expect(bundle?.text()).not.toContain("transcript");
+    expect(bundle.stagingPath).toContain("diagnostics");
+    expect(bundle.manifest).toMatchObject({
+      version: "2026.09.01",
+      capabilities: ["gateway.health"],
+      schema: "orca-hq.diagnostics.v1",
+      counters: { commandsProcessed: 3 },
+      auditReferences: ["audit:dispatch:123"],
+      files: ["manifest.json"]
+    });
+    expect(bundle.manifest.health).toEqual({ workspace: "[Redacted]", nested: {} });
+    expect(bundle.manifest.files).not.toContain("runtime.sqlite");
+    expect(bundle.text()).not.toContain("secret-value");
+    expect(bundle.text()).not.toContain("private customer prompt");
+    expect(bundle.text()).not.toContain("private call transcript");
+    expect(bundle.text()).not.toContain("company-project-path");
   });
 
-  it("keeps Pino logs redacted at the destination boundary", () => {
-    // Break caught: a logger writes secrets before redaction is applied.
+  it("supports the brief's minimal diagnostic creation call with safe manifest defaults", async () => {
+    // Break caught: callers cannot create a privacy-safe diagnostic bundle without inventing unrelated metadata.
+    const bundle = await diagnostics.create({ includeFullContent: false });
+
+    expect(bundle.manifest).toEqual({
+      version: "unknown",
+      capabilities: [],
+      schema: "orca-hq.diagnostics.v1",
+      health: {},
+      counters: {},
+      auditReferences: [],
+      files: ["manifest.json"]
+    });
+  });
+
+  it("redacts arbitrary-depth and array secrets at the Pino destination boundary", () => {
+    // Break caught: Pino path rules redact only shallow event fields while nested payload bytes leak.
     let output = "";
     const destination = new Writable({
       write(chunk, _encoding, callback) {
@@ -94,22 +117,36 @@ describe("observability privacy boundary", () => {
       }
     });
 
-    createLogger?.(destination).info(
-      { authorization: "Bearer secret-value", nested: { signedUrl: "https://signed.example/secret" } },
-      "request complete"
-    );
+    createLogger(destination).info({
+      req: { headers: { authorization: "Bearer depth-three-secret" } },
+      jobs: [{ request: { token: "array-token-secret" } }],
+      traces: { levelOne: { levelTwo: { signedUrl: "https://signed.example/depth-four-secret" } } }
+    }, "request complete");
 
     expect(output).toContain("[Redacted]");
-    expect(output).not.toContain("secret-value");
-    expect(output).not.toContain("https://signed.example/secret");
+    expect(output).not.toContain("depth-three-secret");
+    expect(output).not.toContain("array-token-secret");
+    expect(output).not.toContain("depth-four-secret");
+  });
+
+  it("preserves redacted error diagnostics instead of discarding every message", () => {
+    // Break caught: safe serialization removes the error code and all non-secret diagnostic context.
+    const error = Object.assign(new Error("request failed token=secret-token"), { code: "E_AUTH" });
+
+    expect(safeErrorSerializer(error, { secretPatterns: [/token=[^\s]+/] })).toEqual({
+      type: "Error",
+      name: "Error",
+      code: "E_AUTH",
+      message: "request failed [Redacted]"
+    });
   });
 
   it("keeps pilot counters local as aggregate snapshots", () => {
     // Break caught: counters lose prior values or accept invalid decrements.
-    const counters = createPilotCounters?.({ commandsProcessed: 2 });
-    counters?.increment("commandsProcessed");
-    counters?.increment("commandsProcessed", -1);
+    const counters = createPilotCounters({ commandsProcessed: 2 });
+    counters.increment("commandsProcessed");
+    counters.increment("commandsProcessed", -1);
 
-    expect(counters?.snapshot()).toEqual({ commandsProcessed: 3 });
+    expect(counters.snapshot()).toEqual({ commandsProcessed: 3 });
   });
 });

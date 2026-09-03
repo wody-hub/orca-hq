@@ -48,3 +48,47 @@ pnpm test
 ## 우려사항
 
 현재 staging 디렉터리는 운영체제 임시 경로에 생성되며 정리와 archive 실행은 의도적으로 후속 CLI의 명시적 확인 책임으로 남겨 두었다. Pino의 기본 redaction 설정은 지정 필드와 한 단계 nested 필드를 대상으로 하고, 임의 깊이의 외부 structured event는 `redactDeep`을 통해 producer가 정규화해야 한다.
+
+## 수정 라운드 1/5
+
+### TDD 기록
+
+RED는 `packages/observability/test/redaction.test.ts`에서 정적 `@orca-hq/observability` import로 시작했다. 첫 `pnpm test packages/observability/test/redaction.test.ts`는 배포되지 않은 `dist` entry를 해석하지 못해 0개 테스트로 실패했고, 패키지 내 개발 export와 tsconfig self path를 추가한 뒤에는 최소 diagnostics 호출의 `input.capabilities is not iterable`, 깊이 3·4 및 배열 내부 Pino secret 평문 출력, 모든 error message/code 파기라는 예상된 3개 실패를 확인했다. 이어 일반 `company-*` 자동 redaction을 금지하는 테스트도 `[Redacted]` 실제값으로 RED가 된 것을 확인한 후, 호출자 주입 pattern만 남기는 최소 구현으로 GREEN으로 만들었다.
+
+### Finding별 해결
+
+- Critical 1: `createLogger`의 `formatters.log`가 모든 payload를 `redactDeep`에 통과시키도록 해 Pino path 목록은 보조 방어선으로만 남겼다. 실제 `Writable` destination 바이트 테스트가 깊이 3 authorization, 깊이 4 signed URL, 배열 내부 token의 원문 부재를 검증한다.
+- Important 1: 동적 import/catch, optional chaining, 수제 타입 shim을 제거하고 정적 `@orca-hq/observability` import로 교체했다. 새 `packages/observability/tsconfig.json`은 `src`와 `test`를 함께 검사한다.
+- Important 2: `COMPANY_DATA_PATTERN`을 제거했다. 실제 절대 워크스페이스 경로와 기존 `company-project-path` 문자열 모두 호출자가 전달한 `secretPatterns`으로 redaction하며, path key는 명시된 `basename` 정책을 적용한다.
+- Important 3: diagnostics input에 실제 prompt/transcript 및 nested secret을 넣고 `manifest.health`가 정확히 `{ workspace: "[Redacted]", nested: {} }`임을 단언한다.
+- Important 4: `safeErrorSerializer`는 error `name`, `code`, secret pattern 적용 후의 `message`를 보존하며 unknown throw 값은 `Unknown`으로 구분한다.
+- Important 5: 패키지 내부 공개 이름 import를 focused test에서 실행하고, 개발 조건 export와 self path를 통해 root alias 수정 없이 source 배포 환경에서 test/typecheck 가능함을 검증했다.
+- Important 6: 중복된 `tsc` 플래그를 패키지 `tsconfig.json`으로 이동하고 scripts를 `tsc -p tsconfig.json` 규약으로 통일했다. build 산출물 경로와 exports도 이 설정의 `rootDir: "."`에 맞췄다.
+
+### 검증
+
+실행 명령:
+
+```sh
+pnpm test packages/observability/test/redaction.test.ts
+pnpm --filter @orca-hq/observability typecheck
+pnpm --filter @orca-hq/observability build
+pnpm typecheck
+pnpm test
+git diff --check
+```
+
+핵심 출력: focused test 1 파일 12 테스트 통과, observability package typecheck/build 통과, root typecheck 통과, 전체 Vitest 31 파일 543 테스트 통과, `git diff --check` 통과.
+
+### 변경 파일
+
+- `packages/observability/package.json`
+- `packages/observability/tsconfig.json`
+- `packages/observability/src/diagnostics.ts`
+- `packages/observability/src/logger.ts`
+- `packages/observability/src/redaction.ts`
+- `packages/observability/test/redaction.test.ts`
+
+### 남은 우려사항
+
+진단 staging 디렉터리의 archive 및 정리는 원래 범위대로 후속 명시적 확인 CLI의 책임으로 남아 있다. 이 패키지는 upload/telemetry 경로를 추가하지 않았다.

@@ -5,12 +5,12 @@ import { join } from "node:path";
 import { isRedactedField, redactDeep, type RedactionOptions } from "./redaction.js";
 
 export interface DiagnosticCreateInput extends RedactionOptions {
-  readonly version: string;
-  readonly capabilities: readonly string[];
-  readonly schema: string;
-  readonly health: unknown;
-  readonly counters: Readonly<Record<string, number>>;
-  readonly auditReferences: readonly string[];
+  readonly version?: string;
+  readonly capabilities?: readonly string[];
+  readonly schema?: string;
+  readonly health?: unknown;
+  readonly counters?: Readonly<Record<string, number>>;
+  readonly auditReferences?: readonly string[];
   readonly includeFullContent: false;
   readonly stagingRoot?: string;
 }
@@ -70,12 +70,14 @@ export function createPilotCounters(initial: Readonly<Record<string, number>> = 
 
 export async function create(input: DiagnosticCreateInput): Promise<DiagnosticBundle> {
   const manifest: DiagnosticManifest = Object.freeze({
-    version: input.version,
-    capabilities: Object.freeze([...input.capabilities]),
-    schema: input.schema,
-    health: removeFullContent(redactDeep(input.health, input)),
-    counters: aggregateCounters(input.counters),
-    auditReferences: Object.freeze([...input.auditReferences]),
+    version: input.version ?? "unknown",
+    capabilities: Object.freeze([...(input.capabilities ?? [])]),
+    schema: input.schema ?? "orca-hq.diagnostics.v1",
+    health: input.includeFullContent === false
+      ? removeFullContent(redactDeep(input.health ?? {}, input))
+      : {},
+    counters: aggregateCounters(input.counters ?? {}),
+    auditReferences: Object.freeze([...(input.auditReferences ?? [])]),
     files: Object.freeze(["manifest.json"] as ["manifest.json"])
   });
   const text = JSON.stringify(manifest, null, 2);
