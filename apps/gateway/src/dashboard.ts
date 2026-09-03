@@ -46,6 +46,16 @@ function approvalPhrase(operation: string, digest: string): string {
   const normalizedOperation = operation.trim().replace(/[\s-]+/g, "_").toUpperCase();
   return `APPROVE ${normalizedOperation} ${digest.slice(0, 12).toUpperCase()}`;
 }
+function mayApprove(
+  riskLevel: "L2" | "L3" | undefined,
+  principal: AuthenticatedPrincipal
+): boolean {
+  if (riskLevel === "L3") return principal.roles.includes("owner");
+  if (riskLevel === "L2") {
+    return principal.roles.some((role) => role === "owner" || role === "operator");
+  }
+  return false;
+}
 function approvalHistoryItem(
   persisted: ReturnType<ControlStore["listApprovals"]>[number]
 ): DashboardCommandDetailView["approvalHistory"][number] {
@@ -85,7 +95,7 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
     async listCommands(_principal: AuthenticatedPrincipal) {
       return { commands: store.listCommands().map(summary) };
     },
-    async getCommand({ commandId, principal: _principal }): Promise<DashboardCommandDetailView | undefined> {
+    async getCommand({ commandId, principal }): Promise<DashboardCommandDetailView | undefined> {
       const command = store.listCommands().find((item) => item.commandId === commandId);
       if (command === undefined) return undefined;
       const base = summary(command);
@@ -153,7 +163,8 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
               } : {}),
               status: approvalState === "approved" || approvalState === "consumed" ? "approved"
                 : approvalState === "expired" ? "expired" : approvalState === "invalidated" ? "denied" : "pending",
-              permitted: approvalState === "approved"
+              permitted: approvalState === "pending"
+                && mayApprove(persistedApproval.request.riskLevel, principal)
             },
         audit: { reference: commandAudit?.id ?? "", summary: commandAudit?.eventType ?? "pending" },
         approvalHistory,

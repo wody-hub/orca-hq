@@ -64,9 +64,13 @@ describe("production command dashboard", () => {
           verification: { status: "failed", commands: ["pnpm test"] },
           tasks: [{ id: "task-501", dependencies: ["task-implement"], verifierFamily: "claude", dispatchId: "dispatch-501", canStop: false, canRetry: false }],
           diff: { summary: "1 file changed" },
-          approval: { id: "approval-501", level: "L3", digest, operationPhrase: `APPROVE DEPLOY_PRODUCTION ${digest.slice(0, 12).toUpperCase()}`, status: "pending", permitted: false },
+          approval: { id: "approval-501", level: "L3", digest, operationPhrase: `APPROVE DEPLOY_PRODUCTION ${digest.slice(0, 12).toUpperCase()}`, status: "pending", permitted: true },
           audit: { reference: expect.any(String) }, delivery: []
         });
+      await expect(dashboard.getCommand({
+        commandId: "command-501",
+        principal: { principalId: "viewer", roles: ["viewer"] }
+      })).resolves.toMatchObject({ approval: { permitted: false } });
     } finally {
       database.close();
     }
