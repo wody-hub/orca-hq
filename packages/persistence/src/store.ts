@@ -11,7 +11,10 @@ import {
 import { OrcaReceiptSchema, parseOrcaOperationReceipt } from "@orca-hq/orca-adapter";
 import {
   ProviderInspectReceiptSchema,
-  ProviderStartReceiptSchema
+  ProviderStartReceiptSchema,
+  TrustedRepositorySnapshotSchema,
+  assertAuthoritativeActiveWorkerInspection,
+  assertAuthoritativeWorkerIdentityInspection
 } from "@orca-hq/worker-routing";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -134,6 +137,20 @@ const LifecycleMessageStoreSchema = z.object({
   dispatchId: z.string().min(1)
 }).passthrough();
 
+const WorkerCompletionIdentityStoreSchema = z.object({
+  dispatchId: z.string().min(1),
+  outcome: z.enum(["completed", "failed"]),
+  summary: z.string().min(1)
+}).strict();
+
+const WorkerDoneMessageStoreSchema = z.object({
+  kind: z.literal("worker_done"),
+  messageId: z.string().min(1),
+  dispatchId: z.string().min(1),
+  outcome: z.enum(["completed", "failed"]),
+  summary: z.string().min(1)
+}).strict();
+
 const VerificationObligationStoreSchema = z.object({
   rootImplementationTaskId: z.string().min(1),
   currentImplementationTaskId: z.string().min(1),
@@ -159,10 +176,33 @@ const VerificationObligationVerifierInputSchema = z.object({
 }).strict();
 
 const WorkerDoneCommitStoreSchema = z.object({
-  message: LifecycleMessageStoreSchema,
-  dispatch: LifecycleDispatchStoreSchema,
+  message: WorkerDoneMessageStoreSchema,
+  dispatch: LifecycleDispatchStoreSchema.extend({
+    state: z.literal("worker_done"),
+    workerCompletion: WorkerCompletionIdentityStoreSchema,
+    workerCompletionAuditReference: z.string().min(1)
+  }).passthrough(),
   task: LifecycleTaskStoreSchema,
   transitions: z.array(LifecycleTransitionStoreSchema).length(2)
+}).strict();
+
+const LaunchFailureCommitStoreSchema = z.object({
+  message: z.object({
+    kind: z.literal("launch_failure"),
+    messageId: z.string().min(1),
+    dispatchId: z.string().min(1),
+    evidence: z.object({
+      kind: z.literal("orca_worker_state"),
+      state: z.enum(["launch_failed", "process_failed"])
+    }).strict()
+  }).strict(),
+  dispatch: LifecycleDispatchStoreSchema.extend({
+    state: z.literal("launch_failed"),
+    launchFailureId: z.string().min(1),
+    orcaDispatchId: z.string().min(1),
+    fenceReceipt: OrcaReceiptSchema
+  }).passthrough(),
+  transition: LifecycleTransitionStoreSchema
 }).strict();
 
 export type InboxEvent = z.infer<typeof InboxEventSchema>;
@@ -722,13 +762,20 @@ function verificationDecisionFor(
   return { kind: "intervention_required", findings: [...report.findings] };
 }
 
+type BoundProviderReceiptOptions = Readonly<{
+  inspectionMode?: "active_start" | "launch_failure_identity" | undefined;
+  verifierSnapshotMode?: "completion" | "launch_failure" | undefined;
+  expectedVerifierDiffSha256?: string | undefined;
+}>;
+
 function hasBoundProviderReceipts(
   payload: Record<string, unknown>,
   provider: "codex" | "claude",
   taskId: string,
   dispatchId: string,
   orcaTaskId: string,
-  orcaRunId: string
+  orcaRunId: string,
+  options: BoundProviderReceiptOptions = {}
 ): boolean {
   const startResult = ProviderStartReceiptSchema.safeParse(payload.providerStartReceipt);
   const inspectionsResult = z.array(ProviderInspectReceiptSchema).min(1)
@@ -746,6 +793,21 @@ function hasBoundProviderReceipts(
       const readReceipt = inspection.readReceipt;
       const show = showReceipt.result;
       const read = readReceipt.result;
+      if (options.inspectionMode === "launch_failure_identity") {
+        assertAuthoritativeWorkerIdentityInspection(showReceipt, readReceipt, {
+          dispatchId: orcaDispatchId,
+          taskId: orcaTaskId,
+          runId: orcaRunId
+        });
+      } else {
+        assertAuthoritativeActiveWorkerInspection(showReceipt, readReceipt, {
+          dispatchId: orcaDispatchId,
+          taskId: orcaTaskId,
+          runId: orcaRunId,
+          workerState: startReceipt.result.state,
+          workerStage: startReceipt.result.stage
+        });
+      }
       if (
         inspection.provider !== provider
         || inspection.dispatchId !== orcaDispatchId
@@ -758,12 +820,17 @@ function hasBoundProviderReceipts(
         || inspection.workerState !== show.worker.state
         || show.worker.state !== show.observation.status
         || show.worker.state !== read.status.worker
-        || startReceipt.result.state !== show.worker.state
-        || startReceipt.result.stage !== show.worker.stage
         || read.dispatchId !== orcaDispatchId
-        || read.status.terminal !== "running"
         || show.terminalResource.ownershipState !== "owned"
         || show.terminalResource.releaseState !== "active"
+        || (
+          options.inspectionMode !== "launch_failure_identity"
+          && (
+            startReceipt.result.state !== show.worker.state
+            || startReceipt.result.stage !== show.worker.stage
+            || read.status.terminal !== "running"
+          )
+        )
       ) return false;
     }
     const terminalOperation = payload.releaseReceipt === undefined ? "stop_worker" : "release_worker";
@@ -779,7 +846,32 @@ function hasBoundProviderReceipts(
     const expectedTerminal = terminalOperation === "release_worker"
       ? { state: "released", verdict: "released" }
       : { state: "stopped", verdict: "stopped" };
-    return payload.providerId === provider
+    const repositorySnapshots = objectValue(payload.repositorySnapshots);
+    const beforeSnapshot = TrustedRepositorySnapshotSchema.safeParse(repositorySnapshots?.before);
+    const afterSnapshot = TrustedRepositorySnapshotSchema.safeParse(repositorySnapshots?.after);
+    const assignmentRepo = objectValue(assignment?.repo);
+    const assignmentWorktree = objectValue(assignment?.worktree);
+    const verifierRepositorySafe = assignment?.role !== "verify" || (
+      beforeSnapshot.success
+      && beforeSnapshot.data.repositoryPath === assignmentRepo?.repositoryPath
+      && beforeSnapshot.data.worktreePath === assignmentWorktree?.path
+      && beforeSnapshot.data.worktreeKind === assignmentWorktree?.kind
+      && beforeSnapshot.data.branch === assignmentWorktree?.branch
+      && beforeSnapshot.data.diffSha256 === options.expectedVerifierDiffSha256
+      && (
+        options.verifierSnapshotMode === "launch_failure"
+        || (
+          repositorySnapshots?.mutated === false
+          && afterSnapshot.success
+          && isDeepStrictEqual(
+            { ...beforeSnapshot.data, auditReference: undefined },
+            { ...afterSnapshot.data, auditReference: undefined }
+          )
+        )
+      )
+    );
+    return verifierRepositorySafe
+    && payload.providerId === provider
     && payload.id === dispatchId
     && payload.taskId === taskId
     && payload.orcaDispatchId === orcaDispatchId
@@ -842,6 +934,16 @@ function normalizeLease(leaseInput: WorktreeLease): WorktreeLease {
 
 function worktreeLeaseFromRow(row: WorktreeLockRow): WorktreeLease {
   return normalizeLease(WorktreeLeaseSchema.parse(parseJson(row.payload_json)));
+}
+
+export class WorkerCompletionConflictError extends Error {
+  readonly code = "worker_completion_conflict";
+  readonly retryable = false;
+
+  constructor(dispatchId: string) {
+    super(`Dispatch ${dispatchId} has conflicting worker completion content`);
+    this.name = "WorkerCompletionConflictError";
+  }
 }
 
 export class ControlStore implements CommandIngress {
@@ -1023,6 +1125,64 @@ export class ControlStore implements CommandIngress {
     }));
   }
 
+  loadRunGraphForDispatch(dispatchIdInput: unknown): JsonValue | undefined {
+    const dispatchId = z.string().min(1).parse(dispatchIdInput);
+    const owners = this.database.prepare(`
+      SELECT d.id, t.run_id
+      FROM dispatches d
+      JOIN tasks t ON t.id = d.task_id
+      WHERE d.id = ? OR json_extract(d.payload_json, '$.orcaDispatchId') = ?
+      ORDER BY CASE WHEN d.id = ? THEN 0 ELSE 1 END
+      LIMIT 2
+    `).all(dispatchId, dispatchId, dispatchId) as Array<{ id: string; run_id: string }>;
+    if (owners.length === 0) return undefined;
+    if (owners.length !== 1) {
+      throw new Error(`Dispatch lookup ${dispatchId} is ambiguous`);
+    }
+    const owner = owners[0] as { id: string; run_id: string };
+    const run = this.loadRunRecord(owner.run_id);
+    if (run === undefined) throw new Error(`Run ${owner.run_id} is not persisted`);
+    const taskRows = this.database.prepare(`
+      SELECT id, run_id, state, payload_json
+      FROM tasks
+      WHERE run_id = ?
+      ORDER BY created_at, id
+    `).all(owner.run_id) as Array<{
+      id: string;
+      run_id: string;
+      state: string;
+      payload_json: string;
+    }>;
+    const tasks = taskRows.map((row) => JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)),
+      id: row.id,
+      runId: row.run_id,
+      state: row.state
+    }));
+    const dispatchRows = this.database.prepare(`
+      SELECT d.id, d.task_id, d.state, d.payload_json
+      FROM dispatches d
+      JOIN tasks t ON t.id = d.task_id
+      WHERE t.run_id = ?
+      ORDER BY d.created_at, d.id
+    `).all(owner.run_id) as StoredDispatchRow[];
+    const dispatches = dispatchRows.map((row) => JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)),
+      id: row.id,
+      taskId: row.task_id,
+      state: row.state
+    }));
+    const activeLeaseDispatchIds = (this.database.prepare(`
+      SELECT wl.dispatch_id
+      FROM worktree_locks wl
+      JOIN dispatches d ON d.id = wl.dispatch_id
+      JOIN tasks t ON t.id = d.task_id
+      WHERE t.run_id = ? AND wl.state = 'active'
+      ORDER BY wl.created_at, wl.id
+    `).all(owner.run_id) as Array<{ dispatch_id: string }>).map(({ dispatch_id }) => dispatch_id);
+    return JsonValueSchema.parse({ run, tasks, dispatches, activeLeaseDispatchIds });
+  }
+
   saveTask(recordInput: unknown): void {
     const payload = JsonValueSchema.parse(recordInput);
     const record = LifecycleTaskStoreSchema.parse(payload);
@@ -1107,11 +1267,77 @@ export class ControlStore implements CommandIngress {
   commitWorkerDone(inputValue: unknown): "inserted" | "duplicate" {
     const input = WorkerDoneCommitStoreSchema.parse(JsonValueSchema.parse(inputValue));
     return this.database.transaction(() => {
-      const messageId = `worker-message:${input.message.messageId}`;
+      const dispatchRow = this.database.prepare(`
+        SELECT task_id, state, payload_json
+        FROM dispatches
+        WHERE id = ?
+      `).get(input.dispatch.id) as Pick<
+        StoredDispatchRow,
+        "task_id" | "state" | "payload_json"
+      > | undefined;
+      if (dispatchRow === undefined || dispatchRow.task_id !== input.dispatch.taskId) {
+        throw new WorkerCompletionConflictError(input.dispatch.id);
+      }
+      const dispatchPayload = objectValue(parseJson(dispatchRow.payload_json));
+      const messageAuditReference = `worker-message:${input.message.messageId}`;
+      const expectedCompletion = WorkerCompletionIdentityStoreSchema.parse({
+        dispatchId: input.message.dispatchId,
+        outcome: input.message.outcome,
+        summary: input.message.summary
+      });
+      if (
+        input.dispatch.workerCompletion.dispatchId !== expectedCompletion.dispatchId
+        || input.dispatch.workerCompletion.outcome !== expectedCompletion.outcome
+        || input.dispatch.workerCompletion.summary !== expectedCompletion.summary
+        || input.dispatch.taskId !== input.task.id
+        || input.task.state !== "worker_done"
+        || input.dispatch.orcaDispatchId !== expectedCompletion.dispatchId
+        || dispatchPayload?.orcaDispatchId !== expectedCompletion.dispatchId
+      ) {
+        throw new WorkerCompletionConflictError(input.dispatch.id);
+      }
+      if (dispatchRow.state === "worker_done") {
+        const existingCompletion = WorkerCompletionIdentityStoreSchema.safeParse(
+          dispatchPayload?.workerCompletion
+        );
+        const terminalTaskRow = this.database.prepare(`
+          SELECT run_id, state, payload_json
+          FROM tasks
+          WHERE id = ?
+        `).get(dispatchRow.task_id) as StoredTaskRow | undefined;
+        const terminalTaskPayload = objectValue(
+          terminalTaskRow === undefined ? undefined : parseJson(terminalTaskRow.payload_json)
+        );
+        const terminalTaskStateCoherent = terminalTaskRow?.state === "worker_done"
+          || (
+            terminalTaskPayload?.role === "verify"
+            && ["verified_success", "verification_failed", "intervention_required"]
+              .includes(terminalTaskRow?.state ?? "")
+          );
+        if (
+          existingCompletion.success
+          && isDeepStrictEqual(existingCompletion.data, expectedCompletion)
+          && input.dispatch.workerCompletionAuditReference
+            === dispatchPayload?.workerCompletionAuditReference
+          && terminalTaskRow !== undefined
+          && terminalTaskRow.run_id === input.task.runId
+          && terminalTaskStateCoherent
+          && terminalTaskPayload?.id === input.task.id
+          && terminalTaskPayload.runId === input.task.runId
+        ) return "duplicate" as const;
+        throw new WorkerCompletionConflictError(input.dispatch.id);
+      }
+      if (dispatchRow.state !== "running") {
+        throw new WorkerCompletionConflictError(input.dispatch.id);
+      }
+      if (input.dispatch.workerCompletionAuditReference !== messageAuditReference) {
+        throw new WorkerCompletionConflictError(input.dispatch.id);
+      }
+      const messageId = messageAuditReference;
       const existing = this.database.prepare(`
         SELECT id FROM audit_events WHERE id = ?
       `).get(messageId) as { id: string } | undefined;
-      if (existing !== undefined) return "duplicate" as const;
+      if (existing !== undefined) throw new WorkerCompletionConflictError(input.dispatch.id);
       const dispatchUpdate = this.database.prepare(`
         UPDATE dispatches SET state = ?, payload_json = ?, updated_at = ?
         WHERE id = ? AND task_id = ? AND state = 'running'
@@ -1155,6 +1381,92 @@ export class ControlStore implements CommandIngress {
         new Date().toISOString()
       );
       for (const transition of input.transitions) this.appendTransition(transition);
+      return "inserted" as const;
+    }).immediate();
+  }
+
+  commitLaunchFailure(inputValue: unknown): "inserted" | "duplicate" {
+    const input = LaunchFailureCommitStoreSchema.parse(JsonValueSchema.parse(inputValue));
+    return this.database.transaction(() => {
+      const dispatchRow = this.database.prepare(`
+        SELECT task_id, state, payload_json
+        FROM dispatches
+        WHERE id = ?
+      `).get(input.dispatch.id) as StoredDispatchRow | undefined;
+      if (dispatchRow === undefined || dispatchRow.task_id !== input.dispatch.taskId) {
+        throw new Error(`Dispatch ${input.dispatch.id} is not persisted for launch failure`);
+      }
+      const existingPayload = objectValue(parseJson(dispatchRow.payload_json));
+      if (dispatchRow.state === "launch_failed") {
+        if (
+          existingPayload?.launchFailureId === input.message.messageId
+          && isDeepStrictEqual(existingPayload.fenceReceipt, input.dispatch.fenceReceipt)
+        ) return "duplicate" as const;
+        throw new Error(`Dispatch ${input.dispatch.id} has conflicting launch failure`);
+      }
+      if (dispatchRow.state !== "running") {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch failure`);
+      }
+      const taskRow = this.database.prepare(`
+        SELECT run_id, payload_json
+        FROM tasks
+        WHERE id = ?
+      `).get(input.dispatch.taskId) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+      const taskPayload = objectValue(taskRow === undefined ? undefined : parseJson(taskRow.payload_json));
+      const taskGitDiff = objectValue(taskPayload?.gitDiff);
+      const runRow = taskRow === undefined ? undefined : this.database.prepare(`
+        SELECT payload_json FROM runs WHERE id = ?
+      `).get(taskRow.run_id) as { payload_json: string } | undefined;
+      const runPayload = objectValue(runRow === undefined ? undefined : parseJson(runRow.payload_json));
+      const provider = z.enum(["codex", "claude"]).safeParse(input.dispatch.providerId);
+      if (
+        input.dispatch.launchFailureId !== input.message.messageId
+        || input.dispatch.orcaDispatchId !== input.message.dispatchId
+        || taskRow === undefined
+        || typeof taskPayload?.orcaTaskId !== "string"
+        || typeof runPayload?.orcaRunId !== "string"
+        || !provider.success
+        || !hasBoundProviderReceipts(
+          input.dispatch,
+          provider.data,
+          input.dispatch.taskId,
+          input.dispatch.id,
+          taskPayload.orcaTaskId,
+          runPayload.orcaRunId,
+          {
+            inspectionMode: "launch_failure_identity",
+            verifierSnapshotMode: "launch_failure",
+            expectedVerifierDiffSha256: typeof taskGitDiff?.sha256 === "string"
+              ? taskGitDiff.sha256
+              : undefined
+          }
+        )
+      ) {
+        throw new TypeError("launch failure terminal proof is not durably bound");
+      }
+      const update = this.database.prepare(`
+        UPDATE dispatches
+        SET state = 'launch_failed', payload_json = ?, updated_at = ?
+        WHERE id = ? AND task_id = ? AND state = 'running'
+      `).run(
+        JSON.stringify(input.dispatch),
+        new Date().toISOString(),
+        input.dispatch.id,
+        input.dispatch.taskId
+      );
+      if (update.changes !== 1) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch failure`);
+      }
+      this.database.prepare(`
+        INSERT INTO audit_events (id, subject_id, event_type, data_json, created_at)
+        VALUES (?, ?, 'worker.launch_failure', ?, ?)
+      `).run(
+        `worker-message:${input.message.messageId}`,
+        input.message.dispatchId,
+        JSON.stringify(input.message),
+        new Date().toISOString()
+      );
+      this.appendTransition(input.transition);
       return "inserted" as const;
     }).immediate();
   }
@@ -1712,7 +2024,11 @@ export class ControlStore implements CommandIngress {
           report.verificationTaskId,
           verifierDispatch.id,
           taskPayload.orcaTaskId,
-          orcaRunId
+          orcaRunId,
+          {
+            verifierSnapshotMode: "completion",
+            expectedVerifierDiffSha256: report.diffSha256
+          }
         )
       ) {
         throw new TypeError("verification report is not bound to durable verifier Dispatch evidence");

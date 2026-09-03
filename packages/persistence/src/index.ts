@@ -2,6 +2,7 @@ export { migrate, openDatabase } from "./database.js";
 export { OutboxDispatcher, type OutboxDispatcherOptions } from "./outbox-dispatcher.js";
 export {
   ControlStore,
+  WorkerCompletionConflictError,
   type AppendAuditEvent,
   type AuditEvent,
   type EnqueueOutboxMessage,

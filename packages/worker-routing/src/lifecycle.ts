@@ -100,6 +100,7 @@ export type RunState =
   | "creating"
   | "active"
   | "awaiting_verification"
+  | "investigation_complete"
   | "verified_success"
   | "intervention_required";
 
@@ -184,6 +185,36 @@ export type DispatchRecord = Readonly<{
   releaseReceipt?: OrcaReceipt | undefined;
   releaseFailure?: WorkerReleaseFailure | undefined;
   verificationCommands?: readonly VerificationCommandReceipt[] | undefined;
+  workerCompletion?: WorkerCompletionIdentity | undefined;
+  workerCompletionAuditReference?: string | undefined;
+  repositorySnapshots?: VerifierRepositorySnapshots | undefined;
+}>;
+
+export const TrustedRepositorySnapshotSchema = z.object({
+  repositoryPath: AbsolutePathSchema,
+  worktreePath: AbsolutePathSchema,
+  worktreeKind: z.enum(["existing-read-only", "approved-current", "isolated"]),
+  head: NonBlankStringSchema,
+  branch: NonBlankStringSchema.nullable(),
+  statusSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  diffSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  auditReference: NonBlankStringSchema.max(256)
+}).strict();
+
+export type TrustedRepositorySnapshot = Readonly<
+  z.infer<typeof TrustedRepositorySnapshotSchema>
+>;
+
+export type VerifierRepositorySnapshots = Readonly<{
+  before: TrustedRepositorySnapshot;
+  after?: TrustedRepositorySnapshot | undefined;
+  mutated?: boolean | undefined;
+}>;
+
+export type WorkerCompletionIdentity = Readonly<{
+  dispatchId: string;
+  outcome: "completed" | "failed";
+  summary: string;
 }>;
 
 export type WorkerReleaseFailure = Readonly<{
@@ -244,6 +275,19 @@ export type WorkerDoneCommit = Readonly<{
   transitions: readonly [LifecycleTransition, LifecycleTransition];
 }>;
 
+export type LaunchFailureCommit = Readonly<{
+  message: LaunchFailureMessage;
+  dispatch: DispatchRecord;
+  transition: LifecycleTransition;
+}>;
+
+export type DurableRunGraph = Readonly<{
+  run: RunRecord;
+  tasks: readonly TaskRecord[];
+  dispatches: readonly DispatchRecord[];
+  activeLeaseDispatchIds: readonly string[];
+}>;
+
 type MaybePromise<T> = T | Promise<T>;
 
 export interface LifecycleStore {
@@ -253,6 +297,7 @@ export interface LifecycleStore {
   appendTransition(transition: LifecycleTransition): MaybePromise<void>;
   appendMessageOnce(message: LifecycleMessage): MaybePromise<"inserted" | "duplicate">;
   commitWorkerDone(input: WorkerDoneCommit): MaybePromise<"inserted" | "duplicate">;
+  commitLaunchFailure(input: LaunchFailureCommit): MaybePromise<"inserted" | "duplicate">;
   ensureVerificationObligations(
     runId: string,
     obligations: readonly VerificationObligation[]
@@ -268,6 +313,7 @@ export interface LifecycleStore {
   loadRunRecord?(id: string): MaybePromise<unknown | undefined>;
   loadTaskRecord?(id: string): MaybePromise<unknown | undefined>;
   loadDispatchesForTask?(taskId: string): MaybePromise<readonly unknown[]>;
+  loadRunGraphForDispatch?(dispatchId: string): MaybePromise<unknown | undefined>;
 }
 
 export interface LifecycleMessageSink {
@@ -388,7 +434,19 @@ export class ExecutionLifecycle {
     if (message.kind === "worker_done") {
       const currentDispatch = this.#required(this.#dispatches, "Dispatch", localDispatchId);
       const currentTask = this.#required(this.#tasks, "Task", currentDispatch.taskId);
-      const dispatch = Object.freeze({ ...currentDispatch, state: "worker_done" as const });
+      const workerCompletion = Object.freeze({
+        dispatchId: message.dispatchId,
+        outcome: message.outcome,
+        summary: message.summary
+      });
+      const workerCompletionAuditReference = currentDispatch.workerCompletionAuditReference
+        ?? `worker-message:${message.messageId}`;
+      const dispatch = Object.freeze({
+        ...currentDispatch,
+        state: "worker_done" as const,
+        workerCompletion,
+        workerCompletionAuditReference
+      });
       const task = Object.freeze({ ...currentTask, state: "worker_done" as const });
       const transitions = Object.freeze([
         this.#newTransition("dispatch", dispatch.id, currentDispatch.state, dispatch.state),
@@ -416,11 +474,29 @@ export class ExecutionLifecycle {
     message: LaunchFailureMessage,
     localDispatchId: string
   ): Promise<"recorded" | "duplicate"> {
-    const result = await this.#store.appendMessageOnce(message);
-    if (result === "duplicate") return "duplicate";
-    await this.transitionDispatch(localDispatchId, "launch_failed", {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (current.fenceReceipt === undefined || current.orcaDispatchId === undefined) {
+      throw new Error(`Dispatch ${localDispatchId} has no authoritative terminal proof`);
+    }
+    const updated = Object.freeze({
+      ...current,
+      state: "launch_failed" as const,
       launchFailureId: message.messageId
     });
+    const transition = this.#newTransition(
+      "dispatch",
+      localDispatchId,
+      current.state,
+      "launch_failed",
+      current.fenceReceipt.id
+    );
+    const result = await this.#store.commitLaunchFailure(Object.freeze({
+      message,
+      dispatch: updated,
+      transition
+    }));
+    if (result === "duplicate") return "duplicate";
+    this.#dispatches.set(localDispatchId, updated);
     return "recorded";
   }
 
@@ -470,6 +546,72 @@ export class ExecutionLifecycle {
     const updated = Object.freeze({
       ...current,
       verificationCommands: Object.freeze(commands.map((command) => Object.freeze({ ...command })))
+    });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordVerifierRepositorySnapshotBefore(
+    localDispatchId: string,
+    snapshotInput: TrustedRepositorySnapshot,
+    implementationDiffSha256: string
+  ): Promise<DispatchRecord> {
+    const snapshot = Object.freeze(TrustedRepositorySnapshotSchema.parse(snapshotInput));
+    const expectedDiffSha256 = z.string().regex(/^[a-f0-9]{64}$/).parse(
+      implementationDiffSha256
+    );
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (current.assignment.role !== "verify" || current.state !== "planned") {
+      throw new Error(`verification Dispatch ${localDispatchId} is not awaiting launch`);
+    }
+    if (
+      snapshot.repositoryPath !== current.assignment.repo.repositoryPath
+      || snapshot.worktreePath !== current.assignment.worktree.path
+      || snapshot.worktreeKind !== current.assignment.worktree.kind
+      || snapshot.branch !== current.assignment.worktree.branch
+    ) {
+      throw new TypeError("verification repository baseline is not bound to its assignment");
+    }
+    if (snapshot.diffSha256 !== expectedDiffSha256) {
+      throw new TypeError(
+        "verification repository baseline diff does not match implementation evidence"
+      );
+    }
+    if (current.repositorySnapshots !== undefined) {
+      const { auditReference: _currentAudit, ...currentIdentity } =
+        current.repositorySnapshots.before;
+      const { auditReference: _snapshotAudit, ...snapshotIdentity } = snapshot;
+      if (JSON.stringify(currentIdentity) !== JSON.stringify(snapshotIdentity)) {
+        throw new TypeError("verification repository baseline changed");
+      }
+      return current;
+    }
+    const updated = Object.freeze({
+      ...current,
+      repositorySnapshots: Object.freeze({ before: snapshot })
+    });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
+  async recordVerifierRepositorySnapshotAfter(
+    localDispatchId: string,
+    snapshotInput: TrustedRepositorySnapshot
+  ): Promise<DispatchRecord> {
+    const after = Object.freeze(TrustedRepositorySnapshotSchema.parse(snapshotInput));
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const before = current.repositorySnapshots?.before;
+    if (current.assignment.role !== "verify" || current.state !== "worker_done" || before === undefined) {
+      throw new Error(`verification Dispatch ${localDispatchId} has no durable baseline`);
+    }
+    const { auditReference: _beforeAudit, ...beforeIdentity } = before;
+    const { auditReference: _afterAudit, ...afterIdentity } = after;
+    const mutated = JSON.stringify(beforeIdentity) !== JSON.stringify(afterIdentity);
+    const updated = Object.freeze({
+      ...current,
+      repositorySnapshots: Object.freeze({ before, after, mutated })
     });
     await this.#store.saveDispatch(updated);
     this.#dispatches.set(localDispatchId, updated);
@@ -549,6 +691,25 @@ export class ExecutionLifecycle {
     return updated;
   }
 
+  async recordProviderStart(
+    localDispatchId: string,
+    input: Readonly<{
+      orcaDispatchId: string;
+      receipt: OrcaReceipt;
+      providerId: WorkerProviderId;
+      providerStartReceipt: ProviderStartReceipt;
+    }>
+  ): Promise<DispatchRecord> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    if (current.state !== "launching") {
+      throw new Error(`Dispatch ${localDispatchId} is not launching`);
+    }
+    const updated = Object.freeze({ ...current, ...input });
+    await this.#store.saveDispatch(updated);
+    this.#dispatches.set(localDispatchId, updated);
+    return updated;
+  }
+
   async ensureVerificationObligations(
     runId: string,
     obligations: readonly VerificationObligation[]
@@ -604,6 +765,56 @@ export class ExecutionLifecycle {
       return this.#dispatches.get(record.id) as DispatchRecord;
     });
     return Object.freeze(records);
+  }
+
+  async recoverRunGraphForDispatch(dispatchId: string): Promise<DurableRunGraph | undefined> {
+    const value = await this.#store.loadRunGraphForDispatch?.(dispatchId);
+    if (value === undefined || typeof value !== "object" || value === null) return undefined;
+    const graph = value as {
+      run?: unknown;
+      tasks?: unknown;
+      dispatches?: unknown;
+      activeLeaseDispatchIds?: unknown;
+    };
+    if (
+      typeof graph.run !== "object"
+      || graph.run === null
+      || !Array.isArray(graph.tasks)
+      || !Array.isArray(graph.dispatches)
+      || !Array.isArray(graph.activeLeaseDispatchIds)
+      || graph.activeLeaseDispatchIds.some((id) => typeof id !== "string" || id.length === 0)
+    ) {
+      throw new TypeError("recovered Run graph is invalid");
+    }
+    const run = Object.freeze(graph.run as RunRecord);
+    const tasks = graph.tasks.map((record) => {
+      if (typeof record !== "object" || record === null) {
+        throw new TypeError("recovered Task graph is invalid");
+      }
+      const task = Object.freeze(record as TaskRecord);
+      if (task.runId !== run.id) throw new TypeError("recovered Task Run ownership mismatch");
+      this.#tasks.set(task.id, task);
+      return task;
+    });
+    const taskIds = new Set(tasks.map(({ id }) => id));
+    const dispatches = graph.dispatches.map((record) => {
+      if (typeof record !== "object" || record === null) {
+        throw new TypeError("recovered Dispatch graph is invalid");
+      }
+      const dispatch = Object.freeze(record as DispatchRecord);
+      if (!taskIds.has(dispatch.taskId)) {
+        throw new TypeError("recovered Dispatch Task ownership mismatch");
+      }
+      this.#dispatches.set(dispatch.id, dispatch);
+      return dispatch;
+    });
+    this.#runs.set(run.id, run);
+    return Object.freeze({
+      run,
+      tasks: Object.freeze(tasks),
+      dispatches: Object.freeze(dispatches),
+      activeLeaseDispatchIds: Object.freeze([...graph.activeLeaseDispatchIds] as string[])
+    });
   }
 
   run(id: string): RunRecord {

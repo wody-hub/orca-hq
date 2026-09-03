@@ -312,6 +312,16 @@ function persistCompletedVerificationDispatches(
     now
   );
   const verifierDispatchId = `dispatch:${task.taskId}:1`;
+  const verifierSnapshot = {
+    repositoryPath: task.projectRoute.repositoryPath,
+    worktreePath: "/srv/orca/worktrees/proposal-1",
+    worktreeKind: "isolated",
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branch: "orca/proposal-1",
+    statusSha256: "b".repeat(64),
+    diffSha256: task.gitDiff.sha256,
+    auditReference: "audit:trusted-host:verifier-snapshot"
+  };
   database.prepare(`
     INSERT INTO dispatches (id, task_id, state, payload_json, created_at, updated_at)
     VALUES (?, ?, 'worker_done', ?, ?, ?)
@@ -324,6 +334,13 @@ function persistCompletedVerificationDispatches(
       assignment: {
         role: "verify",
         preferredAgent: task.preferredAgent,
+        repo: { repositoryPath: task.projectRoute.repositoryPath },
+        worktree: {
+          kind: "isolated",
+          path: verifierSnapshot.worktreePath,
+          head: verifierSnapshot.head,
+          branch: verifierSnapshot.branch
+        },
         acceptanceCommands: task.testReceipts.map(({ command }) => command),
         permissions: "read-only",
         nestedWorkers: "forbidden",
@@ -331,6 +348,14 @@ function persistCompletedVerificationDispatches(
         dispatchId: verifierDispatchId
       },
       verificationCommands: commands,
+      repositorySnapshots: {
+        before: verifierSnapshot,
+        after: {
+          ...verifierSnapshot,
+          auditReference: "audit:trusted-host:verifier-snapshot-after"
+        },
+        mutated: false
+      },
       ...receiptPayload(
         task.preferredAgent,
         task.taskId,

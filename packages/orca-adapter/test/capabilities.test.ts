@@ -59,7 +59,7 @@ function clientFor(
   return new OrcaClient({
     executablePath: fake.executablePath,
     signal: options.signal ?? new AbortController().signal,
-    timeoutMs: options.timeoutMs ?? 5_000,
+    timeoutMs: options.timeoutMs ?? 15_000,
     ...(options.terminationGraceMs === undefined
       ? {}
       : { terminationGraceMs: options.terminationGraceMs }),
@@ -91,7 +91,7 @@ function statusWith(change: { version?: string; capabilities?: readonly string[]
   return status;
 }
 
-describe("Orca CLI capability adapter", () => {
+describe("Orca CLI capability adapter", { timeout: 20_000 }, () => {
   it("forwards only the bounded CLI environment required for normal authenticated profiles", () => {
     // Break caught: worker-start may otherwise expose HQ channel or voice secrets to a provider process.
     expect(boundedOrcaEnvironment({

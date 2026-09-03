@@ -7,7 +7,13 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZodError } from "zod";
 
-import { ControlStore, migrate, openDatabase, type JsonValue } from "../src/index.js";
+import {
+  ControlStore,
+  WorkerCompletionConflictError,
+  migrate,
+  openDatabase,
+  type JsonValue
+} from "../src/index.js";
 
 const command = {
   commandId: "cmd-1",
@@ -354,6 +360,222 @@ describe("SQLite migrations", () => {
         id, command_id, event_type, provider, provider_event_id, payload_json, created_at
       ) VALUES ('invalid', 'missing-command', 'command_received', 'slack', 'event-1', '{}', ?)
     `).run("2026-09-01T00:00:00.000Z")).toThrow("FOREIGN KEY constraint failed");
+  });
+
+  it("deduplicates worker_done by Dispatch completion identity across fresh message IDs and rejects conflicts", () => {
+    // Break caught: message-ID-only dedupe makes an equivalent transport redelivery fail after the Dispatch is terminal.
+    const store = testStore();
+    store.insertCommand(command);
+    store.saveRun({
+      id: "run-worker-done",
+      proposalId: "proposal-worker-done",
+      commandId: command.commandId,
+      objective: "exercise durable completion identity",
+      state: "active"
+    });
+    store.saveTask({
+      id: "task-worker-done",
+      runId: "run-worker-done",
+      localId: "verify",
+      title: "Verify",
+      role: "verify",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "running"
+    });
+    store.saveDispatch({
+      id: "dispatch-worker-done",
+      taskId: "task-worker-done",
+      attempt: 1,
+      state: "running",
+      orcaDispatchId: "orca-dispatch-worker-done"
+    });
+    const commit = (messageId: string, summary: string) => store.commitWorkerDone({
+      message: {
+        kind: "worker_done",
+        messageId,
+        dispatchId: "orca-dispatch-worker-done",
+        outcome: "completed",
+        summary
+      },
+      dispatch: {
+        id: "dispatch-worker-done",
+        taskId: "task-worker-done",
+        attempt: 1,
+        state: "worker_done",
+        orcaDispatchId: "orca-dispatch-worker-done",
+        workerCompletion: {
+          dispatchId: "orca-dispatch-worker-done",
+          outcome: "completed",
+          summary
+        },
+        workerCompletionAuditReference: "worker-message:completion-message-1"
+      },
+      task: {
+        id: "task-worker-done",
+        runId: "run-worker-done",
+        localId: "verify",
+        title: "Verify",
+        role: "verify",
+        preferredAgent: "codex",
+        dependsOn: [],
+        state: "worker_done"
+      },
+      transitions: [
+        {
+          entity: "dispatch",
+          entityId: "dispatch-worker-done",
+          from: "running",
+          to: "worker_done",
+          at: "2026-09-01T00:00:01.000Z"
+        },
+        {
+          entity: "task",
+          entityId: "task-worker-done",
+          from: "running",
+          to: "worker_done",
+          at: "2026-09-01T00:00:01.000Z"
+        }
+      ]
+    });
+
+    expect(commit("completion-message-1", "implementation complete")).toBe("inserted");
+    expect(commit("completion-message-2", "implementation complete")).toBe("duplicate");
+    expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+      .toHaveLength(1);
+    store.saveTask({
+      id: "task-worker-done",
+      runId: "run-worker-done",
+      localId: "verify",
+      title: "Verify",
+      role: "verify",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "verified_success"
+    });
+    expect(commit("completion-message-after-terminal-advance", "implementation complete"))
+      .toBe("duplicate");
+    store.saveTask({
+      id: "task-worker-done",
+      runId: "run-worker-done",
+      localId: "verify",
+      title: "Verify",
+      role: "verify",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "running"
+    });
+    expect(() => commit("completion-message-incoherent-task", "implementation complete"))
+      .toThrowError(WorkerCompletionConflictError);
+    store.saveTask({
+      id: "task-worker-done",
+      runId: "run-worker-done",
+      localId: "verify",
+      title: "Verify",
+      role: "verify",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "worker_done"
+    });
+    expect(() => commit("completion-message-3", "different immutable summary"))
+      .toThrowError(expect.objectContaining({ code: "worker_completion_conflict" }));
+    expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+      .toHaveLength(1);
+  });
+
+  it("rejects worker_done when the persisted Dispatch has no exact Orca identity", () => {
+    // Break caught: caller-shaped completion identity must not bind a Dispatch that never persisted its Orca ID.
+    const store = testStore();
+    store.insertCommand(command);
+    store.saveRun({
+      id: "run-unbound-worker-done",
+      proposalId: "proposal-unbound-worker-done",
+      commandId: command.commandId,
+      objective: "reject unbound completion",
+      state: "active"
+    });
+    store.saveTask({
+      id: "task-unbound-worker-done",
+      runId: "run-unbound-worker-done",
+      state: "running"
+    });
+    store.saveDispatch({
+      id: "dispatch-unbound-worker-done",
+      taskId: "task-unbound-worker-done",
+      attempt: 1,
+      state: "running"
+    });
+
+    expect(() => store.commitWorkerDone({
+      message: {
+        kind: "worker_done",
+        messageId: "completion-unbound",
+        dispatchId: "orca-dispatch-unbound",
+        outcome: "completed",
+        summary: "caller claims completion"
+      },
+      dispatch: {
+        id: "dispatch-unbound-worker-done",
+        taskId: "task-unbound-worker-done",
+        attempt: 1,
+        state: "worker_done",
+        workerCompletion: {
+          dispatchId: "orca-dispatch-unbound",
+          outcome: "completed",
+          summary: "caller claims completion"
+        },
+        workerCompletionAuditReference: "worker-message:completion-unbound"
+      },
+      task: {
+        id: "task-unbound-worker-done",
+        runId: "run-unbound-worker-done",
+        state: "worker_done"
+      },
+      transitions: [
+        {
+          entity: "dispatch",
+          entityId: "dispatch-unbound-worker-done",
+          from: "running",
+          to: "worker_done",
+          at: "2026-09-01T00:00:01.000Z"
+        },
+        {
+          entity: "task",
+          entityId: "task-unbound-worker-done",
+          from: "running",
+          to: "worker_done",
+          at: "2026-09-01T00:00:01.000Z"
+        }
+      ]
+    })).toThrowError(WorkerCompletionConflictError);
+  });
+
+  it("fails closed when an Orca Dispatch lookup key owns more than one Run graph", () => {
+    // Break caught: LIMIT 1 silently hydrates an arbitrary Run when persisted Orca IDs collide.
+    const store = testStore();
+    store.insertCommand(command);
+    for (const suffix of ["a", "b"] as const) {
+      store.saveRun({
+        id: `run-ambiguous-${suffix}`,
+        proposalId: `proposal-ambiguous-${suffix}`,
+        commandId: command.commandId,
+        state: "active"
+      });
+      store.saveTask({
+        id: `task-ambiguous-${suffix}`,
+        runId: `run-ambiguous-${suffix}`,
+        state: "running"
+      });
+      store.saveDispatch({
+        id: `dispatch-ambiguous-${suffix}`,
+        taskId: `task-ambiguous-${suffix}`,
+        state: "running",
+        orcaDispatchId: "orca-dispatch-ambiguous"
+      });
+    }
+
+    expect(() => store.loadRunGraphForDispatch("orca-dispatch-ambiguous"))
+      .toThrow("Dispatch lookup orca-dispatch-ambiguous is ambiguous");
   });
 
   it("indexes composite idempotency keys without raw provider-message uniqueness", () => {

@@ -35,6 +35,7 @@ import {
   type LifecycleMessageSink,
   type LifecycleStore,
   type LifecycleTransition,
+  type LaunchFailureCommit,
   type ImplementationVerificationEvidence,
   type ProviderCapabilities,
   type ProviderInspectReceipt,
@@ -42,6 +43,7 @@ import {
   type RunRecord,
   type TaskRecord,
   type UserVisibleLifecycleMessage,
+  type WorkerAssignment,
   type WorkerDoneCommit,
   type WorkerLaunchPolicy,
   type WorkerMessage,
@@ -231,8 +233,29 @@ function authorized(
 class RecordingOrca {
   readonly calls: OrcaOperation[] = [];
   releaseError: Error | undefined;
+  stopError: Error | undefined;
+  releaseResult: { state: string; verdict: string } = {
+    state: "released",
+    verdict: "released"
+  };
+  stopResult: { state: string; verdict: string } = {
+    state: "stopped",
+    verdict: "stopped"
+  };
   dispatchErrorOnCall: number | undefined;
   createTaskErrorOnCall: number | undefined;
+  createTaskRunId: string | undefined;
+  dispatchRunId: string | undefined;
+  showTaskId: string | undefined;
+  showRunId: string | undefined;
+  showWorkerState = "ready";
+  readWorkerState = "ready";
+  readonly showWorkerStateByDispatch = new Map<string, string>();
+  readonly readWorkerStateByDispatch = new Map<string, string>();
+  showTerminalHandle: string | null | undefined;
+  showTerminalResourceId: string | undefined;
+  showTerminalOwnershipState = "owned";
+  showTerminalReleaseState = "active";
   malformedDispatchId: string | undefined;
   dispatchTaskId: string | undefined;
   effectiveEnvironmentKeys: string[] = ["HOME", "PATH"];
@@ -262,7 +285,7 @@ class RecordingOrca {
         }
         return receipt(`task-receipt-${this.#task}`, {
           taskId: `orca-task-${this.#task}`,
-          runId: "orca-run-1",
+          runId: this.createTaskRunId ?? "orca-run-1",
           status: "ready"
         });
       }
@@ -288,7 +311,7 @@ class RecordingOrca {
           result: {
             dispatchId: orcaDispatchId,
             taskId: this.dispatchTaskId ?? operation.taskId,
-            runId: "orca-run-1",
+            runId: this.dispatchRunId ?? "orca-run-1",
             state: "ready",
             stage: "ready",
             setup: {
@@ -312,34 +335,45 @@ class RecordingOrca {
           ...(extensions === undefined ? {} : { _meta: { diagnostic: extensions.slack } })
         };
       }
-      case "show_worker":
+      case "show_worker": {
+        const workerState = this.showWorkerStateByDispatch.get(operation.dispatchId)
+          ?? this.showWorkerState;
         return receipt(`show-receipt-${operation.dispatchId}`, {
           dispatch: {
             id: operation.dispatchId,
-            task_id: this.#dispatchTasks.get(operation.dispatchId) ?? "unknown-task",
-            run_id: "orca-run-1",
+            task_id: this.showTaskId
+              ?? this.#dispatchTasks.get(operation.dispatchId)
+              ?? "unknown-task",
+            run_id: this.showRunId ?? "orca-run-1",
             status: "dispatched"
           },
           worker: {
             dispatch_id: operation.dispatchId,
-            state: "ready",
+            state: workerState,
             stage: "ready",
-            agent_terminal_handle: `terminal-${operation.dispatchId}`
+            agent_terminal_handle: this.showTerminalHandle === undefined
+              ? `terminal-${operation.dispatchId}`
+              : this.showTerminalHandle
           },
           terminal: null,
-          observation: { status: "ready", exactWorker: true },
+          observation: { status: workerState, exactWorker: true },
           terminalResource: {
-            id: `terminal-${operation.dispatchId}`,
-            ownershipState: "owned",
-            releaseState: "active"
+            id: this.showTerminalResourceId ?? `terminal-${operation.dispatchId}`,
+            ownershipState: this.showTerminalOwnershipState,
+            releaseState: this.showTerminalReleaseState
           }
         });
+      }
       case "read_worker":
         return receipt(`read-receipt-${operation.dispatchId}`, {
           dispatchId: operation.dispatchId,
           source: "transcript",
           cursor: "cursor-1",
-          status: { worker: "ready", terminal: "running" },
+          status: {
+            worker: this.readWorkerStateByDispatch.get(operation.dispatchId)
+              ?? this.readWorkerState,
+            terminal: "running"
+          },
           transcript: {
             messages: [],
             limited: false,
@@ -350,17 +384,18 @@ class RecordingOrca {
           archived: false
         });
       case "stop_worker":
+        if (this.stopError !== undefined) throw this.stopError;
         return receipt(`stop-receipt-${operation.dispatchId}`, {
           dispatchId: operation.dispatchId,
-          state: "stopped",
-          verdict: "stopped"
+          state: this.stopResult.state,
+          verdict: this.stopResult.verdict
         });
       case "release_worker":
         if (this.releaseError !== undefined) throw this.releaseError;
         return receipt(`release-receipt-${operation.dispatchId}`, {
           dispatchId: operation.dispatchId,
-          state: "released",
-          verdict: "released"
+          state: this.releaseResult.state,
+          verdict: this.releaseResult.verdict
         });
       default:
         throw new Error(`unexpected operation ${operation.kind}`);
@@ -441,6 +476,15 @@ class MemoryLifecycleStore implements LifecycleStore {
     return "inserted";
   }
 
+  async commitLaunchFailure(input: LaunchFailureCommit): Promise<"inserted" | "duplicate"> {
+    if (this.#messageIds.has(input.message.messageId)) return "duplicate";
+    this.#messageIds.add(input.message.messageId);
+    this.messages.push(structuredClone(input.message));
+    this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
+    this.transitions.push(structuredClone(input.transition));
+    return "inserted";
+  }
+
   ensureVerificationObligations(
     runId: string,
     obligations: readonly VerificationObligation[]
@@ -493,6 +537,30 @@ class MemoryVerificationLifecycleStore implements VerificationLifecycleStore {
   }
 }
 
+function hostRepositorySnapshot(overrides: Readonly<Record<string, unknown>> = {}) {
+  return {
+    repositoryPath: project.absolutePath,
+    worktreePath: "/srv/orca/worktrees/proposal-1/attempt-1",
+    worktreeKind: "isolated" as const,
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branch: "orca/proposal-1/attempt-1",
+    statusSha256: "b".repeat(64),
+    diffSha256: "a".repeat(64),
+    auditReference: "audit:host:repository-snapshot",
+    ...overrides
+  };
+}
+
+function hostRepositorySnapshotFor(dispatch: DispatchRecord) {
+  return hostRepositorySnapshot({
+    repositoryPath: dispatch.assignment.repo.repositoryPath,
+    worktreePath: dispatch.assignment.worktree.path,
+    worktreeKind: dispatch.assignment.worktree.kind,
+    head: dispatch.assignment.worktree.head,
+    branch: dispatch.assignment.worktree.branch
+  });
+}
+
 function executionVerificationHarness(collectImplementation = () => ({
   changedFiles: ["src/api.ts"],
   gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
@@ -527,6 +595,8 @@ function executionVerificationHarness(collectImplementation = () => ({
       service,
       evidence: {
         collectImplementation,
+        captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+          hostRepositorySnapshotFor(dispatch),
         collectVerifierCommands: () => verifierCommands
       }
     }
@@ -730,7 +800,8 @@ function durableExecutionService(
         auditReference: "audit:durable:implementation:test"
       }],
       auditReferences: ["audit:durable:implementation:dispatch"]
-    })
+    }),
+  locks: EditingLockPort = new RecordingLocks()
 ): ExecutionService {
   const lifecycle = new ExecutionLifecycle({ store, messages: new RecordingMessageSink() });
   const verification = new VerificationService({
@@ -745,7 +816,7 @@ function durableExecutionService(
   return new ExecutionService({
     orca,
     placements: new GitWorktreePlacementService(new MemoryGit()),
-    locks: new RecordingLocks(),
+    locks,
     lifecycle,
     assignmentArtifacts: new MemoryAssignmentArtifactStore(),
     providerCapabilities: {
@@ -761,6 +832,8 @@ function durableExecutionService(
       service: verification,
       evidence: {
         collectImplementation,
+        captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+          hostRepositorySnapshotFor(dispatch),
         collectVerifierCommands: () => durableVerifierCommands
       }
     }
@@ -804,6 +877,50 @@ function durableReport(
     findings: verdict === "pass" ? [] : ["acceptance behavior is incomplete"],
     evidence: ["audit:durable:verifier:test"],
     auditReferences: [...task.auditReferences, "audit:durable:verifier:test"],
+    verifierEffects: {
+      filesModified: false,
+      committed: false,
+      pushed: false,
+      pullRequestChanged: false,
+      merged: false,
+      deployed: false,
+      secretsAccessed: false,
+      productionAccessed: false
+    }
+  };
+}
+
+function reportForTask(
+  task: VerificationTask,
+  commands: readonly {
+    command: string;
+    exitCode: number;
+    outcome: "passed" | "failed";
+    auditReference: string;
+  }[],
+  reportId = `report:${task.taskId}`
+): VerificationReport {
+  return {
+    reportId,
+    runId: task.runId,
+    verificationTaskId: task.taskId,
+    implementationTaskId: task.implementationTaskId,
+    implementationDispatchId: task.implementationDispatchId,
+    cycle: task.cycle,
+    verdict: "pass",
+    projectRoute: task.projectRoute,
+    changedFiles: task.changedFiles,
+    diffSha256: task.gitDiff.sha256,
+    diffSummary: task.gitDiff.summary,
+    commands: [...commands],
+    implementationProvider: task.implementationProvider,
+    verifierProvider: task.preferredAgent,
+    findings: [],
+    evidence: commands.map(({ auditReference }) => auditReference),
+    auditReferences: [
+      ...task.auditReferences,
+      ...commands.map(({ auditReference }) => auditReference)
+    ],
     verifierEffects: {
       filesModified: false,
       committed: false,
@@ -1961,6 +2078,78 @@ describe("Git worktree placement", () => {
 });
 
 describe("worker lifecycle", () => {
+  it("rejects an Orca Task receipt that is not bound to the created Run", async () => {
+    // Break caught: Task creation must bind its public Run identity before any worker can start.
+    const { service, orca, store } = setup();
+    orca.createTaskRunId = "orca-run-other";
+
+    await expect(service.start(authorized())).rejects.toMatchObject({
+      code: "orca_task_run_mismatch"
+    });
+
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toEqual([]);
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")?.state)
+      .not.toBe("running");
+  });
+
+  it("fences a started Dispatch whose receipt is not bound to the created Run", async () => {
+    // Break caught: a provider-start receipt for another Run cannot become this Task's running worker.
+    const { service, orca, store, artifacts, locks } = setup();
+    orca.dispatchRunId = "orca-run-other";
+
+    await expect(service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt"
+    });
+
+    expect(orca.calls).toContainEqual({
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")?.state)
+      .toBe("intervention_required");
+    expect(artifacts.cleaned).toEqual([artifacts.staged[0]]);
+    expect(locks.released).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "Task identity",
+      corrupt: (orca: RecordingOrca) => { orca.showTaskId = "orca-task-other"; }
+    },
+    {
+      name: "Run identity",
+      corrupt: (orca: RecordingOrca) => { orca.showRunId = "orca-run-other"; }
+    },
+    {
+      name: "terminal ownership",
+      corrupt: (orca: RecordingOrca) => { orca.showTerminalOwnershipState = "unowned"; }
+    },
+    {
+      name: "show/read state coherence",
+      corrupt: (orca: RecordingOrca) => { orca.readWorkerState = "running"; }
+    }
+  ])("fences initial inspection with mismatched $name before marking the Dispatch running", async ({ corrupt }) => {
+    // Break caught: exact Dispatch alone is insufficient when Task/Run/terminal/state ownership differs.
+    const { service, orca, store } = setup();
+    corrupt(orca);
+
+    await expect(service.start(authorized())).rejects.toMatchObject({
+      code: "invalid_provider_receipt"
+    });
+
+    expect(orca.calls).toContainEqual({
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(store.dispatches.get("dispatch:proposal-1:implement:1")?.state)
+      .toBe("intervention_required");
+    expect(store.transitions).not.toContainEqual(expect.objectContaining({
+      entity: "dispatch",
+      entityId: "dispatch:proposal-1:implement:1",
+      to: "running"
+    }));
+  });
+
   it("dispatches one opposite-family verifier for every implementation Task", async () => {
     // Break caught: verifying only the final worker_done leaves earlier implementation output unchecked.
     const harness = executionVerificationHarness();
@@ -2204,7 +2393,9 @@ describe("worker lifecycle", () => {
               auditReference: "audit:implementation:test:1"
             }],
             auditReferences: ["audit:implementation:dispatch:1"]
-          })
+          }),
+          captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+            hostRepositorySnapshotFor(dispatch)
         }
       }
     );
@@ -2262,6 +2453,269 @@ describe("worker lifecycle", () => {
     });
   });
 
+  it("uses durable trusted-host snapshots and command evidence to fail closed on verifier mutation", async () => {
+    // Break caught: a verifier can mutate the shared worktree and self-declare no effects unless the host compares snapshots.
+    const verificationStore = new MemoryVerificationLifecycleStore();
+    const verificationService = new VerificationService({
+      store: verificationStore,
+      completionTarget: {
+        commandId: proposal.commandId,
+        channel: "slack",
+        destination: "C123",
+        nextAttemptAt: "2026-09-02T00:00:00.000Z"
+      }
+    });
+    const hostCommands = [{
+      command: "pnpm test",
+      exitCode: 0,
+      outcome: "passed" as const,
+      auditReference: "audit:trusted-host:verifier:test"
+    }];
+    let snapshotCall = 0;
+    let activeOrca: RecordingOrca | undefined;
+    const observedDispatchCounts: number[] = [];
+    const setupResult = setup(new MemoryGit(), undefined, undefined, undefined, {
+      service: verificationService,
+      evidence: {
+        collectImplementation: () => ({
+          changedFiles: ["src/api.ts"],
+          gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+          testReceipts: [{
+            command: "pnpm test",
+            exitCode: 0,
+            outcome: "passed" as const,
+            auditReference: "audit:trusted-host:implementation:test"
+          }],
+          auditReferences: ["audit:trusted-host:implementation"]
+        }),
+        captureRepositorySnapshot: (input: { dispatch: DispatchRecord }) => {
+          snapshotCall += 1;
+          observedDispatchCounts.push(
+            activeOrca?.calls.filter(({ kind }) => kind === "dispatch_worker").length ?? 0
+          );
+          return hostRepositorySnapshot({
+            repositoryPath: input.dispatch.assignment.repo.repositoryPath,
+            worktreePath: input.dispatch.assignment.worktree.path,
+            worktreeKind: input.dispatch.assignment.worktree.kind,
+            head: input.dispatch.assignment.worktree.head,
+            branch: input.dispatch.assignment.worktree.branch,
+            statusSha256: (snapshotCall === 1 ? "b" : "c").repeat(64),
+            auditReference: `audit:trusted-host:snapshot:${snapshotCall}`
+          });
+        },
+        collectVerifierCommands: () => hostCommands
+      }
+    } as never);
+    activeOrca = setupResult.orca;
+    await setupResult.service.start(authorized());
+    await setupResult.service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "snapshot-implementation-done",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    });
+    const verifierTask = verificationStore.tasks[0];
+    if (verifierTask === undefined) throw new Error("verifier Task missing");
+
+    const completion = await setupResult.service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "snapshot-verifier-done",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "all checks pass and no files changed"
+    });
+
+    await expect(setupResult.service.recordVerificationReport(
+      reportForTask(verifierTask, hostCommands, "report:mutating-verifier")
+    )).rejects.toMatchObject({ code: "verifier_repository_mutation" });
+    expect(completion).toEqual({
+      kind: "review_required",
+      reason: "verifier_repository_mutation",
+      dispatchId: "orca-dispatch-2"
+    });
+    expect(observedDispatchCounts).toEqual([1, 2]);
+    expect(verificationStore.commits).toEqual([]);
+    expect(setupResult.store.dispatches.get("dispatch:task:proposal-1:implement:verify:0:1"))
+      .toMatchObject({
+        repositorySnapshots: {
+          mutated: true,
+          before: { auditReference: "audit:trusted-host:snapshot:1" },
+          after: { auditReference: "audit:trusted-host:snapshot:2" }
+        }
+      });
+    expect(setupResult.store.runs.get("run:proposal-1")?.state)
+      .toBe("intervention_required");
+  });
+
+  it("releases the exact verifier before the trusted post-snapshot and host commands", async () => {
+    // Break caught: a verifier that is still live after the post-snapshot can mutate the shared worktree undetected.
+    const verificationStore = new MemoryVerificationLifecycleStore();
+    const verificationService = new VerificationService({
+      store: verificationStore,
+      completionTarget: {
+        commandId: proposal.commandId,
+        channel: "slack",
+        destination: "C123",
+        nextAttemptAt: "2026-09-02T00:00:00.000Z"
+      }
+    });
+    const observedReleaseCounts: Array<Readonly<{ phase: string; count: number }>> = [];
+    let activeOrca: RecordingOrca | undefined;
+    const setupResult = setup(new MemoryGit(), undefined, undefined, undefined, {
+      service: verificationService,
+      evidence: {
+        collectImplementation: () => ({
+          changedFiles: ["src/api.ts"],
+          gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+          testReceipts: [{
+            command: "pnpm test",
+            exitCode: 0,
+            outcome: "passed" as const,
+            auditReference: "audit:release-order:implementation"
+          }],
+          auditReferences: ["audit:release-order:dispatch"]
+        }),
+        captureRepositorySnapshot: ({
+          dispatch,
+          phase
+        }: {
+          dispatch: DispatchRecord;
+          phase: "before_verifier" | "after_verifier";
+        }) => {
+          observedReleaseCounts.push({
+            phase,
+            count: activeOrca?.calls.filter(({ kind }) => kind === "release_worker").length ?? 0
+          });
+          return hostRepositorySnapshotFor(dispatch);
+        },
+        collectVerifierCommands: () => {
+          observedReleaseCounts.push({
+            phase: "commands",
+            count: activeOrca?.calls.filter(({ kind }) => kind === "release_worker").length ?? 0
+          });
+          return [{
+            command: "pnpm test",
+            exitCode: 0,
+            outcome: "passed" as const,
+            auditReference: "audit:release-order:verifier"
+          }];
+        }
+      }
+    } as never);
+    activeOrca = setupResult.orca;
+    await setupResult.service.start(authorized());
+    await setupResult.service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "release-order-implementation",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    });
+
+    await setupResult.service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "release-order-verifier",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "verification complete"
+    });
+
+    expect(observedReleaseCounts).toEqual([
+      { phase: "before_verifier", count: 1 },
+      { phase: "after_verifier", count: 2 },
+      { phase: "commands", count: 2 }
+    ]);
+  });
+
+  it("binds verifier snapshots to the implementation diff while allowing a committed implementation HEAD", async () => {
+    // Break caught: binding the verifier baseline to the original worktree HEAD rejects legitimate implementation commits.
+    const harness = executionVerificationHarness();
+    const committedHead = "f".repeat(40);
+    const { service, store } = setup(
+      new MemoryGit(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...harness.verification,
+        evidence: {
+          ...harness.verification.evidence,
+          captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+            hostRepositorySnapshot({
+              repositoryPath: dispatch.assignment.repo.repositoryPath,
+              worktreePath: dispatch.assignment.worktree.path,
+              worktreeKind: dispatch.assignment.worktree.kind,
+              head: committedHead,
+              branch: dispatch.assignment.worktree.branch,
+              diffSha256: "a".repeat(64)
+            })
+        }
+      }
+    );
+    await service.start(authorized());
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "committed-head-implementation",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation committed locally"
+    })).resolves.toMatchObject({ dispatched: ["orca-dispatch-2"] });
+    await service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "committed-head-verifier",
+      dispatchId: "orca-dispatch-2",
+      outcome: "completed",
+      summary: "verification complete"
+    });
+
+    expect(store.dispatches.get("dispatch:task:proposal-1:implement:verify:0:1"))
+      .toMatchObject({
+        repositorySnapshots: {
+          mutated: false,
+          before: { head: committedHead, diffSha256: "a".repeat(64) },
+          after: { head: committedHead, diffSha256: "a".repeat(64) }
+        }
+      });
+  });
+
+  it("rejects a verifier baseline whose trusted diff does not match implementation evidence", async () => {
+    // Break caught: a verifier can otherwise be launched against repository content other than the reviewed implementation diff.
+    const harness = executionVerificationHarness();
+    const { service, orca } = setup(
+      new MemoryGit(),
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...harness.verification,
+        evidence: {
+          ...harness.verification.evidence,
+          captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+            hostRepositorySnapshot({
+              repositoryPath: dispatch.assignment.repo.repositoryPath,
+              worktreePath: dispatch.assignment.worktree.path,
+              worktreeKind: dispatch.assignment.worktree.kind,
+              head: "f".repeat(40),
+              branch: dispatch.assignment.worktree.branch,
+              diffSha256: "b".repeat(64)
+            })
+        }
+      }
+    );
+    await service.start(authorized());
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "wrong-baseline-diff",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).rejects.toThrow("verification repository baseline diff does not match implementation evidence");
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+  });
+
   it("accepts a verification report only after its exact verifier Dispatch evidence is durable", async () => {
     // Break caught: a caller-shaped report must not complete a Run before the assigned verifier finishes.
     const verificationStore = new MemoryVerificationLifecycleStore();
@@ -2302,6 +2756,8 @@ describe("worker lifecycle", () => {
             }],
             auditReferences: ["audit:implementation:dispatch:1"]
           }),
+          captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+            hostRepositorySnapshotFor(dispatch),
           collectVerifierCommands: () => verifierCommands
         }
       }
@@ -2442,6 +2898,8 @@ describe("worker lifecycle", () => {
               }],
               auditReferences: ["audit:durable:implementation:dispatch"]
             }),
+            captureRepositorySnapshot: ({ dispatch }: { dispatch: DispatchRecord }) =>
+              hostRepositorySnapshotFor(dispatch),
             collectVerifierCommands: () => verifierCommands
           }
         }
@@ -2732,6 +3190,486 @@ describe("worker lifecycle", () => {
     }
   });
 
+  it("resumes a durably planned verifier Dispatch after process loss before launch", async () => {
+    // Break caught: returning undefined for a hydrated prelaunch verifier permanently strands its Run obligation.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-verifier-prelaunch-restart");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const firstService = durableExecutionService(store, orca);
+      await firstService.start(authorized());
+      const originalSaveDispatch = store.saveDispatch.bind(store);
+      let crashOnVerifierDispatch = true;
+      const saveDispatchSpy = vi.spyOn(store, "saveDispatch").mockImplementation((value) => {
+        originalSaveDispatch(value);
+        const record = value as {
+          state?: unknown;
+          assignment?: { role?: unknown };
+        };
+        if (
+          crashOnVerifierDispatch
+          && record.state === "planned"
+          && record.assignment?.role === "verify"
+        ) {
+          crashOnVerifierDispatch = false;
+          throw new Error("synthetic process loss after verifier Dispatch persistence");
+        }
+      });
+      const done: WorkerMessage = {
+        kind: "worker_done",
+        messageId: "verifier-prelaunch-root-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      };
+      try {
+        await expect(firstService.recordWorkerMessage(done))
+          .rejects.toThrow("synthetic process loss after verifier Dispatch persistence");
+      } finally {
+        saveDispatchSpy.mockRestore();
+      }
+      const plannedVerifierDispatch = store.loadDispatchesForTask(
+        "task:proposal-1:implement:verify:0"
+      );
+      expect(plannedVerifierDispatch).toMatchObject([{ state: "planned" }]);
+      expect(plannedVerifierDispatch[0]).not.toHaveProperty("orcaDispatchId");
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+      const persistedVerifier = plannedVerifierDispatch[0] as {
+        id: string;
+        assignment: WorkerAssignment;
+      };
+      const persistedVerifierRow = database.prepare(`
+        SELECT payload_json FROM dispatches WHERE id = ?
+      `).get(persistedVerifier.id) as { payload_json: string };
+      const persistedVerifierPayload = JSON.parse(persistedVerifierRow.payload_json) as
+        Record<string, unknown>;
+      persistedVerifierPayload.repositorySnapshots = {
+        before: hostRepositorySnapshot({
+          repositoryPath: persistedVerifier.assignment.repo.repositoryPath,
+          worktreePath: persistedVerifier.assignment.worktree.path,
+          worktreeKind: persistedVerifier.assignment.worktree.kind,
+          head: persistedVerifier.assignment.worktree.head,
+          branch: persistedVerifier.assignment.worktree.branch,
+          auditReference: "audit:verifier-baseline-before-process-loss"
+        })
+      };
+      database.prepare(`
+        UPDATE dispatches SET payload_json = ? WHERE id = ?
+      `).run(JSON.stringify(persistedVerifierPayload), persistedVerifier.id);
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        ...done,
+        messageId: "verifier-prelaunch-root-redelivery"
+      })).resolves.toMatchObject({
+        kind: "recorded",
+        dispatched: ["orca-dispatch-2"]
+      });
+      expect(store.loadDispatchesForTask("task:proposal-1:implement:verify:0"))
+        .toMatchObject([{ state: "running", orcaDispatchId: "orca-dispatch-2" }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("reuses a hydrated Fix Dispatch and active lease after process loss before launch", async () => {
+    // Break caught: reconstructing a persisted Fix Dispatch reacquires authority already owned by that exact Dispatch.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-fix-prelaunch-lease-restart");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const collectImplementation = () => ({
+        changedFiles: ["src/api.ts"],
+        gitDiff: { sha256: "a".repeat(64), summary: "1 file changed" },
+        testReceipts: [{
+          command: "pnpm test",
+          exitCode: 0,
+          outcome: "passed" as const,
+          auditReference: "audit:fix-prelaunch:implementation"
+        }],
+        auditReferences: ["audit:fix-prelaunch:dispatch"]
+      });
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        collectImplementation
+      );
+      await firstService.start(authorized());
+      await firstService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "fix-prelaunch-root-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      });
+      await firstService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "fix-prelaunch-verifier-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "verification found a defect"
+      });
+      const verifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier === undefined) throw new Error("cycle 0 verifier missing");
+      const report = durableReport(verifier, "fail", "report:fix-prelaunch-crash");
+      const originalSaveDispatch = store.saveDispatch.bind(store);
+      let crashOnFixDispatch = true;
+      const saveDispatchSpy = vi.spyOn(store, "saveDispatch").mockImplementation((value) => {
+        originalSaveDispatch(value);
+        const record = value as {
+          state?: unknown;
+          assignment?: { role?: unknown; taskId?: unknown };
+        };
+        if (
+          crashOnFixDispatch
+          && record.state === "planned"
+          && record.assignment?.role === "implement"
+          && record.assignment.taskId === "task:proposal-1:implement:fix:1"
+        ) {
+          crashOnFixDispatch = false;
+          throw new Error("synthetic process loss after Fix Dispatch persistence");
+        }
+      });
+      try {
+        await expect(firstService.recordVerificationReport(report))
+          .rejects.toThrow("synthetic process loss after Fix Dispatch persistence");
+      } finally {
+        saveDispatchSpy.mockRestore();
+      }
+      const persistedFixDispatch = store.loadDispatchesForTask(
+        "task:proposal-1:implement:fix:1"
+      )[0] as {
+        id: string;
+        assignment: {
+          taskId: string;
+          worktree: { path: string; branch: string | null };
+        };
+      } | undefined;
+      if (persistedFixDispatch === undefined) throw new Error("persisted Fix Dispatch missing");
+      expect(store.acquireWorktreeLock({
+        lockKey: project.lockKey,
+        commandId: proposal.commandId,
+        taskId: persistedFixDispatch.assignment.taskId,
+        projectKey: project.projectKey,
+        worktreePath: persistedFixDispatch.assignment.worktree.path,
+        branch: persistedFixDispatch.assignment.worktree.branch ?? "detached",
+        dispatchId: persistedFixDispatch.id,
+        acquiredAt: "2026-09-02T00:00:00.000Z",
+        heartbeatAt: "2026-09-02T00:00:00.000Z",
+        expiresAt: "2026-09-02T00:05:00.000Z"
+      })).toMatchObject({ kind: "acquired" });
+      expect(store.getWorktreeLock(project.lockKey)?.dispatchId)
+        .toBe("dispatch:task:proposal-1:implement:fix:1:1");
+
+      const restartedLocks = new RecordingLocks();
+      await expect(durableExecutionService(
+        store,
+        orca,
+        collectImplementation,
+        restartedLocks
+      ).recordVerificationReport(structuredClone(report))).resolves.toEqual({
+        kind: "create_fix_task",
+        findings: ["acceptance behavior is incomplete"],
+        nextCycle: 1
+      });
+
+      expect(restartedLocks.acquired).toEqual([]);
+      expect(store.loadDispatchesForTask("task:proposal-1:implement:fix:1"))
+        .toMatchObject([{ state: "running", orcaDispatchId: "orca-dispatch-3" }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("hydrates a complete durable Run graph to resume implementation and verifier worker_done after restart", async () => {
+    // Break caught: a fresh service must recover both local and Orca Dispatch lookup keys before completion delivery.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-worker-done-restart");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-implementation-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-2"] });
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-verifier-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "verification complete"
+      })).resolves.toMatchObject({ kind: "recorded", verificationRequired: true });
+
+      const verifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier === undefined) throw new Error("cycle 0 verifier missing");
+      await expect(durableExecutionService(store, orca).recordVerificationReport(
+        durableReport(verifier, "pass", "report:restart:cycle-0")
+      )).resolves.toMatchObject({ kind: "verified_success" });
+      expect(store.listOutbox()).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("hydrates canonical completion evidence for every implementation before multi-task verification", async () => {
+    // Break caught: losing a completed sibling's worker result strands its pending verification obligation after restart.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-multi-task-completion-hydration");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const multiTaskProposal: ExecutionProposal = {
+        ...proposal,
+        tasks: [
+          proposal.tasks[0]!,
+          {
+            localId: "implement-client",
+            title: "Implement the client change",
+            dependsOn: [],
+            role: "implement",
+            preferredAgent: "claude"
+          }
+        ]
+      };
+      const firstService = durableExecutionService(store, orca);
+      await firstService.start(authorized(multiTaskProposal));
+      await expect(firstService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "multi-hydration-server-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "server implementation complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-2"] });
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "multi-hydration-client-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "client implementation complete"
+      })).resolves.toMatchObject({
+        dispatched: ["orca-dispatch-3", "orca-dispatch-4"]
+      });
+
+      database.prepare(`
+        UPDATE tasks SET created_at = '2026-09-03T00:00:00.000Z'
+        WHERE json_extract(payload_json, '$.role') = 'verify'
+      `).run();
+      const verifierTasks = store.listTasks().filter(({ role }) => role === "verify");
+      expect(verifierTasks).toHaveLength(2);
+      expect(verifierTasks.map(({ payload }) => payload.workerResult)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          summary: "server implementation complete",
+          auditReference: "worker-message:multi-hydration-server-done"
+        }),
+        expect.objectContaining({
+          summary: "client implementation complete",
+          auditReference: "worker-message:multi-hydration-client-done"
+        })
+      ]));
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects durable verifier snapshots tampered away from the implementation diff", async () => {
+    // Break caught: matching before/after snapshots are insufficient if both describe a different implementation diff.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-verifier-diff-tamper");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      await service.start(authorized());
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-diff-tamper-implementation",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "implementation complete"
+      });
+      await service.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-diff-tamper-verifier",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "verification complete"
+      });
+      const verifier = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier === undefined) throw new Error("cycle 0 verifier missing");
+      const dispatchRow = database.prepare(`
+        SELECT id, payload_json
+        FROM dispatches
+        WHERE task_id = ?
+      `).get(verifier.taskId) as { id: string; payload_json: string };
+      const dispatchPayload = JSON.parse(dispatchRow.payload_json) as {
+        repositorySnapshots: {
+          before: { diffSha256: string };
+          after: { diffSha256: string };
+          mutated: boolean;
+        };
+      };
+      dispatchPayload.repositorySnapshots.before.diffSha256 = "b".repeat(64);
+      dispatchPayload.repositorySnapshots.after.diffSha256 = "b".repeat(64);
+      dispatchPayload.repositorySnapshots.mutated = false;
+      database.prepare(`
+        UPDATE dispatches SET payload_json = ? WHERE id = ?
+      `).run(JSON.stringify(dispatchPayload), dispatchRow.id);
+
+      await expect(durableExecutionService(store, orca).recordVerificationReport(
+        durableReport(verifier, "pass", "report:durable-diff-tamper")
+      )).rejects.toThrow(
+        "verification report is not bound to durable verifier Dispatch evidence"
+      );
+      expect(store.listOutbox()).toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("hydrates the latest read-write retry placement before launching post-restart verification", async () => {
+    // Break caught: anchoring recovery to attempt one sends a verifier for attempt two into the stale worktree.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-latest-retry-placement");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const firstService = durableExecutionService(store, orca);
+      await firstService.start(authorized());
+      const retry = await firstService.recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "durable-latest-placement-retry",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      });
+      expect(retry).toMatchObject({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      const implementationDispatches = store.loadDispatchesForTask(
+        "task:proposal-1:implement"
+      ) as Array<{ assignment: { worktree: { path: string } } }>;
+      const retryWorktree = implementationDispatches.at(-1)?.assignment.worktree.path;
+      expect(retryWorktree).toBeTypeOf("string");
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "durable-latest-placement-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "retry implementation complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-3"] });
+
+      const verifierDispatches = store.loadDispatchesForTask(
+        "task:proposal-1:implement:verify:0"
+      ) as Array<{ assignment: { worktree: { path: string } } }>;
+      expect(verifierDispatches).toHaveLength(1);
+      expect(verifierDispatches[0]?.assignment.worktree.path).toBe(retryWorktree);
+      expect(verifierDispatches[0]?.assignment.worktree.path)
+        .not.toBe(implementationDispatches[0]?.assignment.worktree.path);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("hydrates Fix ancestry and exact Dispatch identities through fresh-service cycles one and two", async () => {
+    // Break caught: recovering only a verifier report cannot resume worker_done for either persisted Fix generation.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:durable-fix-worker-done-restart");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const initial = durableExecutionService(store, orca);
+      await initial.start(authorized());
+      await initial.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-root-done",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "root implementation complete"
+      });
+      await initial.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-verifier-0-done",
+        dispatchId: "orca-dispatch-2",
+        outcome: "completed",
+        summary: "cycle 0 verification failed"
+      });
+      const verifier0 = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 0
+      )?.payload as VerificationTask | undefined;
+      if (verifier0 === undefined) throw new Error("cycle 0 verifier missing");
+      await initial.recordVerificationReport(
+        durableReport(verifier0, "fail", "report:restart:fix:0")
+      );
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-1-done",
+        dispatchId: "orca-dispatch-3",
+        outcome: "completed",
+        summary: "first Fix complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-4"] });
+      const cycleOneService = durableExecutionService(store, orca);
+      await cycleOneService.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-verifier-1-done",
+        dispatchId: "orca-dispatch-4",
+        outcome: "completed",
+        summary: "cycle 1 verification failed"
+      });
+      const verifier1 = store.listTasks().find((task) =>
+        task.role === "verify" && task.cycle === 1
+      )?.payload as VerificationTask | undefined;
+      if (verifier1 === undefined) throw new Error("cycle 1 verifier missing");
+      await cycleOneService.recordVerificationReport(
+        durableReport(verifier1, "fail", "report:restart:fix:1")
+      );
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-2-done",
+        dispatchId: "orca-dispatch-5",
+        outcome: "completed",
+        summary: "second Fix complete"
+      })).resolves.toMatchObject({ dispatched: ["orca-dispatch-6"] });
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "restart-fix-verifier-2-done",
+        dispatchId: "orca-dispatch-6",
+        outcome: "completed",
+        summary: "cycle 2 verification complete"
+      })).resolves.toMatchObject({ kind: "recorded", verificationRequired: true });
+
+      const runPayload = JSON.parse((database.prepare(`
+        SELECT payload_json FROM runs WHERE id = 'run:proposal-1'
+      `).get() as { payload_json: string }).payload_json) as {
+        verificationObligations: Array<Record<string, unknown>>;
+      };
+      expect(runPayload.verificationObligations).toContainEqual(expect.objectContaining({
+        rootImplementationTaskId: "task:proposal-1:implement",
+        currentImplementationTaskId: "task:proposal-1:implement:fix:1:fix:2",
+        cycle: 2,
+        status: "verifier_running"
+      }));
+    } finally {
+      database.close();
+    }
+  });
+
   it("keeps original worker_done replay idempotent after its obligation advances to a Fix", async () => {
     // Break caught: replaying cycle-0 worker_done must not revalidate it as the latest Fix lineage.
     const database = openDatabase(":memory:");
@@ -3002,6 +3940,183 @@ describe("worker lifecycle", () => {
     });
     expect(store.messages.filter(({ kind }) => kind === "worker_done")).toEqual([done]);
     expect(orca.calls.filter(({ kind }) => kind === "release_worker")).toHaveLength(1);
+  });
+
+  it("durably completes an L0 investigation without implementation verification obligations", async () => {
+    // Break caught: routing an investigation-only completion through implementation verification throws on an empty obligation set.
+    const { service, store } = setup();
+    const readOnlyProposal: ExecutionProposal = {
+      ...proposal,
+      riskLevel: "L0",
+      tasks: [{
+        ...proposal.tasks[0]!,
+        localId: "investigate",
+        title: "Inspect current status",
+        role: "investigate"
+      }]
+    };
+    await service.start(authorized(readOnlyProposal));
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "investigation-complete",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "investigation findings recorded"
+    })).resolves.toEqual({ kind: "recorded", investigationComplete: true });
+
+    expect(store.runs.get("run:proposal-1")?.state).toBe("investigation_complete");
+    expect(store.verificationObligations.has("run:proposal-1")).toBe(false);
+  });
+
+  it("retains worker and lease fences when release does not authoritatively report released", async () => {
+    // Break caught: a matching Dispatch ID with active/retained state is not proof that Orca released the worker.
+    const { service, orca, locks, artifacts, store } = setup();
+    orca.releaseResult = { state: "active", verdict: "retained" };
+    await service.start(authorized());
+
+    await expect(service.recordWorkerMessage({
+      kind: "worker_done",
+      messageId: "done-nonreleased-receipt",
+      dispatchId: "orca-dispatch-1",
+      outcome: "completed",
+      summary: "implementation complete"
+    })).resolves.toEqual({
+      kind: "review_required",
+      reason: "worker_release_failed",
+      dispatchId: "orca-dispatch-1"
+    });
+
+    expect(artifacts.cleaned).toEqual([]);
+    expect(locks.released).toEqual([]);
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+  });
+
+  it("authoritatively inspects and stops the exact possibly-live Dispatch before launch retry cleanup", async () => {
+    // Break caught: caller-shaped launch_failed evidence alone can free attempt-one resources while its worker remains live.
+    const { service, orca, artifacts, locks } = setup();
+    await service.start(authorized());
+    const callsBeforeFailure = orca.calls.length;
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-authoritative-terminal",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).resolves.toMatchObject({ kind: "retried", retryOf: "orca-dispatch-1" });
+
+    expect(orca.calls.slice(callsBeforeFailure, callsBeforeFailure + 3)).toEqual([
+      { kind: "show_worker", dispatchId: "orca-dispatch-1" },
+      { kind: "read_worker", dispatchId: "orca-dispatch-1", limit: 100 },
+      { kind: "stop_worker", dispatchId: "orca-dispatch-1" }
+    ]);
+    expect(artifacts.cleaned[0]).toEqual(artifacts.staged[0]);
+    expect(locks.released[0]).toEqual({
+      lockKey: project.lockKey,
+      dispatchId: "dispatch:proposal-1:implement:1"
+    });
+  });
+
+  it("accepts coherent authoritative launch-failed state evolution before stopping the exact Dispatch", async () => {
+    // Break caught: retry fencing must not require the worker to remain in its initial ready state after launch failure.
+    const { service, orca } = setup();
+    await service.start(authorized());
+    orca.showWorkerStateByDispatch.set("orca-dispatch-1", "launch_failed");
+    orca.readWorkerStateByDispatch.set("orca-dispatch-1", "launch_failed");
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-state-evolved",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).resolves.toMatchObject({
+      kind: "retried",
+      dispatchId: "orca-dispatch-2",
+      retryOf: "orca-dispatch-1"
+    });
+    expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+      kind: "stop_worker",
+      dispatchId: "orca-dispatch-1"
+    }]);
+  });
+
+  it("atomically persists authoritative terminal proof with the launch_failed transition", async () => {
+    // Break caught: a transition-audit failure must not leave caller evidence or launch_failed state committed by itself.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failure-atomic-proof");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      await service.start(authorized());
+      database.exec(`
+        CREATE TRIGGER fail_launch_failure_transition
+        BEFORE INSERT ON audit_events
+        WHEN NEW.event_type = 'lifecycle.transition'
+          AND json_extract(NEW.data_json, '$.to') = 'launch_failed'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced launch failure transition audit failure');
+        END;
+      `);
+
+      await expect(service.recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "launch-failure-atomic-proof",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).rejects.toThrow("forced launch failure transition audit failure");
+
+      expect(database.prepare(`
+        SELECT state FROM dispatches WHERE id = 'dispatch:proposal-1:implement:1'
+      `).get()).toEqual({ state: "running" });
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.launch_failure"))
+        .toEqual([]);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("keeps attempt-one fences and intervenes when authoritative launch terminal proof is ambiguous", async () => {
+    // Break caught: failure to stop the exact Dispatch must prohibit artifact cleanup, lease release, and attempt two.
+    const { service, orca, artifacts, locks, store } = setup();
+    await service.start(authorized());
+    orca.stopError = Object.assign(new Error("synthetic stop ambiguity"), {
+      code: "orca_stop_unavailable",
+      retryable: true
+    });
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-ambiguous-terminal",
+      evidence: { kind: "orca_worker_state", state: "process_failed" }
+    })).resolves.toEqual({
+      kind: "intervention_required",
+      reason: "launch_terminal_unproven",
+      dispatchId: "orca-dispatch-1"
+    });
+
+    expect(artifacts.cleaned).toEqual([]);
+    expect(locks.released).toEqual([]);
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
+  });
+
+  it("retains resources when stop verdict does not also report the exact stopped state", async () => {
+    // Break caught: a stopped-looking verdict with an active state is not terminal proof and cannot authorize cleanup.
+    const { service, orca, artifacts, locks } = setup();
+    await service.start(authorized());
+    orca.stopResult = { state: "active", verdict: "stopped" };
+
+    await expect(service.recordLaunchFailure({
+      dispatchId: "orca-dispatch-1",
+      failureId: "launch-failure-stop-state-ambiguous",
+      evidence: { kind: "orca_worker_state", state: "launch_failed" }
+    })).resolves.toEqual({
+      kind: "intervention_required",
+      reason: "launch_terminal_unproven",
+      dispatchId: "orca-dispatch-1"
+    });
+    expect(artifacts.cleaned).toEqual([]);
+    expect(locks.released).toEqual([]);
+    expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
   });
 
   it("persists an exact worker release failure and requires review without releasing its edit lease", async () => {

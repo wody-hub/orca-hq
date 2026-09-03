@@ -427,6 +427,20 @@ export type ProviderInspectReceipt = Readonly<
   }
 >;
 
+export type AuthoritativeWorkerBinding = Readonly<{
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+  workerState: string;
+  workerStage: string;
+}>;
+
+export type AuthoritativeWorkerIdentityBinding = Readonly<{
+  dispatchId: string;
+  taskId: string;
+  runId: string;
+}>;
+
 export type WorkerProviderFailureCode =
   | "provider_mismatch"
   | "provider_unavailable"
@@ -684,6 +698,81 @@ export function providerInspectOrcaAuditReceipts(
     showReceipt,
     readReceipt
   });
+}
+
+export function assertAuthoritativeActiveWorkerInspection(
+  showReceiptValue: OrcaReceipt,
+  readReceiptValue: OrcaReceipt,
+  bindingValue: AuthoritativeWorkerBinding
+): void {
+  const binding = z.object({
+    dispatchId: NonBlankStringSchema,
+    taskId: NonBlankStringSchema,
+    runId: NonBlankStringSchema,
+    workerState: NonBlankStringSchema,
+    workerStage: NonBlankStringSchema
+  }).strict().parse(bindingValue);
+  const showReceipt = ProviderInspectShowOrcaAuditReceiptSchema.parse(showReceiptValue);
+  const readReceipt = ProviderInspectReadOrcaAuditReceiptSchema.parse(readReceiptValue);
+  const show = showReceipt.result;
+  const read = readReceipt.result;
+  if (
+    show.dispatch.id !== binding.dispatchId
+    || show.dispatch.task_id !== binding.taskId
+    || show.dispatch.run_id !== binding.runId
+    || show.worker.dispatch_id !== binding.dispatchId
+    || show.observation.exactWorker !== true
+    || read.dispatchId !== binding.dispatchId
+    || show.worker.agent_terminal_handle === null
+    || show.worker.agent_terminal_handle !== show.terminalResource.id
+    || show.terminalResource.ownershipState !== "owned"
+    || show.terminalResource.releaseState !== "active"
+    || show.worker.state !== binding.workerState
+    || show.worker.stage !== binding.workerStage
+    || show.observation.status !== binding.workerState
+    || read.status.worker !== binding.workerState
+    || read.status.terminal !== "running"
+    || read.archived
+  ) {
+    throw Object.assign(new Error("authoritative worker inspection mismatch"), {
+      code: "invalid_orca_receipt"
+    });
+  }
+}
+
+export function assertAuthoritativeWorkerIdentityInspection(
+  showReceiptValue: OrcaReceipt,
+  readReceiptValue: OrcaReceipt,
+  bindingValue: AuthoritativeWorkerIdentityBinding
+): void {
+  const binding = z.object({
+    dispatchId: NonBlankStringSchema,
+    taskId: NonBlankStringSchema,
+    runId: NonBlankStringSchema
+  }).strict().parse(bindingValue);
+  const showReceipt = ProviderInspectShowOrcaAuditReceiptSchema.parse(showReceiptValue);
+  const readReceipt = ProviderInspectReadOrcaAuditReceiptSchema.parse(readReceiptValue);
+  const show = showReceipt.result;
+  const read = readReceipt.result;
+  if (
+    show.dispatch.id !== binding.dispatchId
+    || show.dispatch.task_id !== binding.taskId
+    || show.dispatch.run_id !== binding.runId
+    || show.worker.dispatch_id !== binding.dispatchId
+    || show.observation.exactWorker !== true
+    || read.dispatchId !== binding.dispatchId
+    || show.worker.agent_terminal_handle === null
+    || show.worker.agent_terminal_handle !== show.terminalResource.id
+    || show.terminalResource.ownershipState !== "owned"
+    || show.terminalResource.releaseState !== "active"
+    || show.worker.state !== show.observation.status
+    || read.status.worker !== show.worker.state
+    || read.archived
+  ) {
+    throw Object.assign(new Error("authoritative worker identity inspection mismatch"), {
+      code: "invalid_orca_receipt"
+    });
+  }
 }
 
 function startResult(
