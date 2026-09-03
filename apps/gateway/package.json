@@ -10,6 +10,7 @@
   "dependencies": {
     "@orca-hq/core": "workspace:*",
     "@orca-hq/tailscale-adapter": "workspace:*",
-    "fastify": "^5.5.0"
+    "fastify": "^5.5.0",
+    "zod": "^3.24.2"
   }
 }

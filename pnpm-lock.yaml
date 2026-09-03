@@ -29,6 +29,9 @@ importers:
       fastify:
         specifier: ^5.5.0
         version: 5.12.1
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   packages/codex-hq:
     dependencies:
