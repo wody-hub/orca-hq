@@ -46,6 +46,14 @@ function runtime(events: string[], options: { slackFails?: boolean } = {}): Runt
         events.push("http.stopped");
       }
     },
+    outbox: {
+      async start() {
+        events.push("outbox.started");
+      },
+      async stop() {
+        events.push("outbox.stopped");
+      }
+    },
     slack: {
       async start() {
         events.push("slack.started");
@@ -72,6 +80,16 @@ function runtime(events: string[], options: { slackFails?: boolean } = {}): Runt
 }
 
 describe("Gateway lifecycle", () => {
+  it("allows port zero only behind the explicit test-only configuration", async () => {
+    // Break caught: production silently binds an ephemeral HTTP port that Tailscale Serve cannot retain across restarts.
+    await expect(createGateway({ ...config, httpPort: 0 }, runtime([]))).rejects.toThrow();
+    await expect(createGateway({
+      ...config,
+      httpPort: 0,
+      allowEphemeralHttpPortForTests: true
+    }, runtime([]))).resolves.toBeDefined();
+  });
+
   it("starts durable services before external adapters", async () => {
     // Break caught: an ingress adapter starts before config, migrations, Orca health, or reconciliation finish.
     const events: string[] = [];
@@ -85,6 +103,7 @@ describe("Gateway lifecycle", () => {
       "orca.checked",
       "reconciled",
       "http.started",
+      "outbox.started",
       "slack.started",
       "telegram.started"
     ]);
@@ -126,10 +145,11 @@ describe("Gateway lifecycle", () => {
 
     await gateway.stop();
 
-    expect(events.slice(-6)).toEqual([
+    expect(events.slice(-7)).toEqual([
       "telegram.stopped",
       "slack.stopped",
       "http.stopped",
+      "outbox.stopped",
       "transactions.drained",
       "db.checkpointed",
       "db.closed"
@@ -188,9 +208,10 @@ describe("Gateway lifecycle", () => {
         : boundary === "slack"
           ? ["slack.stopped", "http.stopped"]
           : ["telegram.stopped", "slack.stopped", "http.stopped"];
-      expect(events).toEqual(expect.arrayContaining(expectedStops));
-      expect(events.slice(-(expectedStops.length + 3))).toEqual([
-        ...expectedStops, "transactions.drained", "db.checkpointed", "db.closed"
+      const outboxStops = boundary === "http" ? [] : ["outbox.stopped"];
+      expect(events).toEqual(expect.arrayContaining([...expectedStops, ...outboxStops]));
+      expect(events.slice(-(expectedStops.length + outboxStops.length + 3))).toEqual([
+        ...expectedStops, ...outboxStops, "transactions.drained", "db.checkpointed", "db.closed"
       ]);
       expect(gateway.status).toEqual({ kind: "stopped", degradedChannels: [] });
     }

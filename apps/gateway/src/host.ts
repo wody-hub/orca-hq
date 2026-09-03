@@ -13,6 +13,7 @@ import {
   type DiscoveredProject,
   type ProjectRegistryEntry
 } from "@orca-hq/project-registry";
+import type { ServeConfiguration } from "@orca-hq/tailscale-adapter";
 import { z } from "zod";
 
 import { validateGatewayConfig, type GatewayConfig } from "./config.js";
@@ -44,6 +45,7 @@ export type GatewayHostSettings = Readonly<{
     slack: string;
     tailscaleWeb: string;
   }>;
+  serveConfiguration: Omit<ServeConfiguration, "gatewayHttpPort">;
 }>;
 
 /**
@@ -81,6 +83,15 @@ const NonBlankStringSchema = z.string().trim().min(1);
 const CompletionDestinationsSchema = z.object({
   slack: NonBlankStringSchema,
   tailscaleWeb: NonBlankStringSchema
+}).strict();
+const ServeConfigurationSchema = z.object({
+  funnelEnabled: z.boolean(),
+  publicExposure: z.boolean(),
+  gatewayBindAddress: NonBlankStringSchema,
+  upstreamAddress: NonBlankStringSchema,
+  httpsEnabled: z.boolean(),
+  advertisedHost: NonBlankStringSchema,
+  expectedTailnetDnsSuffix: NonBlankStringSchema
 }).strict();
 
 function unavailable(): Error {
@@ -132,6 +143,9 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
     const completionDestinations = CompletionDestinationsSchema.parse(
       settings.completionDestinations
     );
+    const serveConfiguration = ServeConfigurationSchema.parse(
+      settings.serveConfiguration
+    );
     requireMethods(candidate.secrets, ["validate"]);
     requireMethods(candidate.orca, ["health", "execute"]);
     requireMethods(candidate.proposalModel, ["plan"]);
@@ -168,6 +182,7 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
       assignmentArtifactRootDirectory,
       outboxWorkerId,
       completionDestinations: Object.freeze({ ...completionDestinations }),
+      serveConfiguration: Object.freeze({ ...serveConfiguration }),
       ...(settings.slackHqDestination === undefined
         ? {}
         : { slackHqDestination: NonBlankStringSchema.parse(settings.slackHqDestination) })
@@ -231,6 +246,7 @@ export function assembleGatewayHost(boundariesValue: unknown): GatewayHost {
     },
     dispatchControl: boundaries.dispatchControl,
     completionDestinations: settings.completionDestinations,
+    serveConfiguration: settings.serveConfiguration,
     ...(boundaries.now === undefined ? {} : { now: boundaries.now })
   };
   return Object.freeze({ config: settings.gateway, dependencies: Object.freeze(dependencies) });

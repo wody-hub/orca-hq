@@ -2192,6 +2192,36 @@ export class ControlStore implements CommandIngress {
     })();
   }
 
+  recoverExpiredOutboxClaims(nowInput: string, claimTtlMsInput: number): number {
+    const now = normalizeTimestamp(z.string().datetime().parse(nowInput));
+    const claimTtlMs = z.number().int().positive().max(60 * 60_000).parse(claimTtlMsInput);
+    const cutoff = new Date(new Date(now).getTime() - claimTtlMs).toISOString();
+    return this.database.transaction(() => {
+      const rows = this.database.prepare(`
+        SELECT id
+        FROM outbox_messages
+        WHERE state = 'claimed' AND (claimed_at IS NULL OR claimed_at <= ?)
+        ORDER BY id
+      `).all(cutoff) as Array<{ id: string }>;
+      for (const { id } of rows) {
+        const recovered = this.database.prepare(`
+          UPDATE outbox_messages
+          SET state = 'pending', claimed_by = NULL, claimed_at = NULL,
+              next_attempt_at = MIN(next_attempt_at, ?), updated_at = ?
+          WHERE id = ? AND state = 'claimed'
+            AND (claimed_at IS NULL OR claimed_at <= ?)
+        `).run(now, now, id, cutoff);
+        if (recovered.changes !== 1) continue;
+        this.appendAudit({
+          subjectId: id,
+          eventType: "outbox.claim_recovered",
+          data: {}
+        });
+      }
+      return rows.length;
+    }).immediate();
+  }
+
   getOutbox(idInput: string): OutboxMessage | undefined {
     const id = z.string().min(1).parse(idInput);
     const row = this.database.prepare(`

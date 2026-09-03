@@ -13,6 +13,10 @@ import { ControlStore, openDatabase, OutboxDispatcher, type OutboxDispatcherOpti
 import { WorktreeLockService } from "@orca-hq/project-registry";
 import type { ProjectRegistryEntry } from "@orca-hq/project-registry";
 import {
+  diagnoseServeConfiguration,
+  type ServeConfiguration
+} from "@orca-hq/tailscale-adapter";
+import {
   ExecutionLifecycle,
   ExecutionService,
   VerificationService,
@@ -32,12 +36,15 @@ import {
   type GatewayCommand,
   type GatewayConfig,
   type GatewayConfigPort,
+  type GatewayDiagnostic,
   type GatewayIngressPort,
   type GatewayTransactionPort
 } from "./lifecycle.js";
 import { wireAbortSignals } from "./main.js";
 import { createCommandDashboard, createProjectDashboard } from "./dashboard.js";
 import { createHttpApp, type ApprovalConfirmationPort, type DispatchActionPort, type GatewayHttpOptions } from "./http.js";
+import { validateGatewayConfig } from "./config.js";
+import { GatewayOutboxDriver } from "./outbox-driver.js";
 
 export interface GatewayDispatchControlPort {
   stop(input: Readonly<{ dispatchId: string; idempotencyKey: string }>): Promise<boolean>;
@@ -90,6 +97,8 @@ export interface GatewayProductionDependencies {
     slack: string;
     tailscaleWeb: string;
   }>;
+  /** Host-owned observation of the active Tailscale Serve configuration. */
+  readonly serveConfiguration?: Omit<ServeConfiguration, "gatewayHttpPort"> | undefined;
 }
 
 export interface GatewayProductionServices {
@@ -438,6 +447,8 @@ export async function createProductionGateway(
   config: GatewayConfig,
   dependencies: GatewayProductionDependencies
 ): Promise<Readonly<{ gateway: Gateway; services: GatewayProductionServices }>> {
+  const runtimeConfig = validateGatewayConfig(config);
+  const now = dependencies.now ?? (() => new Date());
   const completionDestinations = requireCompletionDestinations(
     dependencies.completionDestinations
   );
@@ -445,6 +456,7 @@ export async function createProductionGateway(
   // validation is the first lifecycle operation and a rejected config leaves no handle.
   let services: GatewayProductionServices | undefined;
   let commandFlow: ReturnType<typeof productionCommandFlow> | undefined;
+  let outboxDriver: GatewayOutboxDriver | undefined;
   let http: GatewayIngressPort | undefined = dependencies.http;
   const requireServices = (): GatewayProductionServices => {
     if (services === undefined) throw new Error("production services are unavailable before configuration validation");
@@ -457,19 +469,18 @@ export async function createProductionGateway(
   for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "httpApp"] as const) {
     Object.defineProperty(exposedServices, key, { enumerable: true, get: () => requireServices()[key] });
   }
-  const gateway = await createGateway(config, {
+  const gateway = await createGateway(runtimeConfig, {
     config: dependencies.config,
     database: {
       async migrate() {
         // openDatabase owns WAL, foreign keys, and idempotent migration.
         let database: ReturnType<typeof openDatabase> | undefined;
         try {
-          database = openDatabase(config.databasePath);
+          database = openDatabase(runtimeConfig.databasePath);
           const store = new ControlStore(database);
           const locks = new WorktreeLockService(store);
           const lifecycle = new ExecutionLifecycle({ store });
           const hq = repositoryHq(dependencies.proposalModel, dependencies.projects);
-          const now = dependencies.now ?? (() => new Date());
           const verification = new VerificationService({
             store,
             completionTarget: (report) => verificationCompletionTarget(
@@ -500,6 +511,19 @@ export async function createProductionGateway(
               : { workerLaunchPolicy: dependencies.execution.workerLaunchPolicy })
           });
           const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
+          outboxDriver = new GatewayOutboxDriver({
+            dispatcher: outbox,
+            now,
+            pollMs: runtimeConfig.outboxPollMs,
+            maxBackoffMs: runtimeConfig.outboxMaxBackoffMs,
+            auditFailure() {
+              store.appendAudit({
+                subjectId: "gateway",
+                eventType: "outbox.tick_failed",
+                data: {}
+              });
+            }
+          });
           commandFlow = productionCommandFlow(
             store,
             hq,
@@ -516,7 +540,9 @@ export async function createProductionGateway(
             });
             httpApp = app;
             http = {
-              async start() { await app.listen({ host: "127.0.0.1", port: 0 }); },
+              async start() {
+                await app.listen({ host: "127.0.0.1", port: runtimeConfig.httpPort });
+              },
               async stopIngress() { await app.close(); }
             };
           }
@@ -538,10 +564,54 @@ export async function createProductionGateway(
     },
     orca: { async check() { await orca.health(); } },
     reconcile: async () => {
-      // Durable stores are the recovery source of truth. The deployment module
-      // cannot replace this reconciliation step with prebuilt state transitions.
-      requireServices().store.listRunRecords();
-      requireServices().store.listOutbox();
+      const store = requireServices().store;
+      const reconciledAt = now().toISOString();
+      store.recoverExpiredOutboxClaims(reconciledAt, runtimeConfig.outboxClaimTtlMs);
+      if (commandFlow !== undefined) {
+        for (const approval of store.listApprovals()) {
+          if (approval.state === "approved") {
+            try {
+              await commandFlow.resumeApproval(approval.request.approvalId);
+            } catch {
+              // Durable state remains authoritative; unresolved work is diagnosed below.
+            }
+          }
+        }
+      }
+      const activeRuns = store.listRunRecords().filter((run) => {
+        if (typeof run !== "object" || run === null || Array.isArray(run)) return true;
+        const state = run.state;
+        return typeof state !== "string" || ![
+          "verified_success",
+          "investigation_complete",
+          "intervention_required",
+          "waiting_approval"
+        ].includes(state);
+      }).length;
+      const activeDispatches = store.listTasks().flatMap((task) =>
+        store.loadDispatchesForTask(task.id)
+      ).filter((dispatch) => {
+        if (typeof dispatch !== "object" || dispatch === null || Array.isArray(dispatch)) return true;
+        const state = dispatch.state;
+        return typeof state !== "string" || [
+          "planned",
+          "launching",
+          "running",
+          "launch_failure_reserved"
+        ].includes(state);
+      }).length;
+      if (activeRuns === 0 && activeDispatches === 0) return [];
+      store.appendAudit({
+        subjectId: "gateway",
+        eventType: "gateway.reconciliation_incomplete",
+        data: { activeRuns, activeDispatches }
+      });
+      return [Object.freeze({
+        component: "reconciliation",
+        code: "reconciliation_incomplete",
+        activeRuns,
+        activeDispatches
+      }) satisfies GatewayDiagnostic];
     },
     http: {
       async start() {
@@ -549,6 +619,34 @@ export async function createProductionGateway(
         await http.start();
       },
       async stopIngress() { await http?.stopIngress(); }
+    },
+    diagnoseHttp: async () => {
+      if (dependencies.serveConfiguration === undefined) return [];
+      const diagnostic = diagnoseServeConfiguration({
+        ...dependencies.serveConfiguration,
+        gatewayHttpPort: runtimeConfig.httpPort
+      });
+      if (diagnostic.kind === "valid") return [];
+      const safe = Object.freeze({
+        component: "tailscale-serve",
+        code: "serve_configuration_invalid",
+        reasons: Object.freeze([...diagnostic.reasons])
+      }) satisfies GatewayDiagnostic;
+      requireServices().store.appendAudit({
+        subjectId: "gateway",
+        eventType: "gateway.serve_configuration_invalid",
+        data: { reasons: [...diagnostic.reasons] }
+      });
+      return [safe];
+    },
+    outbox: {
+      async start(reportDiagnostic) {
+        if (outboxDriver === undefined) throw new Error("production Outbox driver is unavailable");
+        await outboxDriver.start(reportDiagnostic);
+      },
+      async stop() {
+        await outboxDriver?.stop();
+      }
     },
     slack: dependencies.slack,
     telegram: dependencies.telegram,

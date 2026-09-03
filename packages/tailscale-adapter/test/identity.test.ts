@@ -169,6 +169,7 @@ describe("Serve diagnostics", () => {
     funnelEnabled: false,
     publicExposure: false,
     gatewayBindAddress: "127.0.0.1",
+    gatewayHttpPort: 4310,
     upstreamAddress: "[::1]:4310",
     httpsEnabled: true,
     advertisedHost: "hq.example.ts.net",
@@ -181,6 +182,8 @@ describe("Serve diagnostics", () => {
     expect(diagnoseServeConfiguration({ ...valid, publicExposure: true }).kind).toBe("invalid");
     expect(diagnoseServeConfiguration({ ...valid, gatewayBindAddress: "0.0.0.0" }).kind).toBe("invalid");
     expect(diagnoseServeConfiguration({ ...valid, upstreamAddress: "100.64.0.4:4310" }).kind).toBe("invalid");
+    expect(diagnoseServeConfiguration({ ...valid, upstreamAddress: "127.0.0.1:4311" }))
+      .toEqual({ kind: "invalid", reasons: ["upstream_port_mismatch"] });
     expect(diagnoseServeConfiguration({ ...valid, httpsEnabled: false }).kind).toBe("invalid");
     expect(diagnoseServeConfiguration({ ...valid, advertisedHost: "evil-example.ts.net" }).kind).toBe("invalid");
   });

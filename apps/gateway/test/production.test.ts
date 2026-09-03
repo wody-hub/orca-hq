@@ -1,13 +1,42 @@
 import { access, mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 import { ApprovalService, IdentityResolver, type PrincipalBinding } from "@orca-hq/core";
+import { ControlStore, openDatabase } from "@orca-hq/persistence";
 import type { ProjectRegistryEntry } from "@orca-hq/project-registry";
 import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
 
 import { createProductionGateway, type GatewayProductionDependencies } from "../src/production.js";
+
+async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let failure: unknown;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      failure = error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw failure;
+}
+
+async function availablePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test port unavailable");
+  await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+  return address.port;
+}
 
 const sandboxProject = {
   projectKey: "sandbox",
@@ -42,6 +71,200 @@ function dependencies(events: string[], valid = true): GatewayProductionDependen
 }
 
 describe("production gateway composition", () => {
+  it("requeues a stale Outbox claim on restart and lifecycle-delivers it", async () => {
+    // Break caught: reconciliation reads stale claims without making them eligible for the lifecycle-owned driver.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-reconcile-outbox-"));
+    const path = join(directory, "control.sqlite");
+    const seededDatabase = openDatabase(path);
+    const seededStore = new ControlStore(seededDatabase);
+    seededStore.enqueueOutbox({
+      id: "stale-message",
+      channel: "tailscale-web",
+      destination: "/commands/stale",
+      template: "success",
+      payload: { text: "recovered" },
+      nextAttemptAt: "2026-09-03T00:00:00.000Z"
+    });
+    expect(seededStore.claimOutbox("2026-09-03T00:00:00.000Z", "crashed-worker"))
+      .toMatchObject({ state: "claimed" });
+    seededDatabase.close();
+    const deliveries: string[] = [];
+    const events: string[] = [];
+    const recoveryDependencies: GatewayProductionDependencies = {
+      ...dependencies(events),
+      now: () => new Date("2026-09-03T00:02:00.000Z"),
+      outbox: {
+        workerId: "replacement-worker",
+        providers: {
+          "tailscale-web": {
+            async deliver(message) {
+              deliveries.push((message.payload as { text: string }).text);
+              return { providerMessageId: "recovered-1" };
+            }
+          }
+        }
+      }
+    };
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        outboxPollMs: 10,
+        outboxClaimTtlMs: 60_000
+      }, recoveryDependencies);
+      await composition.gateway.start();
+      await eventually(() => {
+        expect(composition?.services.store.getOutbox("stale-message")?.state).toBe("delivered");
+      });
+
+      expect(deliveries).toEqual(["recovered"]);
+      expect(composition.services.store.listAuditEvents()).toContainEqual(
+        expect.objectContaining({ eventType: "outbox.claim_recovered" })
+      );
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces nonterminal durable work as reconciliation_incomplete", async () => {
+    // Break caught: startup reports reconciled after discarding nonterminal Run and Dispatch observations.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-reconcile-run-"));
+    const path = join(directory, "control.sqlite");
+    const database = openDatabase(path);
+    const store = new ControlStore(database);
+    store.insertCommand({
+      commandId: "active-command",
+      idempotencyKey: "active-command:key",
+      channel: "slack",
+      externalMessageId: "slack:active-command",
+      principalId: "owner",
+      receivedAt: "2026-09-03T00:00:00.000Z",
+      text: "active work"
+    });
+    store.saveRun({
+      id: "active-run",
+      proposalId: "active-proposal",
+      commandId: "active-command",
+      objective: "active work",
+      state: "active"
+    });
+    database.close();
+    const events: string[] = [];
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway(
+        { databasePath: path, shutdownDrainMs: 1_000 },
+        { ...dependencies(events), now: () => new Date("2026-09-03T00:02:00.000Z") }
+      );
+      await composition.gateway.start();
+
+      expect(composition.gateway.diagnostics).toContainEqual({
+        component: "reconciliation",
+        code: "reconciliation_incomplete",
+        activeRuns: 1,
+        activeDispatches: 0
+      });
+      expect(composition.services.store.listAuditEvents()).toContainEqual(
+        expect.objectContaining({
+          eventType: "gateway.reconciliation_incomplete",
+          data: { activeRuns: 1, activeDispatches: 0 }
+        })
+      );
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the configured HTTP port and reports a redacted Tailscale Serve upstream mismatch", async () => {
+    // Break caught: production ignores the configured stable port and never runs Serve diagnostics after HTTP starts.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-http-port-"));
+    const path = join(directory, "control.sqlite");
+    const port = await availablePort();
+    const mismatchedPort = port === 65_535 ? port - 1 : port + 1;
+    const events: string[] = [];
+    const owner: PrincipalBinding = {
+      principalId: "owner", slackUserIds: [], telegramUserIds: [], telegramChatIds: [],
+      tailscaleLoginNames: ["owner@example.test"], roles: ["owner"]
+    };
+    const { http: _http, ...baseDependencies } = dependencies(events);
+    const fixedPortDependencies = {
+      ...baseDependencies,
+      httpOptions: {
+        bindings: [owner], resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
+        sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(1) }), peerAddress: () => "127.0.0.1",
+        allowedOrigin: "https://hq.tailnet.example", csrfSigningKey: new Uint8Array(32).fill(2)
+      },
+      serveConfiguration: {
+        funnelEnabled: false,
+        publicExposure: false,
+        gatewayBindAddress: "127.0.0.1",
+        upstreamAddress: `127.0.0.1:${mismatchedPort}`,
+        httpsEnabled: true,
+        advertisedHost: "hq.example.ts.net",
+        expectedTailnetDnsSuffix: "example.ts.net"
+      }
+    } satisfies GatewayProductionDependencies;
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        httpPort: port
+      }, fixedPortDependencies);
+      await composition.gateway.start();
+      const address = composition.services.httpApp?.server.address();
+      expect(address).toMatchObject({ address: "127.0.0.1", port });
+      expect(composition.gateway.diagnostics).toContainEqual({
+        component: "tailscale-serve",
+        code: "serve_configuration_invalid",
+        reasons: ["upstream_port_mismatch"]
+      });
+      expect(JSON.stringify(composition.gateway.diagnostics)).not.toContain(String(mismatchedPort));
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("absorbs Outbox driver failures with redacted diagnostics and bounded retry", async () => {
+    // Break caught: a scheduled tick rejection becomes an unhandled process failure or leaks its raw cause.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-outbox-failure-"));
+    const path = join(directory, "control.sqlite");
+    const events: string[] = [];
+    let clockReads = 0;
+    const failingClock = () => {
+      clockReads += 1;
+      if (clockReads === 1) return new Date("2026-09-03T00:00:00.000Z");
+      throw new Error("token=driver-secret-must-not-leak");
+    };
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        outboxPollMs: 5,
+        outboxMaxBackoffMs: 20
+      }, { ...dependencies(events), now: failingClock });
+      await composition.gateway.start();
+      await eventually(() => {
+        expect(composition?.gateway.diagnostics).toContainEqual({
+          component: "outbox",
+          code: "outbox_tick_failed"
+        });
+      });
+      expect(composition.gateway.status.kind).toBe("running");
+      expect(JSON.stringify(composition.services.store.listAuditEvents()))
+        .not.toContain("driver-secret-must-not-leak");
+      expect(clockReads).toBeLessThan(20);
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("returns a typed audited failure when the accepted command is not durable", async () => {
     // Break caught: a command/store mismatch throws through the ingress adapter before any audit evidence is committed.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-command-missing-"));
@@ -217,7 +440,12 @@ describe("production gateway composition", () => {
       }
     };
     try {
-      const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
+      const composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        httpPort: 0,
+        allowEphemeralHttpPortForTests: true
+      }, productionDependencies);
       await composition.gateway.start();
       composition.services.store.insertCommand({ commandId: "command-1", idempotencyKey: "key-1", channel: "telegram", externalMessageId: "20:1", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
       const proposal = { proposalId: "proposal-1", commandId: "command-1", selectedProjectKey: "sandbox", routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias"] }], allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L1" as const, tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement" as const, preferredAgent: "codex" as const }] };
@@ -257,7 +485,12 @@ describe("production gateway composition", () => {
       }
     };
     try {
-      const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
+      const composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        httpPort: 0,
+        allowEphemeralHttpPortForTests: true
+      }, productionDependencies);
       await composition.gateway.start();
       const approvalService = new ApprovalService(composition.services.store);
       for (const [commandId, riskLevel, operation] of [
@@ -315,7 +548,12 @@ describe("production gateway composition", () => {
       }
     };
     try {
-      const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
+      const composition = await createProductionGateway({
+        databasePath: path,
+        shutdownDrainMs: 1_000,
+        httpPort: 0,
+        allowEphemeralHttpPortForTests: true
+      }, productionDependencies);
       await composition.gateway.start();
       composition.services.store.insertCommand({ commandId: "command-action", idempotencyKey: "key-action", channel: "tailscale-web", externalMessageId: "action", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
       composition.services.store.saveRun({ id: "run-action", proposalId: "proposal-action", commandId: "command-action", state: "active" });

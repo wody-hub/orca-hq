@@ -43,7 +43,12 @@ function externalBoundaries(directory: string, events: string[]): GatewayExterna
   });
   return {
     settings: {
-      gateway: { databasePath: join(directory, "control.sqlite"), shutdownDrainMs: 1_000 },
+      gateway: {
+        databasePath: join(directory, "control.sqlite"),
+        shutdownDrainMs: 1_000,
+        httpPort: 0,
+        allowEphemeralHttpPortForTests: true
+      },
       projectRegistryPath,
       discoveredProjects: [{ orcaProjectId: "orca-sandbox", absolutePath: directory, approved: true }],
       assignmentArtifactRootDirectory: join(directory, "assignments"),
@@ -51,6 +56,15 @@ function externalBoundaries(directory: string, events: string[]): GatewayExterna
       completionDestinations: {
         slack: "C-HQ-COMPLETIONS",
         tailscaleWeb: "/commands/completed"
+      },
+      serveConfiguration: {
+        funnelEnabled: false,
+        publicExposure: false,
+        gatewayBindAddress: "127.0.0.1",
+        upstreamAddress: "127.0.0.1:0",
+        httpsEnabled: true,
+        advertisedHost: "hq.example.ts.net",
+        expectedTailnetDnsSuffix: "example.ts.net"
       }
     },
     secrets: { async validate() { events.push("config.valid"); } },

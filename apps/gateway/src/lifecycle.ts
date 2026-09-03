@@ -13,11 +13,28 @@ export type GatewayStatus = Readonly<
   | { kind: "failed"; degradedChannels: readonly GatewayChannel[] }
 >;
 
-export type GatewayDiagnostic = Readonly<{
-  channel: GatewayChannel;
-  /** Stable, safe category only. Provider messages and credential details must not escape. */
-  code: "channel_start_failed";
-}>;
+export type GatewayDiagnostic = Readonly<
+  | {
+      channel: GatewayChannel;
+      /** Stable, safe category only. Provider messages and credential details must not escape. */
+      code: "channel_start_failed";
+    }
+  | {
+      component: "outbox";
+      code: "outbox_tick_failed";
+    }
+  | {
+      component: "reconciliation";
+      code: "reconciliation_incomplete";
+      activeRuns: number;
+      activeDispatches: number;
+    }
+  | {
+      component: "tailscale-serve";
+      code: "serve_configuration_invalid";
+      reasons: readonly string[];
+    }
+>;
 
 export interface GatewayConfigPort {
   /** Must include Keychain-backed secret access validation and reject on denial. */
@@ -39,6 +56,11 @@ export interface GatewayOrcaPort {
 export interface GatewayIngressPort {
   start(): Promise<void>;
   stopIngress(): Promise<void>;
+}
+
+export interface GatewayOutboxPort {
+  start(reportDiagnostic: (diagnostic: GatewayDiagnostic) => void): Promise<void>;
+  stop(): Promise<void>;
 }
 
 export interface GatewayTransactionPort {
@@ -83,8 +105,11 @@ export interface RuntimeAdapters {
   readonly database: GatewayDatabasePort;
   readonly orca: GatewayOrcaPort;
   /** Reconciles durable queues, channel cursors, Outbox claims, and nonterminal Orca state. */
-  readonly reconcile: () => Promise<void>;
+  readonly reconcile: () => Promise<readonly GatewayDiagnostic[] | void>;
   readonly http: GatewayIngressPort;
+  /** Runs after the loopback listener exists so its configured Serve upstream can be compared. */
+  readonly diagnoseHttp?: (() => Promise<readonly GatewayDiagnostic[]>) | undefined;
+  readonly outbox: GatewayOutboxPort;
   readonly slack: GatewayIngressPort;
   readonly telegram: GatewayIngressPort;
   readonly transactions: GatewayTransactionPort;
@@ -110,6 +135,7 @@ export class Gateway {
   #status: GatewayStatus = snapshot("created", this.#degraded);
   #databaseOpened = false;
   #httpStarted = false;
+  #outboxStarted = false;
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   #stopRequested = false;
@@ -147,10 +173,17 @@ export class Gateway {
       this.#throwIfStopRequested();
       await this.#adapters.orca.check();
       this.#throwIfStopRequested();
-      await this.#adapters.reconcile();
+      this.#recordDiagnostics(await this.#adapters.reconcile());
       this.#throwIfStopRequested();
       await this.#adapters.http.start();
       this.#httpStarted = true;
+      this.#throwIfStopRequested();
+      if (this.#adapters.diagnoseHttp !== undefined) {
+        this.#recordDiagnostics(await this.#adapters.diagnoseHttp());
+      }
+      this.#throwIfStopRequested();
+      await this.#adapters.outbox.start((diagnostic) => this.#recordDiagnostic(diagnostic));
+      this.#outboxStarted = true;
       this.#throwIfStopRequested();
     } catch (error) {
       // A concurrent stop owns teardown so an already-open ingress is always
@@ -216,9 +249,23 @@ export class Gateway {
     if (this.#httpStarted || this.#startedChannels.size > 0) {
       try {
         await this.#stopIngress();
-        await this.#drainTransactions();
       } catch (error) {
         failure = error;
+      }
+    }
+    if (this.#outboxStarted) {
+      try {
+        await this.#adapters.outbox.stop();
+        this.#outboxStarted = false;
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (this.#httpStarted || this.#startedChannels.size > 0) {
+      try {
+        await this.#drainTransactions();
+      } catch (error) {
+        failure ??= error;
       }
     }
     if (this.#databaseOpened) {
@@ -248,6 +295,24 @@ export class Gateway {
       this.#diagnostics.push(Object.freeze({ channel, code: "channel_start_failed" }));
       await this.#audit();
     }
+  }
+
+  #recordDiagnostics(diagnostics: readonly GatewayDiagnostic[] | void): void {
+    if (diagnostics === undefined) return;
+    for (const diagnostic of diagnostics) this.#recordDiagnostic(diagnostic);
+  }
+
+  #recordDiagnostic(diagnostic: GatewayDiagnostic): void {
+    const frozen = Object.freeze({
+      ...diagnostic,
+      ...("reasons" in diagnostic
+        ? { reasons: Object.freeze([...diagnostic.reasons]) }
+        : {})
+    }) as GatewayDiagnostic;
+    const key = JSON.stringify(frozen);
+    if (this.#diagnostics.some((existing) => JSON.stringify(existing) === key)) return;
+    if (this.#diagnostics.length >= 100) this.#diagnostics.shift();
+    this.#diagnostics.push(frozen);
   }
 
   async #stopIngress(): Promise<void> {

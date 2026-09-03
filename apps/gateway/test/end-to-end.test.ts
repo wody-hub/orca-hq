@@ -44,6 +44,21 @@ const verifierCommands = [{
   auditReference: "audit:verifier:test"
 }];
 
+async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let failure: unknown;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      failure = error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw failure;
+}
+
 function receipt(id: string, result: unknown): OrcaReceipt {
   return { id, ok: true, result };
 }
@@ -237,7 +252,13 @@ function boundaries(
   );
   return {
     settings: {
-      gateway: { databasePath: join(directory, "control.sqlite"), shutdownDrainMs: 1_000 },
+      gateway: {
+        databasePath: join(directory, "control.sqlite"),
+        shutdownDrainMs: 1_000,
+        httpPort: 0,
+        allowEphemeralHttpPortForTests: true,
+        outboxPollMs: 10
+      },
       projectRegistryPath,
       discoveredProjects: [{ orcaProjectId: "orca-sandbox", absolutePath: directory, approved: true }],
       assignmentArtifactRootDirectory: join(directory, "assignments"),
@@ -245,6 +266,15 @@ function boundaries(
       completionDestinations: {
         slack: "C-HQ-COMPLETIONS",
         tailscaleWeb: "/commands/completed"
+      },
+      serveConfiguration: {
+        funnelEnabled: false,
+        publicExposure: false,
+        gatewayBindAddress: "127.0.0.1",
+        upstreamAddress: "127.0.0.1:0",
+        httpsEnabled: true,
+        advertisedHost: "hq.example.ts.net",
+        expectedTailnetDnsSuffix: "example.ts.net"
       }
     },
     secrets: { async validate() {} },
@@ -569,7 +599,10 @@ describe("Gateway production state machine E2E", () => {
       const command = await acceptTelegram501(composition);
       const verificationTask = await completeImplementationAndVerifier(composition);
       await composition.services.execution.recordVerificationReport(reportFor(verificationTask, "pass"));
-      await composition.services.outbox.tick("2026-09-03T00:00:00.000Z");
+      await eventually(() => {
+        expect(composition?.services.store.getOutbox("report-command-501:success")?.state)
+          .toBe("delivered");
+      });
 
       expect(composition.services.store.listRunRecords()).toEqual([
         expect.objectContaining({
@@ -624,7 +657,10 @@ describe("Gateway production state machine E2E", () => {
         const verificationTask = await completeImplementationAndVerifier(composition);
 
         await composition.services.execution.recordVerificationReport(reportFor(verificationTask, "pass"));
-        await composition.services.outbox.tick("2026-09-03T00:00:00.000Z");
+        await eventually(() => {
+          expect(composition?.services.store.getOutbox("report-command-501:success")?.state)
+            .toBe("delivered");
+        });
 
         expect(composition.services.store.listRunRecords()).toEqual([
           expect.objectContaining({
@@ -666,7 +702,6 @@ describe("Gateway production state machine E2E", () => {
       await acceptTelegram501(composition);
       const verificationTask = await completeImplementationAndVerifier(composition);
       await composition.services.execution.recordVerificationReport(reportFor(verificationTask, "fail"));
-      await composition.services.outbox.tick("2026-09-03T00:00:00.000Z");
 
       expect(composition.services.store.listRunRecords()).toEqual([
         expect.objectContaining({ id: "run:proposal-command-501", state: "active" })
