@@ -27,7 +27,18 @@ describe("production command dashboard", () => {
       });
       store.saveTask({
         id: "task-501", runId: "run-501", title: "검증", role: "verify", preferredAgent: "claude",
-        dependsOn: ["task-implement"], state: "verification_failed"
+        dependsOn: ["task-implement"], state: "verification_failed",
+        // This is the durable writer shape produced by verification completion.  A
+        // dashboard regression must read this evidence, not invent a Run field.
+        report: {
+          reportId: "report-501", runId: "run-501", verificationTaskId: "task-501",
+          implementationTaskId: "task-implement", implementationDispatchId: "dispatch-implement", cycle: 0,
+          verdict: "fail", projectRoute: { projectKey: "sandbox", orcaProjectId: "orca-sandbox", repositoryPath: "/srv/sandbox" },
+          changedFiles: ["src/example.ts"], diffSha256: "c".repeat(64), diffSummary: "1 file changed",
+          commands: [{ command: "pnpm test", exitCode: 1, outcome: "failed", auditReference: "audit:test" }],
+          implementationProvider: "codex", verifierProvider: "claude", findings: ["test failed"], evidence: ["audit:test"],
+          auditReferences: ["audit:test"], verifierEffects: { filesModified: false, committed: false, pushed: false, pullRequestChanged: false, merged: false, deployed: false, secretsAccessed: false, productionAccessed: false }
+        }
       });
       store.saveDispatch({ id: "dispatch-501", taskId: "task-501", state: "worker_done" });
       store.appendAudit({ subjectId: "command-501", eventType: "command.accepted", data: {} });
@@ -52,7 +63,8 @@ describe("production command dashboard", () => {
           contract: { allowedScope: ["src"], prohibitedEffects: ["deploy"], testCommands: ["pnpm test"] },
           verification: { status: "failed", commands: ["pnpm test"] },
           tasks: [{ id: "task-501", dependencies: ["task-implement"], verifierFamily: "claude", dispatchId: "dispatch-501", canStop: false, canRetry: false }],
-          approval: { id: "approval-501", level: "L3", digest, status: "pending", permitted: false },
+          diff: { summary: "1 file changed" },
+          approval: { id: "approval-501", level: "L3", digest, operationPhrase: `APPROVE DEPLOY_PRODUCTION ${digest.slice(0, 12).toUpperCase()}`, status: "pending", permitted: false },
           audit: { reference: expect.any(String) }, delivery: []
         });
     } finally {

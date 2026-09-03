@@ -23,13 +23,13 @@ describe("gateway production entry", () => {
     const dependencies: GatewayProductionDependencies = {
       config: { async validate() { events.push("config.valid"); } },
       orca: { async health() { events.push("orca.checked"); return {} as never; }, async execute() { throw new Error("not used"); } },
-      execution: {} as never, hq: {} as never, slackAdapter: {} as never, telegramAdapter: {} as never,
+      execution: {} as never, hq: { async plan() { return { kind: "failure", reason: "invalid_command" } as never; } }, projects: [], slackAdapter: {} as never, telegramAdapter: {} as never,
       http: ingress("http"), slack: ingress("slack"), telegram: ingress("telegram"),
-      transactions: { async drain() {} }, reconcile: async () => { events.push("reconciled"); },
-      commandFlow: { async accept() { return { state: "pending" }; } }, deliveries: { async deliver() {} },
-      outbox: { workerId: "entry-test", providers: {} }
+      transactions: { async drain() {} },
+      outbox: { workerId: "entry-test", providers: {} },
+      dispatchControl: { async stop() { return false; }, async retry() { return false; } }
     };
     await run(async () => ({ config: { databasePath: ":memory:", shutdownDrainMs: 1_000 }, dependencies }));
-    expect(events).toEqual(["config.valid", "orca.checked", "reconciled", "http.started", "slack.started", "telegram.started"]);
+    expect(events).toEqual(["config.valid", "orca.checked", "http.started", "slack.started", "telegram.started"]);
   });
 });

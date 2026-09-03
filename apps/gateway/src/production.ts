@@ -3,6 +3,7 @@ import type { CodexHqSession } from "@orca-hq/codex-hq";
 import { OrcaClient, type OrcaClientOptions } from "@orca-hq/orca-adapter";
 import { ControlStore, openDatabase, OutboxDispatcher, type OutboxDispatcherOptions } from "@orca-hq/persistence";
 import { WorktreeLockService } from "@orca-hq/project-registry";
+import type { ProjectRegistryEntry } from "@orca-hq/project-registry";
 import type { SlackAdapter } from "@orca-hq/slack-adapter";
 import type { TelegramAdapter } from "@orca-hq/telegram-adapter";
 import { ExecutionLifecycle, ExecutionService } from "@orca-hq/worker-routing";
@@ -10,10 +11,9 @@ import { ExecutionLifecycle, ExecutionService } from "@orca-hq/worker-routing";
 import {
   createGateway,
   type Gateway,
-  type GatewayCommandFlowPort,
+  type GatewayCommand,
   type GatewayConfig,
   type GatewayConfigPort,
-  type GatewayDeliveryPort,
   type GatewayIngressPort,
   type GatewayTransactionPort
 } from "./lifecycle.js";
@@ -36,7 +36,10 @@ export interface GatewayProductionDependencies {
   /** A real Orca client is external I/O and may be injected; options construct the default client. */
   readonly orca: OrcaClientOptions | Pick<OrcaClient, "health" | "execute">;
   readonly execution: Omit<ConstructorParameters<typeof ExecutionService>[0], "orca" | "locks" | "lifecycle">;
-  readonly hq: CodexHqSession;
+  /** HQ is the external model/I/O boundary; this module owns consuming its result. */
+  readonly hq: Pick<CodexHqSession, "plan">;
+  /** Validated local registry snapshot supplied by the deployment configuration boundary. */
+  readonly projects: readonly ProjectRegistryEntry[];
   readonly slackAdapter: SlackAdapter;
   readonly telegramAdapter: TelegramAdapter;
   /** Legacy externally-hosted ingress. New hosts should supply httpOptions so production owns createHttpApp. */
@@ -46,12 +49,11 @@ export interface GatewayProductionDependencies {
   readonly slack: GatewayIngressPort;
   readonly telegram: GatewayIngressPort;
   readonly transactions: GatewayTransactionPort;
-  readonly reconcile: (services: GatewayProductionServices) => Promise<void>;
-  readonly commandFlow: GatewayCommandFlowPort;
-  readonly deliveries: GatewayDeliveryPort;
+  /** @deprecated only retained for durable adapter recovery hooks during migration. */
+  readonly reconcile?: (services: GatewayProductionServices) => Promise<void>;
   readonly outbox: Omit<OutboxDispatcherOptions, "store">;
-  /** Orca dispatch control is an injected external-I/O boundary; route adapters remain production-owned. */
-  readonly dispatchControl?: GatewayDispatchControlPort;
+  /** Required external Orca control boundary. Production refuses to expose mutating routes without it. */
+  readonly dispatchControl: GatewayDispatchControlPort;
   /** Injectable clock for approval expiry tests; production defaults to the system clock. */
   readonly now?: () => Date;
 }
@@ -62,7 +64,7 @@ export interface GatewayProductionServices {
   readonly orca: Pick<OrcaClient, "health" | "execute">;
   readonly locks: WorktreeLockService;
   readonly execution: ExecutionService;
-  readonly hq: CodexHqSession;
+  readonly hq: Pick<CodexHqSession, "plan">;
   readonly outbox: OutboxDispatcher;
   readonly slackAdapter: SlackAdapter;
   readonly telegramAdapter: TelegramAdapter;
@@ -81,26 +83,48 @@ function approvalAdapter(store: ControlStore, now: () => Date): ApprovalConfirma
   const service = new ApprovalService(store);
   return {
     async confirmExisting(input) {
-      const persisted = store.findApproval(input.approvalId);
-      if (persisted === undefined) return { kind: "denied" };
-      if (persisted.request.digest !== input.digest) return { kind: "changed" };
-      const request = service.request(persisted.request);
-      const decision = service.confirm(request, approvalPrincipal(input.principal), now(), input.phrase);
-      if (decision.kind === "changed") return { kind: "changed" };
-      if (decision.kind !== "approved") return { kind: "denied" };
-      const confirmed = store.findApproval(input.approvalId)?.approval;
-      return confirmed === undefined ? { kind: "denied" } : { kind: "approved", expiresAt: confirmed.expiresAt };
+      try {
+        const persisted = store.findApproval(input.approvalId);
+        if (persisted === undefined) return { kind: "denied" };
+        if (persisted.request.digest !== input.digest) return { kind: "changed" };
+        // `request()` is deliberately not called here: this is a durable request,
+        // not new user input, and persisted records include server-derived fields
+        // rejected by ApprovalRequestInputSchema.  Restore only the redacted L3
+        // display phrase required by the strict approval request contract.
+        const operation = persisted.request.operation.trim().replace(/[\s-]+/g, "_").toUpperCase();
+        const request = {
+          ...persisted.request,
+          ...(persisted.request.riskLevel === "L3" ? {
+            operationPhrase: `APPROVE ${operation} ${persisted.request.digest.slice(0, 12).toUpperCase()}`
+          } : {})
+        };
+        const decision = service.confirm(request, approvalPrincipal(input.principal), now(), input.phrase);
+        if (decision.kind === "changed") return { kind: "changed" };
+        if (decision.kind !== "approved") return { kind: "denied" };
+        const confirmed = store.findApproval(input.approvalId)?.approval;
+        return confirmed === undefined ? { kind: "denied" } : { kind: "approved", expiresAt: confirmed.expiresAt };
+      } catch {
+        // Invalid or stale durable content must never turn into an approval.
+        return { kind: "denied" };
+      }
     }
   };
 }
 
-function actionAdapter(store: ControlStore, control: GatewayDispatchControlPort | undefined): DispatchActionPort {
+function actionAdapter(store: ControlStore, control: GatewayDispatchControlPort): DispatchActionPort {
   const exists = (dispatchId: string): boolean => store.listTasks()
     .some((task) => store.loadDispatchesForTask(task.id).some((dispatch) => record(dispatch).id === dispatchId));
   const record = (value: unknown): Record<string, unknown> =>
     typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const action = async (kind: "stop" | "retry", input: Readonly<{ dispatchId: string; idempotencyKey: string }>) => {
-    if (!exists(input.dispatchId) || control === undefined) return { kind: "denied" } as const;
+    if (!exists(input.dispatchId)) return { kind: "denied" } as const;
+    const prior = store.listAuditEvents().find((event) =>
+      record(event.data).idempotencyKey === input.idempotencyKey
+    );
+    if (prior !== undefined) {
+      if (prior.subjectId !== input.dispatchId || prior.eventType !== `dispatch.${kind}_requested`) return { kind: "denied" } as const;
+      return { kind: kind === "stop" ? "stopped" : "retried" } as const;
+    }
     const accepted = await control[kind](input);
     if (!accepted) return { kind: "denied" } as const;
     store.appendAudit({ subjectId: input.dispatchId, eventType: `dispatch.${kind}_requested`, data: { idempotencyKey: input.idempotencyKey } });
@@ -114,6 +138,28 @@ function actionAdapter(store: ControlStore, control: GatewayDispatchControlPort 
     async retry(input) {
       const result = await action("retry", input);
       return result.kind === "retried" ? { kind: "retried" as const } : { kind: "denied" as const };
+    }
+  };
+}
+
+function productionCommandFlow(
+  store: ControlStore,
+  hq: Pick<CodexHqSession, "plan">,
+  execution: ExecutionService,
+  projects: readonly ProjectRegistryEntry[]
+) {
+  return {
+    async accept(command: GatewayCommand) {
+      const durable = store.listCommands().find((candidate) => candidate.commandId === command.commandId);
+      if (durable === undefined) throw new Error("Gateway command is not durably accepted");
+      const result = await hq.plan(durable);
+      if (result.kind !== "proposal") return { state: result.kind };
+      const proposal = result.proposal;
+      store.saveExecutionProposal(proposal);
+      const project = projects.find((candidate) => candidate.projectKey === proposal.selectedProjectKey);
+      if (project === undefined) return { state: "review_required" };
+      const started = await execution.start({ authorization: "authorized", proposal, project });
+      return { state: started.kind === "started" ? "active" : started.kind };
     }
   };
 }
@@ -180,7 +226,12 @@ export async function createProductionGateway(
       }
     },
     orca: { async check() { await orca.health(); } },
-    reconcile: () => dependencies.reconcile(requireServices()),
+    reconcile: async () => {
+      // Durable stores are the recovery source of truth; startup never delegates
+      // reconciliation ownership to a deployment bootstrap module.
+      requireServices().store.listRunRecords();
+      await dependencies.reconcile?.(requireServices());
+    },
     http: {
       async start() {
         if (http === undefined) throw new Error("production HTTP security configuration is required");
@@ -191,8 +242,12 @@ export async function createProductionGateway(
     slack: dependencies.slack,
     telegram: dependencies.telegram,
     transactions: dependencies.transactions,
-    commandFlow: dependencies.commandFlow,
-    deliveries: dependencies.deliveries,
+    commandFlow: {
+      async accept(command) {
+        const services = requireServices();
+        return productionCommandFlow(services.store, dependencies.hq, services.execution, dependencies.projects).accept(command);
+      }
+    },
     audit: {
       append(input) {
         // The initial "starting" audit occurs before config validation; there is

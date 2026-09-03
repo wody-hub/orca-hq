@@ -214,3 +214,43 @@ git diff --check                               exit 0
 
 - self-review에서 unknown risk가 L0으로 강등되지 않는지, approval/dispatch adapter가 undefined 500이 아니라 durable fail-closed 결정을 내리는지, config 거부 시 DB 파일 생성 계약이 유지되는지 확인했다.
 - 실제 Slack/Telegram/Tailscale/Keychain/Orca credential 또는 설정은 생성·변경하지 않았다. Playwright가 만든 `apps/web/test-results/.last-run.json`은 untracked test artifact로 남아 있으며 커밋하지 않는다.
+
+## 수정 4차
+
+### RED/GREEN 증거
+
+- RED: `pnpm vitest run apps/gateway/test/dashboard.test.ts`에서 durable verifier Task의 `report.diffSummary`가 있어도 dashboard가 `"pending"`을 반환하고 L3 `operationPhrase`가 없는 것을 재현했다. GREEN: 같은 테스트는 verifier report의 `"1 file changed"`와 immutable digest에서 재구성한 `APPROVE DEPLOY_PRODUCTION ...` 문구를 검증한다.
+- RED: `pnpm vitest run apps/gateway/test/production.test.ts`에서 정확한 L2 digest 확인은 기존 production adapter의 `service.request(persisted.request)` strict-schema 오류 때문에 HTTP 400을 반환했다. GREEN: 실제 loopback HTTP에서 L2 200, 잘못된 L3 phrase 403, 정확히 재구성된 L3 phrase 200을 확인했다.
+- RED: 같은 production 테스트에서 동일 stop idempotency key가 external control을 두 번 호출했다. GREEN: 실제 durable dispatch 대상으로 stop/retry HTTP 200, 외부 control 각 한 번, `dispatch.stop_requested`/`dispatch.retry_requested` audit 두 건을 확인했다.
+
+### 변경 데이터 흐름
+
+- dashboard의 diff는 존재하지 않는 `RunRecord.diffSummary` 대신 terminal verifier Task payload의 durable `report.diffSummary`에서 계산한다. verification evidence가 없으면만 `pending`을 반환한다.
+- persisted approval은 새 request로 다시 parse하지 않고 immutable durable request를 복원한다. L3 문구는 operation과 digest에서 정규화해 서버 projection과 confirmation 양쪽에서 재구성하며, malformed/stale durable 값은 catch하여 fail-closed 한다.
+- production HTTP action은 optional deny-all을 제거하고 필수 `dispatchControl`을 요구한다. durable dispatch 존재, idempotency key의 동일 대상/action, redacted audit을 확인한 뒤에만 I/O port를 호출한다.
+- production composition은 외부 `commandFlow`와 delivery port를 받지 않는다. 저장소 코드가 durable command를 HQ 계획으로 넘기고 proposal을 저장한 다음 등록 project와 concrete `ExecutionService.start`를 연결한다.
+
+### Finding별 self-review
+
+| Finding | 결과 |
+| --- | --- |
+| C1 | `commandFlow`/delivery 외부 주입을 제거했으나, legacy reconcile hook과 execution option 경계는 추가 구조 정리가 필요하다. |
+| C3, N3, N12 | production command flow는 repository-owned로 바뀌었지만 기존 end-to-end 테스트가 실제 ExecutionService의 worker/verifier completion까지 아직 실행하지 않아 남은 회귀가 있다. |
+| I1, N21 | terminal verifier report의 durable diff summary를 HTTP dashboard projection으로 사용해 해결했다. |
+| N9, N19 | strict input 재투입을 없애고 valid L2/L3 HTTP 성공과 mismatch fail-closed를 회귀했다. |
+| N20 | required dispatch control, real durable dispatch HTTP 성공, 동일 key idempotency/audit 회귀를 추가했다. |
+| N22 | immutable digest 기반 L3 phrase projection을 복원해 UI가 정확한 문구를 표시·입력할 수 있게 했다. |
+
+### 검증
+
+```text
+pnpm test                                      30 files, 505 tests passed
+pnpm typecheck                                 exit 0
+pnpm build                                     exit 0 (13 workspace projects)
+pnpm --filter @orca-hq/web test:e2e            4 passed
+git diff --check                               exit 0
+```
+
+### 남은 우려
+
+- C1/C3/N3/N12의 권위 있는 요구인 repository-owned host 성공 경로와 실제 ExecutionService의 worker→verifier→verification-failure Outbox 차단 E2E는 아직 별도 RED/GREEN으로 완결하지 못했다. 이 절의 변경은 해당 사실을 숨기지 않으며, 후속 작업에서 external bootstrap dependency를 Keychain/channel/Orca 경계로 더 축소하고 full durable state-machine E2E를 추가해야 한다.

@@ -36,6 +36,20 @@ function verification(state: string): VerificationStatus {
   if (state === "verification_failed" || state === "intervention_required" || state.endsWith("_failed")) return "failed";
   return "pending";
 }
+/**
+ * The persisted approval deliberately omits its display phrase.  Rebuild it
+ * from the immutable operation digest using the same canonical grammar as the
+ * approval service; no user-supplied string is ever reflected here.
+ */
+function approvalPhrase(operation: string, digest: string): string {
+  const normalizedOperation = operation.trim().replace(/[\s-]+/g, "_").toUpperCase();
+  return `APPROVE ${normalizedOperation} ${digest.slice(0, 12).toUpperCase()}`;
+}
+function verificationDiffSummary(tasks: ReturnType<ControlStore["listTasks"]>, runId: string): string {
+  const verifier = tasks.find((task) => task.runId === runId && task.role === "verify"
+    && (task.state === "verified_success" || task.state === "verification_failed" || task.state === "intervention_required"));
+  return verifier === undefined ? "pending" : text(record(record(verifier.payload).report).diffSummary, "pending");
+}
 function latestRun(store: ControlStore, commandId: string): JsonValue | undefined {
   return store.listRunRecords().filter((item) => record(item).commandId === commandId).at(-1);
 }
@@ -63,6 +77,7 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
       const runValue = record(run);
       const runId = text(runValue.id, "");
       const proposal = proposalFrom(run);
+      const durableTasks = store.listTasks();
       const verifier = store.listTasks().find((item) => item.runId === runId && text(record(item.payload).role, "") === "verify");
       const verifierFamily = verifier === undefined ? "unknown" : text(record(verifier.payload).preferredAgent, "unknown");
       const tasks = store.listTasks().filter((item) => item.runId === runId).map((item) => {
@@ -97,12 +112,15 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
           : { base: proposal.baseRef ?? "unknown", allowedScope: proposal.allowedScope, prohibitedEffects: proposal.prohibitedEffects, testCommands: proposal.acceptanceCommands },
         tasks,
         verification: { status: verification(base.status), commands: proposal?.acceptanceCommands ?? [] },
-        diff: { summary: text(runValue.diffSummary, "pending") },
+        diff: { summary: verificationDiffSummary(durableTasks, runId) },
         approval: persistedApproval === undefined
           ? { id: "", level: "unknown", digest: "", expiresAt: "", status: "pending", permitted: false }
           : {
               id: persistedApproval.request.approvalId, level: persistedApproval.request.riskLevel,
               digest: persistedApproval.request.digest, expiresAt: approval?.expiresAt ?? "",
+              ...(persistedApproval.request.riskLevel === "L3" ? {
+                operationPhrase: approvalPhrase(persistedApproval.request.operation, persistedApproval.request.digest)
+              } : {}),
               status: approvalState === "approved" || approvalState === "consumed" ? "approved"
                 : approvalState === "expired" ? "expired" : approvalState === "invalidated" ? "denied" : "pending",
               permitted: approvalState === "approved"
