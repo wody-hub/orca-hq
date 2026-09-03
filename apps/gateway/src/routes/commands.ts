@@ -39,6 +39,14 @@ export interface DashboardCommandDetailView extends DashboardCommandSummaryView 
     status: "pending" | "approved" | "expired" | "denied"; permitted: boolean;
   }>;
   readonly audit: Readonly<{ reference: string; summary: string }>;
+  readonly approvalHistory: readonly Readonly<{
+    id: string; level: "L2" | "L3"; digest: string; operationPhrase?: string;
+    status: "pending" | "approved" | "consumed" | "expired" | "invalidated";
+    approvedAt: string; expiresAt: string;
+  }>[];
+  readonly auditHistory: readonly Readonly<{
+    reference: string; subjectId: string; summary: string; occurredAt: string;
+  }>[];
   readonly delivery: readonly Readonly<{ channel: string; status: "pending" | "sent" | "failed" }>[];
 }
 

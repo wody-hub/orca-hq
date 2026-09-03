@@ -26,6 +26,17 @@ const detail: CommandDetail = {
   diff: { summary: "3 files changed, 20 insertions" },
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
   audit: { reference: "audit:cmd-42", summary: "승인 대기 이벤트" },
+  approvalHistory: [
+    { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", approvedAt: "", operationPhrase: "APPROVE RELEASE", status: "pending" },
+    { id: "approval-expired", level: "L2", digest: "b".repeat(64), expiresAt: "2026-09-01T08:15:00Z", approvedAt: "2026-09-01T08:00:00Z", status: "expired" },
+    { id: "approval-invalidated", level: "L2", digest: "c".repeat(64), expiresAt: "", approvedAt: "", status: "invalidated" }
+  ],
+  auditHistory: [
+    { reference: "audit:denied", subjectId: "approval-invalidated", summary: "approval.denied", occurredAt: "2026-09-01T08:12:00Z" },
+    { reference: "audit:invalidated", subjectId: "approval-invalidated", summary: "approval.invalidated", occurredAt: "2026-09-01T08:11:00Z" },
+    { reference: "audit:expired", subjectId: "approval-expired", summary: "approval.expired", occurredAt: "2026-09-01T08:10:00Z" },
+    { reference: "audit:cmd-42", subjectId: "cmd-42", summary: "승인 대기 이벤트", occurredAt: "2026-09-01T08:09:00Z" }
+  ],
   delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
 };
 
@@ -56,6 +67,22 @@ describe("private dashboard", () => {
     await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
     expect(await screen.findByText("검증 완료")).toBeTruthy();
     expect(screen.getByText("Slack 전송 대기")).toBeTruthy();
+  });
+
+  it("shows bounded approval and audit histories as separate evidence", async () => {
+    // Break caught: the React detail view ignores history arrays and collapses both evidence streams into one latest row.
+    render(<App api={apiFor()} initialCommandId="cmd-42" />);
+
+    const approvals = (await screen.findByRole("heading", { name: "승인 이력" })).closest("section")!;
+    expect(within(approvals).getByText("approval-expired")).toBeTruthy();
+    expect(within(approvals).getByText("expired")).toBeTruthy();
+    expect(within(approvals).getByText("approval-invalidated")).toBeTruthy();
+    expect(within(approvals).getByText("invalidated")).toBeTruthy();
+
+    const audits = screen.getByRole("heading", { name: "감사 이력" }).closest("section")!;
+    for (const event of ["approval.denied", "approval.invalidated", "approval.expired"]) {
+      expect(within(audits).getByText(event)).toBeTruthy();
+    }
   });
 
   it("allows L3 approval only for the exact server phrase and sends digest and phrase", async () => {
@@ -147,7 +174,7 @@ describe("private dashboard", () => {
     await screen.findByRole("heading", { name: "Dispatch 제어" });
 
     const cardHeadings = Array.from(document.querySelectorAll("article.detail > section > h2"), (heading) => heading.textContent);
-    expect(cardHeadings).toEqual(["경로 선택 근거", "변경 계약", "Task DAG", "diff/test", "승인", "감사 및 채널 전달", "Dispatch 제어"]);
+    expect(cardHeadings).toEqual(["경로 선택 근거", "변경 계약", "Task DAG", "diff/test", "승인", "승인 이력", "감사 이력", "채널 전달", "Dispatch 제어"]);
   });
 
   it("returns to the command list when browser history goes back", async () => {

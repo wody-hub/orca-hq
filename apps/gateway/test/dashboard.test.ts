@@ -71,4 +71,124 @@ describe("production command dashboard", () => {
       database.close();
     }
   });
+
+  it("projects expired, invalidated, and denied approval evidence from approval audit subjects", async () => {
+    // Break caught: command detail discards approval-subject transitions and keeps only one latest audit snapshot.
+    const database = openDatabase(":memory:");
+    const store = new ControlStore(database);
+    try {
+      store.insertCommand({
+        commandId: "command-history", idempotencyKey: "history-key", channel: "tailscale-web",
+        externalMessageId: "history", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z",
+        text: "승인 이력 확인"
+      });
+      const proposal: ExecutionProposal = {
+        proposalId: "proposal-history", commandId: "command-history", selectedProjectKey: "sandbox",
+        routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias:sandbox"] }],
+        allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L2",
+        tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement", preferredAgent: "codex" }]
+      };
+      store.saveRun({
+        id: "run-history", proposalId: proposal.proposalId, commandId: proposal.commandId,
+        state: "waiting_approval", recoveryContext: { proposal }
+      });
+      store.saveExecutionProposal(proposal);
+      const proposalHash = proposalDigest(proposal);
+      const operationHash = approvalOperationDigest({
+        proposalDigest: proposalHash, operation: "create_pull_request", commandDigest: "a".repeat(64)
+      });
+      const request = (approvalId: string) => ({
+        approvalId, proposal, operation: "create_pull_request", commandDigest: "a".repeat(64),
+        channel: "tailscale-web" as const, allowedChannels: ["tailscale-web" as const],
+        proposalDigest: proposalHash, digest: operationHash, riskLevel: "L2" as const
+      });
+
+      store.persistApprovalRequest(request("approval-expired"));
+      store.confirmApproval({
+        approvalId: "approval-expired", proposalDigest: proposalHash, operationDigest: operationHash,
+        principalId: "owner", channel: "tailscale-web", approvedAt: "2026-09-03T00:00:00.000Z",
+        expiresAt: "2026-09-03T00:15:00.000Z", executionProposalId: proposal.proposalId
+      });
+      store.recordApprovalAudit("approval-expired", "approval.denied", "replayed");
+      expect(store.expireApproval("approval-expired")).toBe(true);
+      store.persistApprovalRequest(request("approval-invalidated"));
+      expect(store.invalidateApproval("approval-invalidated", "manual")).toBe(true);
+
+      const detail = await createCommandDashboard(store).getCommand({
+        commandId: "command-history", principal: { principalId: "owner", roles: ["owner"] }
+      });
+
+      expect(detail).toMatchObject({
+        approvalHistory: [
+          { id: "approval-invalidated", status: "invalidated" },
+          { id: "approval-expired", status: "expired" }
+        ],
+        auditHistory: expect.arrayContaining([
+          expect.objectContaining({ subjectId: "approval-expired", summary: "approval.denied" }),
+          expect.objectContaining({ subjectId: "approval-expired", summary: "approval.expired" }),
+          expect.objectContaining({ subjectId: "approval-invalidated", summary: "approval.invalidated" })
+        ])
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("bounds approval and audit histories to the newest twenty records", async () => {
+    // Break caught: an unbounded command projection grows with every approval attempt and audit event.
+    const database = openDatabase(":memory:");
+    const store = new ControlStore(database);
+    try {
+      store.insertCommand({
+        commandId: "command-bounded", idempotencyKey: "bounded-key", channel: "tailscale-web",
+        externalMessageId: "bounded", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z",
+        text: "상한 확인"
+      });
+      const proposal: ExecutionProposal = {
+        proposalId: "proposal-bounded", commandId: "command-bounded", selectedProjectKey: "sandbox",
+        routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias:sandbox"] }],
+        allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L2",
+        tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement", preferredAgent: "codex" }]
+      };
+      store.saveRun({
+        id: "run-bounded", proposalId: proposal.proposalId, commandId: proposal.commandId,
+        state: "waiting_approval", recoveryContext: { proposal }
+      });
+      store.saveExecutionProposal(proposal);
+      const proposalHash = proposalDigest(proposal);
+      const operationHash = approvalOperationDigest({
+        proposalDigest: proposalHash, operation: "create_pull_request", commandDigest: "b".repeat(64)
+      });
+      for (let index = 0; index < 25; index += 1) {
+        const suffix = String(index).padStart(2, "0");
+        store.persistApprovalRequest({
+          approvalId: `approval-${suffix}`, proposal, operation: "create_pull_request",
+          commandDigest: "b".repeat(64), channel: "tailscale-web", allowedChannels: ["tailscale-web"],
+          proposalDigest: proposalHash, digest: operationHash, riskLevel: "L2"
+        });
+      }
+      for (let index = 0; index < 25; index += 1) {
+        const suffix = String(index).padStart(2, "0");
+        store.appendAudit({
+          id: `z-command-audit-${suffix}`, subjectId: "command-bounded",
+          eventType: `command.event.${suffix}`, data: {}
+        });
+      }
+
+      const detail = await createCommandDashboard(store).getCommand({
+        commandId: "command-bounded", principal: { principalId: "owner", roles: ["owner"] }
+      });
+
+      expect(detail?.approvalHistory).toHaveLength(20);
+      expect(detail?.approvalHistory.map(({ id }) => id)).toEqual([
+        ...Array.from({ length: 20 }, (_, offset) => `approval-${String(24 - offset).padStart(2, "0")}`)
+      ]);
+      expect(detail?.auditHistory).toHaveLength(20);
+      expect(detail?.auditHistory.map(({ summary }) => summary)).toEqual([
+        ...Array.from({ length: 20 }, (_, offset) => `command.event.${String(24 - offset).padStart(2, "0")}`)
+      ]);
+    } finally {
+      database.close();
+    }
+  });
 });

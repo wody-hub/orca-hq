@@ -60,7 +60,16 @@ function createPorts() {
           }],
           verification: { status: "pending", commands: ["pnpm test"] }, diff: { summary: "대기" },
           approval: { id: "approval-1", level: "L2", digest, expiresAt: "2026-09-03T12:00:00.000Z", status: "pending", permitted: true },
-          audit: { reference: "audit-1", summary: "명령 수신" }, delivery: [{ channel: "telegram", status: "pending" }]
+          audit: { reference: "audit-1", summary: "명령 수신" },
+          approvalHistory: [{
+            id: "approval-1", level: "L2", digest, approvedAt: "",
+            expiresAt: "2026-09-03T12:00:00.000Z", status: "pending"
+          }],
+          auditHistory: [{
+            reference: "audit-1", subjectId: commandId, summary: "명령 수신",
+            occurredAt: "2026-09-03T11:00:00.000Z"
+          }],
+          delivery: [{ channel: "telegram", status: "pending" }]
         }
         : undefined;
     }

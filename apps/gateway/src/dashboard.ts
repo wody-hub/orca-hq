@@ -6,6 +6,7 @@ import type { CommandDashboardPort, DashboardCommandDetailView, DashboardCommand
 
 type RecordValue = Record<string, JsonValue | undefined>;
 type DashboardRiskLevel = DashboardCommandSummaryView["riskLevel"];
+const DASHBOARD_HISTORY_LIMIT = 20;
 
 function record(value: JsonValue | undefined): RecordValue {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as RecordValue : {};
@@ -44,6 +45,21 @@ function verification(state: string): VerificationStatus {
 function approvalPhrase(operation: string, digest: string): string {
   const normalizedOperation = operation.trim().replace(/[\s-]+/g, "_").toUpperCase();
   return `APPROVE ${normalizedOperation} ${digest.slice(0, 12).toUpperCase()}`;
+}
+function approvalHistoryItem(
+  persisted: ReturnType<ControlStore["listApprovals"]>[number]
+): DashboardCommandDetailView["approvalHistory"][number] {
+  return {
+    id: persisted.request.approvalId,
+    level: persisted.request.riskLevel,
+    digest: persisted.request.digest,
+    ...(persisted.request.riskLevel === "L3"
+      ? { operationPhrase: approvalPhrase(persisted.request.operation, persisted.request.digest) }
+      : {}),
+    status: persisted.state,
+    approvedAt: persisted.approval?.approvedAt ?? "",
+    expiresAt: persisted.approval?.expiresAt ?? ""
+  };
 }
 function verificationDiffSummary(tasks: ReturnType<ControlStore["listTasks"]>, runId: string): string {
   const verifier = tasks.find((task) => task.runId === runId && task.role === "verify"
@@ -92,9 +108,23 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
           dispatchId: text(dispatchValue.id, ""), dispatchStatus: dispatchState, ...taskControls(dispatchState)
         };
       });
-      const audit = store.listAuditEvents().filter((event) => event.subjectId === commandId).at(-1);
-      const persistedApproval = proposal === undefined ? undefined : store.listApprovals()
-        .filter((item) => item.request.proposal.proposalId === proposal.proposalId).at(-1);
+      const commandAudit = store.listAuditEvents().filter((event) => event.subjectId === commandId).at(-1);
+      const persistedApprovals = proposal === undefined ? [] : store.listApprovals()
+        .filter((item) => item.request.proposal.proposalId === proposal.proposalId);
+      const persistedApproval = persistedApprovals.at(-1);
+      const approvalHistory = persistedApprovals.slice(-DASHBOARD_HISTORY_LIMIT).reverse()
+        .map(approvalHistoryItem);
+      const auditSubjects = new Set([commandId, ...persistedApprovals.map((item) => item.request.approvalId)]);
+      const auditHistory = store.listAuditEvents()
+        .filter((event) => auditSubjects.has(event.subjectId))
+        .slice(-DASHBOARD_HISTORY_LIMIT)
+        .reverse()
+        .map((event) => ({
+          reference: event.id,
+          subjectId: event.subjectId,
+          summary: event.eventType,
+          occurredAt: event.createdAt
+        }));
       const approvalState = persistedApproval?.state;
       const approval = persistedApproval?.approval;
       return {
@@ -125,7 +155,9 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
                 : approvalState === "expired" ? "expired" : approvalState === "invalidated" ? "denied" : "pending",
               permitted: approvalState === "approved"
             },
-        audit: { reference: audit?.id ?? "", summary: audit?.eventType ?? "pending" },
+        audit: { reference: commandAudit?.id ?? "", summary: commandAudit?.eventType ?? "pending" },
+        approvalHistory,
+        auditHistory,
         delivery: store.listOutbox().filter((message) => message.commandId === commandId).map((message) => ({
           channel: message.channel, status: message.state === "delivered" ? "sent" : message.state === "failed" ? "failed" : "pending"
         }))

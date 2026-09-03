@@ -10,7 +10,16 @@ const command = {
   ],
   verification: { status: "passed", commands: ["pnpm test"] }, diff: { summary: "3 files changed" },
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
-  audit: { reference: "audit:cmd-42", summary: "승인 대기" }, delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
+  audit: { reference: "audit:cmd-42", summary: "승인 대기" },
+  approvalHistory: [
+    { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", approvedAt: "", operationPhrase: "APPROVE RELEASE", status: "pending" },
+    { id: "approval-expired", level: "L2", digest: "b".repeat(64), expiresAt: "2026-09-01T08:15:00Z", approvedAt: "2026-09-01T08:00:00Z", status: "expired" }
+  ],
+  auditHistory: [
+    { reference: "audit:denied", subjectId: "approval-42", summary: "approval.denied", occurredAt: "2026-09-01T08:12:00Z" },
+    { reference: "audit:expired", subjectId: "approval-expired", summary: "approval.expired", occurredAt: "2026-09-01T08:10:00Z" }
+  ],
+  delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
 };
 
 async function mockApi(page: Page) {
@@ -26,7 +35,7 @@ for (const viewport of [{ name: "모바일", width: 390, height: 844 }, { name: 
     await page.goto("/commands");
     await expect(page.getByRole("link", { name: command.summary })).toBeVisible();
     await page.getByRole("link", { name: command.summary }).click();
-    for (const evidence of ["경로 선택 근거", "검증 완료", "Slack 전송 대기"]) {
+    for (const evidence of ["경로 선택 근거", "검증 완료", "승인 이력", "감사 이력", "approval.denied", "Slack 전송 대기"]) {
       await expect(page.getByText(evidence, { exact: true })).toBeVisible();
     }
     const approvalCard = page.getByRole("region", { name: "승인" });
