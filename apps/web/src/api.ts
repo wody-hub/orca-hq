@@ -1,5 +1,6 @@
 export type RiskLevel = "L0" | "L1" | "L2" | "L3";
 export type DeliveryStatus = "pending" | "sent" | "failed";
+export type VerificationStatus = "passed" | "pending" | "failed";
 
 export interface CommandSummary {
   readonly id: string;
@@ -29,8 +30,10 @@ export interface CommandDetail extends CommandSummary {
     verifierFamily: string;
     dispatchId: string;
     dispatchStatus: string;
+    canStop: boolean;
+    canRetry: boolean;
   }>[];
-  readonly verification: Readonly<{ status: string; commands: readonly string[] }>;
+  readonly verification: Readonly<{ status: VerificationStatus; commands: readonly string[] }>;
   readonly diff: Readonly<{ summary: string }>;
   readonly approval: Readonly<{
     id: string;

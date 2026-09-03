@@ -5,11 +5,19 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/entry.js"
   },
   "dependencies": {
+    "@orca-hq/codex-hq": "workspace:*",
     "@orca-hq/core": "workspace:*",
+    "@orca-hq/orca-adapter": "workspace:*",
+    "@orca-hq/persistence": "workspace:*",
+    "@orca-hq/project-registry": "workspace:*",
+    "@orca-hq/slack-adapter": "workspace:*",
     "@orca-hq/tailscale-adapter": "workspace:*",
+    "@orca-hq/telegram-adapter": "workspace:*",
+    "@orca-hq/worker-routing": "workspace:*",
     "fastify": "^5.5.0",
     "zod": "^3.24.2"
   }

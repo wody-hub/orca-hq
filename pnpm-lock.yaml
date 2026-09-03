@@ -20,12 +20,33 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@orca-hq/codex-hq':
+        specifier: workspace:*
+        version: link:../../packages/codex-hq
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@orca-hq/orca-adapter':
+        specifier: workspace:*
+        version: link:../../packages/orca-adapter
+      '@orca-hq/persistence':
+        specifier: workspace:*
+        version: link:../../packages/persistence
+      '@orca-hq/project-registry':
+        specifier: workspace:*
+        version: link:../../packages/project-registry
+      '@orca-hq/slack-adapter':
+        specifier: workspace:*
+        version: link:../../packages/slack-adapter
       '@orca-hq/tailscale-adapter':
         specifier: workspace:*
         version: link:../../packages/tailscale-adapter
+      '@orca-hq/telegram-adapter':
+        specifier: workspace:*
+        version: link:../../packages/telegram-adapter
+      '@orca-hq/worker-routing':
+        specifier: workspace:*
+        version: link:../../packages/worker-routing
       fastify:
         specifier: ^5.5.0
         version: 5.12.1

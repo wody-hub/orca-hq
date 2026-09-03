@@ -35,16 +35,33 @@ function noRoleBinding(): PrincipalBinding {
 }
 
 type RecordedCall = Readonly<{ type: "approval" | "stop" | "retry"; idempotencyKey: string }>;
+type InjectResponse = Readonly<{ statusCode: number; json<T = unknown>(): T }>;
 
 function createPorts() {
   const calls: RecordedCall[] = [];
   const commands: CommandDashboardPort = {
     async listCommands() {
-      return { commands: [{ commandId: "command-1", status: "pending", projectKey: "project-a" }] };
+      return { commands: [{
+        id: "command-1", summary: "테스트 수정", status: "pending", projectKey: "project-a",
+        riskLevel: "L1", updatedAt: "2026-09-03T12:00:00.000Z"
+      }] };
     },
     async getCommand({ commandId }) {
       return commandId === "command-1"
-        ? { commandId, status: "pending", projectKey: "project-a" }
+        ? {
+          id: commandId, summary: "테스트 수정", status: "pending", projectKey: "project-a", riskLevel: "L1",
+          updatedAt: "2026-09-03T12:00:00.000Z", createdAt: "2026-09-03T11:00:00.000Z",
+          project: { key: "project-a", displayName: "프로젝트 A", path: "[redacted]" },
+          routing: { score: 1, selectedReason: "alias", candidates: ["project-a"] },
+          contract: { base: "main", allowedScope: ["src"], prohibitedEffects: [], testCommands: ["pnpm test"] },
+          tasks: [{
+            id: "task-1", title: "수정", status: "running", dependencies: [], workerFamily: "codex",
+            verifierFamily: "claude", dispatchId: "dispatch-1", dispatchStatus: "running", canStop: true, canRetry: false
+          }],
+          verification: { status: "pending", commands: ["pnpm test"] }, diff: { summary: "대기" },
+          approval: { id: "approval-1", level: "L2", digest, expiresAt: "2026-09-03T12:00:00.000Z", status: "pending", permitted: true },
+          audit: { reference: "audit-1", summary: "명령 수신" }, delivery: [{ channel: "telegram", status: "pending" }]
+        }
         : undefined;
     }
   };
@@ -101,23 +118,25 @@ async function apiAs(app: ReturnType<typeof createHttpApp>, principal: Principal
     url: "/auth/session",
     headers: { "tailscale-user-login": principal.tailscaleLoginNames[0]! }
   });
-  const cookie = login.headers["set-cookie"]?.split(";")[0];
+  const setCookie = login.headers["set-cookie"];
+  const cookie = typeof setCookie === "string" ? setCookie.split(";")[0] : undefined;
   const csrfToken = login.headers["x-csrf-token"];
   if (cookie === undefined || typeof csrfToken !== "string") throw new Error("test session bootstrap failed");
   return {
-    get(url: string) {
-      return app.inject({ method: "GET", url, headers: {
+    async get(url: string): Promise<InjectResponse> {
+      return await app.inject({ method: "GET", url, headers: {
         "tailscale-user-login": principal.tailscaleLoginNames[0]!, cookie
-      } });
+      } }) as InjectResponse;
     },
-    post(url: string, body: unknown, headers: Record<string, string> = {}) {
-      return app.inject({ method: "POST", url, payload: body, headers: {
+    async post(url: string, body: object, headers: Record<string, string> = {}): Promise<InjectResponse> {
+      return await app.inject({ method: "POST", url, payload: JSON.stringify(body), headers: {
         "tailscale-user-login": principal.tailscaleLoginNames[0]!, cookie,
+        "content-type": "application/json",
         origin,
         "x-csrf-token": csrfToken,
         "idempotency-key": randomBytes(16).toString("hex"),
         ...headers
-      } });
+      } }) as InjectResponse;
     }
   };
 }
@@ -156,9 +175,17 @@ describe("gateway dashboard API", () => {
     try {
       const ownerApi = await apiAs(app, owner);
       expect((await ownerApi.get("/api/commands")).json()).toEqual({
-        commands: [{ commandId: "command-1", status: "pending", projectKey: "project-a" }]
+        commands: [{
+          id: "command-1", summary: "테스트 수정", status: "pending", projectKey: "project-a",
+          riskLevel: "L1", updatedAt: "2026-09-03T12:00:00.000Z"
+        }]
       });
-      expect((await ownerApi.get("/api/commands/command-1")).statusCode).toBe(200);
+      const detail = await ownerApi.get("/api/commands/command-1");
+      expect(detail.statusCode).toBe(200);
+      expect(detail.json()).toMatchObject({
+        id: "command-1", verification: { status: "pending" }, tasks: [{ canStop: true, canRetry: false }],
+        routing: { selectedReason: "alias" }, delivery: [{ status: "pending" }]
+      });
       const missing = await ownerApi.get("/api/commands/missing");
       expect(missing.statusCode).toBe(404);
       expect(missing.json()).toEqual({ error: "not_found" });
@@ -304,7 +331,9 @@ describe("gateway dashboard API", () => {
         url: "/auth/session",
         headers: { "tailscale-user-login": viewer.tailscaleLoginNames[0]! }
       });
-      const ownerCookie = ownerLogin.headers["set-cookie"]?.split(";")[0]!;
+      const ownerSetCookie = ownerLogin.headers["set-cookie"];
+      if (typeof ownerSetCookie !== "string") throw new Error("test session bootstrap failed");
+      const ownerCookie = ownerSetCookie.split(";")[0];
       const ownerCsrf = ownerLogin.headers["x-csrf-token"] as string;
       const viewerCsrf = viewerLogin.headers["x-csrf-token"] as string;
       const headers = {
@@ -341,7 +370,9 @@ describe("gateway dashboard API", () => {
         url: "/auth/session",
         headers: { "tailscale-user-login": owner.tailscaleLoginNames[0]! }
       });
-      const cookie = login.headers["set-cookie"]?.split(";")[0]!;
+      const setCookie = login.headers["set-cookie"];
+      if (typeof setCookie !== "string") throw new Error("test session bootstrap failed");
+      const cookie = setCookie.split(";")[0];
       const csrfToken = typeof login.headers["x-csrf-token"] === "string"
         ? login.headers["x-csrf-token"]
         : "A".repeat(43);

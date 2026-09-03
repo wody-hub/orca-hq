@@ -21,8 +21,8 @@ const detail: CommandDetail = {
     prohibitedEffects: ["외부 메시지 전송"],
     testCommands: ["pnpm --filter @orca-hq/web test"]
   },
-  tasks: [{ id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running" }],
-  verification: { status: "완료", commands: ["pnpm test"] },
+  tasks: [{ id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running", canStop: true, canRetry: true }],
+  verification: { status: "passed", commands: ["pnpm test"] },
   diff: { summary: "3 files changed, 20 insertions" },
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
   audit: { reference: "audit:cmd-42", summary: "승인 대기 이벤트" },
@@ -30,7 +30,7 @@ const detail: CommandDetail = {
 };
 
 const secondTask = {
-  id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued"
+  id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued", canStop: true, canRetry: true
 };
 
 function apiFor(overrides: Partial<DashboardApi> = {}): DashboardApi {

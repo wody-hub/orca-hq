@@ -5,10 +5,10 @@ const command = {
   project: { key: "hq", displayName: "Orca HQ", path: "/redacted/hq" }, routing: { score: 92, selectedReason: "보호된 경로와 일치", candidates: ["primary: 92"] },
   contract: { base: "main", allowedScope: ["apps/web/**"], prohibitedEffects: ["외부 메시지 전송"], testCommands: ["pnpm --filter @orca-hq/web test"] },
   tasks: [
-    { id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running" },
-    { id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued" }
+    { id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running", canStop: true, canRetry: true },
+    { id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued", canStop: true, canRetry: true }
   ],
-  verification: { status: "완료", commands: ["pnpm test"] }, diff: { summary: "3 files changed" },
+  verification: { status: "passed", commands: ["pnpm test"] }, diff: { summary: "3 files changed" },
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
   audit: { reference: "audit:cmd-42", summary: "승인 대기" }, delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
 };

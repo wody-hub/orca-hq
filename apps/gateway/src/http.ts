@@ -17,7 +17,12 @@ import { registerProjectRoutes, type ProjectDashboardPort } from "./routes/proje
 
 export type { DispatchActionPort } from "./routes/actions.js";
 export type { ApprovalConfirmationPort } from "./routes/approvals.js";
-export type { CommandDashboardPort } from "./routes/commands.js";
+export type {
+  CommandDashboardPort,
+  DashboardCommandDetailView,
+  DashboardCommandSummaryView,
+  VerificationStatus
+} from "./routes/commands.js";
 export type { ProjectDashboardPort } from "./routes/projects.js";
 
 export interface GatewayWebAssetsPort {
@@ -118,6 +123,23 @@ function validCsrfToken(value: string | undefined, expected: string): boolean {
   return received.length === expectedBytes.length && timingSafeEqual(received, expectedBytes);
 }
 
+/**
+ * Classifies a URL before SPA fallback. Decode once so encoded separators cannot
+ * turn protected API/auth paths into client-side dashboard routes; malformed
+ * escapes are treated as protected misses (fail closed).
+ */
+function isProtectedOrMalformedPath(rawUrl: string): boolean {
+  const rawPath = rawUrl.split("?", 1)[0] ?? "/";
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    return true;
+  }
+  const path = decoded.toLowerCase();
+  return path === "/api" || path.startsWith("/api/") || path === "/auth" || path.startsWith("/auth/");
+}
+
 export interface GatewayRouteContext {
   authenticate(request: FastifyRequest): AuthenticatedPrincipal | undefined;
   canView(principal: AuthenticatedPrincipal): boolean;
@@ -198,7 +220,7 @@ export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
 
   app.get("/*", async (request, reply) => {
     const path = request.url.split("?", 1)[0] ?? "/";
-    if (path.startsWith("/api/") || path === "/api" || path.startsWith("/auth/") || path === "/auth") {
+    if (isProtectedOrMalformedPath(request.url)) {
       return notFound(reply);
     }
     if (options.webAssets === undefined) return notFound(reply);

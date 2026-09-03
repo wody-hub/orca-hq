@@ -23,7 +23,7 @@ const createApp = (options: {
     resolver,
     sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(7) }),
     peerAddress: () => options.peerAddress ?? "127.0.0.1",
-    onCommands: options.onCommands
+    ...(options.onCommands === undefined ? {} : { onCommands: options.onCommands })
   });
 };
 
@@ -56,6 +56,14 @@ describe("gateway HTTP authentication boundary", () => {
       expect((await app.inject({ method: "GET", url: "/commands/command-1" })).statusCode).toBe(200);
       expect((await app.inject({ method: "GET", url: "/api/missing" })).statusCode).toBe(404);
       expect((await app.inject({ method: "GET", url: "/auth/missing" })).statusCode).toBe(404);
+      for (const url of ["/api%2Fmissing", "/auth%2Fmissing", "/API/missing"]) {
+        const response = await app.inject({ method: "GET", url });
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({ error: "not_found" });
+      }
+      const malformed = await app.inject({ method: "GET", url: "/api%ZZmissing" });
+      expect(malformed.statusCode).toBe(400);
+      expect(malformed.headers["content-type"]).toContain("application/json");
     } finally {
       await app.close();
     }
@@ -199,7 +207,8 @@ describe("gateway HTTP authentication boundary", () => {
     const app = createApp({ onCommands });
     try {
       const issued = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
-      const sessionCookie = issued.headers["set-cookie"]?.split(";")[0];
+      const setCookie = issued.headers["set-cookie"];
+      const sessionCookie = typeof setCookie === "string" ? setCookie.split(";")[0] : undefined;
       const response = await app.inject({
         method: "GET",
         url: "/api/commands",
