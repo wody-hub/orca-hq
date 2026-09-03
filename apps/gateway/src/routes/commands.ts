@@ -15,7 +15,7 @@ export interface DashboardCommandSummaryView {
   readonly summary: string;
   readonly status: string;
   readonly projectKey: string;
-  readonly riskLevel: "L0" | "L1" | "L2" | "L3";
+  readonly riskLevel: "L0" | "L1" | "L2" | "L3" | "unknown";
   readonly updatedAt: string;
 }
 
@@ -35,7 +35,7 @@ export interface DashboardCommandDetailView extends DashboardCommandSummaryView 
   readonly verification: Readonly<{ status: VerificationStatus; commands: readonly string[] }>;
   readonly diff: Readonly<{ summary: string }>;
   readonly approval: Readonly<{
-    id: string; level: "L2" | "L3"; digest: string; expiresAt: string; operationPhrase?: string;
+    id: string; level: "L2" | "L3" | "unknown"; digest: string; expiresAt: string; operationPhrase?: string;
     status: "pending" | "approved" | "expired" | "denied"; permitted: boolean;
   }>;
   readonly audit: Readonly<{ reference: string; summary: string }>;

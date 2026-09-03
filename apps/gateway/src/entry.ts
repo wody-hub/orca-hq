@@ -1,24 +1,11 @@
-import type { GatewayConfig } from "./lifecycle.js";
-import { startProductionGateway, type GatewayProductionDependencies } from "./production.js";
+import { createGatewayHost, type GatewayHostBootstrap } from "./host.js";
+import { startProductionGateway } from "./production.js";
 
-type GatewayHostBootstrap = () => Promise<Readonly<{
-  config: GatewayConfig;
-  dependencies: GatewayProductionDependencies;
-}>>;
+export type { GatewayHostBootstrap } from "./host.js";
 
-export async function run(): Promise<void> {
-  const moduleUrl = process.env.GATEWAY_HOST_BOOTSTRAP;
-  if (moduleUrl === undefined || !moduleUrl.startsWith("file:")) {
-    // Deliberately redacted: a process without its injected secret/client host
-    // fails closed as configuration, never as a missing repository module.
-    throw new Error("Gateway configuration or secret provider is unavailable");
-  }
-  const loaded = await import(moduleUrl) as unknown;
-  if (typeof loaded !== "object" || loaded === null || !("createGatewayHost" in loaded)
-    || typeof loaded.createGatewayHost !== "function") {
-    throw new Error("Gateway host bootstrap must export createGatewayHost");
-  }
-  const host = await (loaded.createGatewayHost as GatewayHostBootstrap)();
+/** Starts the repository-owned host; tests inject only external/secret boundaries. */
+export async function run(bootstrap: GatewayHostBootstrap = createGatewayHost): Promise<void> {
+  const host = await bootstrap();
   await startProductionGateway(host.config, host.dependencies);
 }
 

@@ -1,3 +1,4 @@
+import { ApprovalService, type AuthenticatedPrincipal, type PrincipalBinding } from "@orca-hq/core";
 import type { CodexHqSession } from "@orca-hq/codex-hq";
 import { OrcaClient, type OrcaClientOptions } from "@orca-hq/orca-adapter";
 import { ControlStore, openDatabase, OutboxDispatcher, type OutboxDispatcherOptions } from "@orca-hq/persistence";
@@ -17,8 +18,13 @@ import {
   type GatewayTransactionPort
 } from "./lifecycle.js";
 import { wireAbortSignals } from "./main.js";
-import { createCommandDashboard } from "./dashboard.js";
-import { createHttpApp, type GatewayHttpOptions } from "./http.js";
+import { createCommandDashboard, createProjectDashboard } from "./dashboard.js";
+import { createHttpApp, type ApprovalConfirmationPort, type DispatchActionPort, type GatewayHttpOptions } from "./http.js";
+
+export interface GatewayDispatchControlPort {
+  stop(input: Readonly<{ dispatchId: string; idempotencyKey: string }>): Promise<boolean>;
+  retry(input: Readonly<{ dispatchId: string; idempotencyKey: string }>): Promise<boolean>;
+}
 
 /**
  * The concrete process composition boundary. Network/Keychain handles remain
@@ -44,6 +50,10 @@ export interface GatewayProductionDependencies {
   readonly commandFlow: GatewayCommandFlowPort;
   readonly deliveries: GatewayDeliveryPort;
   readonly outbox: Omit<OutboxDispatcherOptions, "store">;
+  /** Orca dispatch control is an injected external-I/O boundary; route adapters remain production-owned. */
+  readonly dispatchControl?: GatewayDispatchControlPort;
+  /** Injectable clock for approval expiry tests; production defaults to the system clock. */
+  readonly now?: () => Date;
 }
 
 export interface GatewayProductionServices {
@@ -56,6 +66,56 @@ export interface GatewayProductionServices {
   readonly outbox: OutboxDispatcher;
   readonly slackAdapter: SlackAdapter;
   readonly telegramAdapter: TelegramAdapter;
+  /** Present only when production owns the HTTP app from httpOptions. */
+  readonly httpApp?: ReturnType<typeof createHttpApp>;
+}
+
+function approvalPrincipal(principal: AuthenticatedPrincipal): PrincipalBinding {
+  return {
+    principalId: principal.principalId, slackUserIds: [], telegramUserIds: [],
+    telegramChatIds: [], tailscaleLoginNames: [`dashboard:${principal.principalId}`], roles: [...principal.roles]
+  };
+}
+
+function approvalAdapter(store: ControlStore, now: () => Date): ApprovalConfirmationPort {
+  const service = new ApprovalService(store);
+  return {
+    async confirmExisting(input) {
+      const persisted = store.findApproval(input.approvalId);
+      if (persisted === undefined) return { kind: "denied" };
+      if (persisted.request.digest !== input.digest) return { kind: "changed" };
+      const request = service.request(persisted.request);
+      const decision = service.confirm(request, approvalPrincipal(input.principal), now(), input.phrase);
+      if (decision.kind === "changed") return { kind: "changed" };
+      if (decision.kind !== "approved") return { kind: "denied" };
+      const confirmed = store.findApproval(input.approvalId)?.approval;
+      return confirmed === undefined ? { kind: "denied" } : { kind: "approved", expiresAt: confirmed.expiresAt };
+    }
+  };
+}
+
+function actionAdapter(store: ControlStore, control: GatewayDispatchControlPort | undefined): DispatchActionPort {
+  const exists = (dispatchId: string): boolean => store.listTasks()
+    .some((task) => store.loadDispatchesForTask(task.id).some((dispatch) => record(dispatch).id === dispatchId));
+  const record = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const action = async (kind: "stop" | "retry", input: Readonly<{ dispatchId: string; idempotencyKey: string }>) => {
+    if (!exists(input.dispatchId) || control === undefined) return { kind: "denied" } as const;
+    const accepted = await control[kind](input);
+    if (!accepted) return { kind: "denied" } as const;
+    store.appendAudit({ subjectId: input.dispatchId, eventType: `dispatch.${kind}_requested`, data: { idempotencyKey: input.idempotencyKey } });
+    return { kind: kind === "stop" ? "stopped" : "retried" } as const;
+  };
+  return {
+    async stop(input) {
+      const result = await action("stop", input);
+      return result.kind === "stopped" ? { kind: "stopped" as const } : { kind: "denied" as const };
+    },
+    async retry(input) {
+      const result = await action("retry", input);
+      return result.kind === "retried" ? { kind: "retried" as const } : { kind: "denied" as const };
+    }
+  };
 }
 
 export async function createProductionGateway(
@@ -74,7 +134,7 @@ export async function createProductionGateway(
     ? dependencies.orca
     : new OrcaClient(dependencies.orca);
   const exposedServices = {} as GatewayProductionServices;
-  for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "slackAdapter", "telegramAdapter"] as const) {
+  for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "slackAdapter", "telegramAdapter", "httpApp"] as const) {
     Object.defineProperty(exposedServices, key, { enumerable: true, get: () => requireServices()[key] });
   }
   const gateway = await createGateway(config, {
@@ -82,22 +142,34 @@ export async function createProductionGateway(
     database: {
       async migrate() {
         // openDatabase owns WAL, foreign keys, and idempotent migration.
-        const database = openDatabase(config.databasePath);
-        const store = new ControlStore(database);
-        const locks = new WorktreeLockService(store);
-        const lifecycle = new ExecutionLifecycle({ store });
-        const execution = new ExecutionService({ ...dependencies.execution, orca, locks, lifecycle });
-        const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
-        services = Object.freeze({ database, store, orca, locks, execution, hq: dependencies.hq, outbox,
-          slackAdapter: dependencies.slackAdapter, telegramAdapter: dependencies.telegramAdapter });
-        if (dependencies.httpOptions !== undefined) {
-          const app = createHttpApp({ ...dependencies.httpOptions, commands: createCommandDashboard(store) });
-          http = {
-            async start() { await app.listen({ host: "127.0.0.1", port: 0 }); },
-            async stopIngress() { await app.close(); }
-          };
+        let database: ReturnType<typeof openDatabase> | undefined;
+        try {
+          database = openDatabase(config.databasePath);
+          const store = new ControlStore(database);
+          const locks = new WorktreeLockService(store);
+          const lifecycle = new ExecutionLifecycle({ store });
+          const execution = new ExecutionService({ ...dependencies.execution, orca, locks, lifecycle });
+          const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
+          let httpApp: ReturnType<typeof createHttpApp> | undefined;
+          if (dependencies.httpOptions !== undefined) {
+            const app = createHttpApp({
+              ...dependencies.httpOptions, commands: createCommandDashboard(store), projects: createProjectDashboard(store),
+              approvals: approvalAdapter(store, dependencies.now ?? (() => new Date())), actions: actionAdapter(store, dependencies.dispatchControl)
+            });
+            httpApp = app;
+            http = {
+              async start() { await app.listen({ host: "127.0.0.1", port: 0 }); },
+              async stopIngress() { await app.close(); }
+            };
+          }
+          services = Object.freeze({ database, store, orca, locks, execution, hq: dependencies.hq, outbox,
+            slackAdapter: dependencies.slackAdapter, telegramAdapter: dependencies.telegramAdapter,
+            ...(httpApp === undefined ? {} : { httpApp }) });
+          if (http === undefined) throw new Error("production HTTP security configuration is required");
+        } catch (error) {
+          if (database?.open) database.close();
+          throw error;
         }
-        if (http === undefined) throw new Error("production HTTP security configuration is required");
       },
       async checkpoint() {
         requireServices().database.pragma("wal_checkpoint(TRUNCATE)");

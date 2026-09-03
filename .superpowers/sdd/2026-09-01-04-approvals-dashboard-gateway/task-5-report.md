@@ -174,3 +174,43 @@ git diff --check                               exit 0
 ### 실제 남은 우려
 
 - 실제 Slack/Telegram/Tailscale/Keychain/Orca 연결은 의도적으로 생성·변경하지 않았다. production에는 이 외부 I/O·secret 경계만 주입하며, 테스트는 fake client와 loopback/store를 사용한다.
+
+## 수정 3차
+
+### 구현 및 데이터 흐름
+
+- 저장소 소유 `host.ts → entry.ts → production.ts` 경로를 추가해 `GATEWAY_HOST_BOOTSTRAP`이라는 저장소 밖 host 모듈 의존을 제거했다. deployment는 Keychain/Slack/Telegram/Tailscale/Orca 외부 경계만 `GATEWAY_EXTERNAL_ADAPTERS`로 공급하며, 기본 host가 없어서 실패하지 않고 설정 부재는 redacted 오류로 fail-closed 한다.
+- production HTTP는 실제 ControlStore 기반 command/project dashboard, persisted approval confirmation, dispatch control adapter를 직접 조립한다. dashboard는 run recovery proposal, task/dispatch, approval, audit, outbox를 읽어 unknown/pending을 보수적으로 표시하고 `verification_failed`를 failed로 표시한다.
+- migration 조립 중 HTTP 설정이 빠져도 openDatabase handle을 즉시 close하도록 ownership을 잡았다. HTTP/Slack/Telegram 시작 경계별 종료 테스트는 시작된 ingress를 역순 stop한 뒤 drain/checkpoint/close하는 literal 순서를 검증한다.
+
+### TDD RED/GREEN
+
+- RED: durable L3 proposal/approval과 `verification_failed` run을 넣은 dashboard test는 기존 L0/unrouted/pending placeholder를 반환해 실패했다. HTTP composition failure test는 기존 lifecycle ownership 이전 DB handle close 누락을 재현하도록 추가했다.
+- GREEN: `pnpm vitest run apps/gateway/test/end-to-end.test.ts apps/gateway/test/production.test.ts apps/gateway/test/dashboard.test.ts apps/gateway/test/entry.test.ts apps/gateway/test/lifecycle.test.ts`는 5 files, 20 tests passed였다. Telegram 501 normalization, durable verified state, implementer/verifier dispatch 2건, real Outbox final Telegram delivery, production projects/approval/action route, DB cleanup을 포함한다.
+
+### 9개 finding 대응
+
+| Finding | 대응 |
+| --- | --- |
+| C1 | 저장소 소유 host/entry와 injected external boundary 성공 경로 테스트 |
+| C3 | Telegram 501 durable run/2 dispatch/Outbox delivery 및 L0-L3 exact policy 회귀 |
+| I1 | proposal/task/approval/audit/outbox 기반 dashboard projection |
+| N3 | production HTTP, entry, acceptCommand→durable evidence→Outbox 실행 |
+| N8 | unknown 위험도, failed verification, durable approval/contract/routing 표시 |
+| N9 | production-owned projects/approval/actions adapters와 actual route test |
+| N10 | migrate composition 예외에서 database close 회귀 |
+| N11 | 실제 boundary별 reverse ingress stop literal sequence |
+| N12 | delivery 문자열을 command-flow fake 반환값에서 받지 않고 durable Outbox dispatch로 검증 |
+
+### 검증 및 self-review
+
+```text
+pnpm test                                      30 files, 503 tests passed
+pnpm typecheck                                 exit 0
+pnpm build                                     exit 0 (13 workspace projects)
+pnpm --filter @orca-hq/web test:e2e            4 passed
+git diff --check                               exit 0
+```
+
+- self-review에서 unknown risk가 L0으로 강등되지 않는지, approval/dispatch adapter가 undefined 500이 아니라 durable fail-closed 결정을 내리는지, config 거부 시 DB 파일 생성 계약이 유지되는지 확인했다.
+- 실제 Slack/Telegram/Tailscale/Keychain/Orca credential 또는 설정은 생성·변경하지 않았다. Playwright가 만든 `apps/web/test-results/.last-run.json`은 untracked test artifact로 남아 있으며 커밋하지 않는다.

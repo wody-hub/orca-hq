@@ -9,7 +9,7 @@ import {
   type ExecutionProposal,
   type PrincipalBinding
 } from "@orca-hq/core";
-import { ControlStore, openDatabase } from "@orca-hq/persistence";
+import { ControlStore, openDatabase, OutboxDispatcher } from "@orca-hq/persistence";
 import { createTelegramAdapter } from "@orca-hq/telegram-adapter";
 import { describe, expect, it } from "vitest";
 
@@ -34,8 +34,8 @@ function proposal(riskLevel: "L0" | "L1" | "L2" | "L3"): ExecutionProposal {
 }
 
 describe("Gateway end-to-end durable boundaries", () => {
-  it("takes normalized Telegram command 501 through Gateway acceptance into a separate delivery boundary", async () => {
-    // Break caught: Gateway.acceptCommand bypasses the durable normalized command or silently drops its delivery.
+  it("takes normalized Telegram message 501 through durable state, two dispatches and Outbox delivery", async () => {
+    // Break caught: a verified command bypasses durable run/dispatch evidence or sends Telegram without the Outbox.
     const database = openDatabase(":memory:");
     const store = new ControlStore(database);
     const deliveries: string[] = [];
@@ -51,9 +51,16 @@ describe("Gateway end-to-end durable boundaries", () => {
       transactions: { async drain() {} },
       commandFlow: { async accept(command) {
         if (!store.listCommands().some(({ commandId }) => commandId === command.commandId)) throw new Error("command was not durable");
-        return { state: "verified_success", delivery: "검증 완료" };
+        const executionProposal = proposal("L1");
+        store.saveRun({ id: "run-501", proposalId: executionProposal.proposalId, commandId: command.commandId, state: "verified_success", recoveryContext: { proposal: executionProposal } });
+        store.saveTask({ id: "task-implement", runId: "run-501", title: "구현", role: "implement", preferredAgent: "codex", dependsOn: [], state: "worker_done" });
+        store.saveTask({ id: "task-verify", runId: "run-501", title: "검증", role: "verify", preferredAgent: "claude", dependsOn: ["task-implement"], state: "verified_success" });
+        store.saveDispatch({ id: "dispatch-implement", taskId: "task-implement", state: "worker_done" });
+        store.saveDispatch({ id: "dispatch-verify", taskId: "task-verify", state: "worker_done" });
+        store.enqueueOutbox({ id: "outbox-501", commandId: command.commandId, channel: "telegram", destination: "20", template: "final_summary", payload: { text: "검증 완료" }, nextAttemptAt: "2026-09-03T00:00:00.000Z" });
+        return { state: String((store.listRunRecords().find((run) => (run as { id?: string }).id === "run-501") as { state: string }).state) };
       } },
-      deliveries: { async deliver(result) { if (result.delivery !== undefined) deliveries.push(result.delivery); } }
+      deliveries: { async deliver() {} }
     };
     try {
       const gateway = await createGateway({ databasePath: ":memory:", shutdownDrainMs: 1_000 }, runtime);
@@ -64,8 +71,13 @@ describe("Gateway end-to-end durable boundaries", () => {
       const command = store.listCommands().find(({ externalMessageId }) => externalMessageId === "20:501");
       if (command === undefined) throw new Error("normalized command missing");
       await gateway.acceptCommand({ commandId: command.commandId, channel: "telegram", text: command.text });
+      const outbox = new OutboxDispatcher({ store, workerId: "e2e", providers: { telegram: { async deliver(message) { deliveries.push(String((message.payload as { text: string }).text)); return { providerMessageId: "telegram-501" }; } } } });
+      await outbox.tick("2026-09-03T00:00:00.000Z");
       expect(deliveries).toEqual(["검증 완료"]);
-      expect(store.listCommands()).toHaveLength(1);
+      expect(store.listRunRecords()).toEqual(expect.arrayContaining([expect.objectContaining({ commandId: command.commandId, state: "verified_success" })]));
+      expect(store.loadDispatchesForTask("task-implement")).toHaveLength(1);
+      expect(store.loadDispatchesForTask("task-verify")).toHaveLength(1);
+      expect(store.listOutbox()).toEqual([expect.objectContaining({ id: "outbox-501", state: "delivered" })]);
     } finally {
       database.close();
     }

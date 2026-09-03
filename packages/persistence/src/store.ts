@@ -6,6 +6,7 @@ import {
   ApprovalRecordSchema,
   PersistedApprovalRequestSchema,
   PersistedApprovalSchema,
+  ExecutionProposalSchema,
   ChannelMessageJsonSchema,
   CommandEnvelopeSchema,
   type ChannelMessageJson,
@@ -1084,6 +1085,26 @@ export class WorkerCompletionConflictError extends Error {
 
 export class ControlStore implements CommandIngress {
   constructor(private readonly database: Database.Database) {}
+
+  /** Persists the proposal before any approval can reference it. */
+  saveExecutionProposal(proposalInput: unknown): void {
+    const proposal = ExecutionProposalSchema.parse(proposalInput);
+    const now = new Date().toISOString();
+    const existing = this.database.prepare(`
+      SELECT command_id, payload_json FROM execution_proposals WHERE id = ?
+    `).get(proposal.proposalId) as { command_id: string; payload_json: string } | undefined;
+    if (existing !== undefined) {
+      if (existing.command_id !== proposal.commandId || !isDeepStrictEqual(parseJson(existing.payload_json), proposal)) {
+        throw new Error(`Execution proposal ${proposal.proposalId} has conflicting content`);
+      }
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO execution_proposals (
+        id, command_id, project_registry_entry_id, state, payload_json, created_at, updated_at
+      ) VALUES (?, ?, NULL, 'proposed', ?, ?, ?)
+    `).run(proposal.proposalId, proposal.commandId, JSON.stringify(proposal), now, now);
+  }
 
   saveRun(recordInput: unknown): void {
     const payload = JsonValueSchema.parse(recordInput);
@@ -2836,6 +2857,15 @@ export class ControlStore implements CommandIngress {
       ...(parseJson(row.payload_json) as Record<string, unknown>),
       state: row.state
     });
+  }
+
+  /** Redacted approval records for dashboard projections scoped by proposal. */
+  listApprovals(): PersistedApproval[] {
+    const rows: Array<Pick<ApprovalRow, "state" | "payload_json">> = this.database
+      .prepare(`SELECT state, payload_json FROM approvals ORDER BY created_at, id`).all() as Array<Pick<ApprovalRow, "state" | "payload_json">>;
+    return rows.map((row) => PersistedApprovalSchema.parse({
+      ...(parseJson(row.payload_json) as Record<string, unknown>), state: row.state
+    }));
   }
 
   consumeApproval(approvalIdInput: string): boolean {

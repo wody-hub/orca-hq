@@ -1,4 +1,4 @@
-export type RiskLevel = "L0" | "L1" | "L2" | "L3";
+export type RiskLevel = "L0" | "L1" | "L2" | "L3" | "unknown";
 export type DeliveryStatus = "pending" | "sent" | "failed";
 export type VerificationStatus = "passed" | "pending" | "failed";
 
@@ -37,7 +37,7 @@ export interface CommandDetail extends CommandSummary {
   readonly diff: Readonly<{ summary: string }>;
   readonly approval: Readonly<{
     id: string;
-    level: "L2" | "L3";
+    level: "L2" | "L3" | "unknown";
     digest: string;
     expiresAt: string;
     operationPhrase?: string;

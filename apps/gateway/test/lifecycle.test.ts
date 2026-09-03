@@ -175,17 +175,23 @@ describe("Gateway lifecycle", () => {
         events.push(started);
         void gateway?.stop();
       };
-      adapters.http.start = () => stopAtBoundary("http.started");
-      adapters.slack.start = () => stopAtBoundary("slack.started");
-      adapters.telegram.start = () => stopAtBoundary("telegram.started");
+      if (boundary === "http") adapters.http.start = () => stopAtBoundary("http.started");
+      if (boundary === "slack") adapters.slack.start = () => stopAtBoundary("slack.started");
+      if (boundary === "telegram") adapters.telegram.start = () => stopAtBoundary("telegram.started");
       gateway = await createGateway(config, adapters);
 
       await expect(gateway.start()).rejects.toThrow("Gateway startup was stopped");
       await gateway.stop();
 
-      const ingressStops = events.filter((event) => event.endsWith(".stopped"));
-      expect(events.slice(-3)).toEqual(["transactions.drained", "db.checkpointed", "db.closed"]);
-      expect(ingressStops).not.toEqual([]);
+      const expectedStops = boundary === "http"
+        ? ["http.stopped"]
+        : boundary === "slack"
+          ? ["slack.stopped", "http.stopped"]
+          : ["telegram.stopped", "slack.stopped", "http.stopped"];
+      expect(events).toEqual(expect.arrayContaining(expectedStops));
+      expect(events.slice(-(expectedStops.length + 3))).toEqual([
+        ...expectedStops, "transactions.drained", "db.checkpointed", "db.closed"
+      ]);
       expect(gateway.status).toEqual({ kind: "stopped", degradedChannels: [] });
     }
   );
