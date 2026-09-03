@@ -138,6 +138,10 @@ export type ExecutionReviewRequired = WorktreePlacement & { kind: "review_requir
   dispatchId: string;
 }> | Readonly<{
   kind: "review_required";
+  reason: "launch_terminal_unproven";
+  dispatchId: string;
+}> | Readonly<{
+  kind: "review_required";
   reason: "assignment_artifact_cleanup_failed";
   dispatchId: string;
 }> | Readonly<{
@@ -799,6 +803,8 @@ export class ExecutionService {
   async recordWorkerMessage(message: WorkerMessage): Promise<WorkerMessageResult> {
     const lookup = await this.#lookupDispatch(message.dispatchId);
     if (lookup === undefined) throw new Error(`Dispatch ${message.dispatchId} is not known`);
+    const launchRecoveryReview = await this.#reconcileLaunchGraph(lookup);
+    if (launchRecoveryReview !== undefined) return launchRecoveryReview;
     const recorded = await this.#lifecycle.recordWorkerMessage(message, lookup.dispatch.localId);
     if (message.kind !== "worker_done") return recorded;
     const completedDispatch = this.#lifecycle.dispatch(lookup.dispatch.localId);
@@ -1425,26 +1431,17 @@ export class ExecutionService {
   async recordLaunchFailure(input: LaunchFailureInput): Promise<LaunchFailureResult> {
     const lookup = await this.#lookupDispatch(input.dispatchId);
     if (lookup === undefined) throw new Error(`Dispatch ${input.dispatchId} is not known`);
-    if (this.#lifecycle.dispatch(lookup.dispatch.localId).state !== "running") {
+    const launchRecoveryReview = await this.#reconcileLaunchGraph(lookup);
+    if (launchRecoveryReview !== undefined) {
+      return Object.freeze({
+        kind: "intervention_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: input.dispatchId
+      });
+    }
+    let durable = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    if (!["running", "launch_failure_reserved", "launch_failed"].includes(durable.state)) {
       return Object.freeze({ kind: "duplicate" });
-    }
-    try {
-      await this.#inspectLaunchFailureWorker(lookup);
-    } catch {
-      await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
-      return Object.freeze({
-        kind: "intervention_required",
-        reason: "launch_terminal_unproven",
-        dispatchId: input.dispatchId
-      });
-    }
-    if (!await this.#fenceUntrustedWorker(lookup)) {
-      await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
-      return Object.freeze({
-        kind: "intervention_required",
-        reason: "launch_terminal_unproven",
-        dispatchId: input.dispatchId
-      });
     }
     const message: LaunchFailureMessage = Object.freeze({
       kind: "launch_failure",
@@ -1452,16 +1449,168 @@ export class ExecutionService {
       dispatchId: input.dispatchId,
       evidence: Object.freeze({ ...input.evidence })
     });
-    const recorded = await this.#lifecycle.recordLaunchFailure(message, lookup.dispatch.localId);
-    if (recorded === "duplicate") return Object.freeze({ kind: "duplicate" });
-    const artifactCleanupReview = await this.#cleanupAssignmentArtifact(lookup);
-    if (artifactCleanupReview !== undefined) {
-      await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+    if (
+      durable.state !== "running"
+      && (
+        durable.launchFailureId !== input.failureId
+        || durable.orcaDispatchId !== input.dispatchId
+      )
+    ) {
+      return Object.freeze({ kind: "duplicate" });
+    }
+    if (durable.state !== "launch_failed") {
+      try {
+        await this.#inspectLaunchFailureWorker(lookup);
+      } catch {
+        await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+        return Object.freeze({
+          kind: "intervention_required",
+          reason: "launch_terminal_unproven",
+          dispatchId: input.dispatchId
+        });
+      }
+    }
+    if (durable.state === "running") {
+      try {
+        await this.#lifecycle.reserveLaunchFailure(message, lookup.dispatch.localId);
+      } catch (error) {
+        if (this.#lifecycle.dispatch(lookup.dispatch.localId).state !== "running") {
+          return Object.freeze({ kind: "duplicate" });
+        }
+        throw error;
+      }
+      durable = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    }
+    if (durable.state === "launch_failure_reserved") {
+      let fenceReceipt: OrcaReceipt;
+      try {
+        fenceReceipt = await this.#orca.execute({
+          kind: "stop_worker",
+          dispatchId: input.dispatchId
+        });
+        if (stopDispatchIdFrom(fenceReceipt) !== input.dispatchId) {
+          throw Object.assign(new Error("stop receipt does not match the exact Dispatch"), {
+            code: "orca_stop_receipt_mismatch",
+            retryable: false
+          });
+        }
+      } catch (error) {
+        await this.#lifecycle.recordWorkerFence(
+          lookup.dispatch.localId,
+          input.dispatchId,
+          { fenceFailure: releaseFailure(error) }
+        );
+        await this.#markIntervention(lookup.run, lookup.task, lookup.dispatch);
+        return Object.freeze({
+          kind: "intervention_required",
+          reason: "launch_terminal_unproven",
+          dispatchId: input.dispatchId
+        });
+      }
+      await this.#lifecycle.recordLaunchFailure(
+        message,
+        lookup.dispatch.localId,
+        fenceReceipt
+      );
+    }
+    return this.#resumeLaunchFailure(input, lookup);
+  }
+
+  async #resumeLaunchFailure(
+    input: LaunchFailureInput,
+    lookup: DispatchLookup
+  ): Promise<LaunchFailureResult> {
+    const durable = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    if (
+      durable.state !== "launch_failed"
+      || durable.launchFailureId !== input.failureId
+      || durable.orcaDispatchId !== input.dispatchId
+    ) {
+      return Object.freeze({ kind: "duplicate" });
+    }
+    const existingRetry = lookup.task.dispatches.find((candidate) =>
+      this.#lifecycle.dispatch(candidate.localId).retryOf === input.dispatchId
+    );
+    if (existingRetry !== undefined) {
+      const existing = this.#lifecycle.dispatch(existingRetry.localId);
+      if (existing.orcaDispatchId !== undefined && existing.state === "running") {
+        return Object.freeze({
+          kind: "retried",
+          dispatchId: existing.orcaDispatchId,
+          retryOf: input.dispatchId
+        });
+      }
+      if (existing.state !== "planned") {
+        return Object.freeze({ kind: "duplicate" });
+      }
+      if (existingRetry.placement.requiresEditingLease && !existingRetry.editingLeaseHeld) {
+        const acquired = await this.#acquire(lookup.run, existingRetry);
+        if (acquired.kind !== "acquired") {
+          await this.#lifecycle.transitionTask(lookup.task.localId, "intervention_required");
+          await this.#lifecycle.transitionRun(lookup.run.localId, "intervention_required");
+          return Object.freeze({
+            kind: "intervention_required",
+            reason: "replacement_not_conflict_free",
+            dispatchId: input.dispatchId
+          });
+        }
+      }
+      if (existingRetry.placement.worktree.kind === "isolated") {
+        let materialized: WorktreePlacement;
+        try {
+          materialized = await this.#placements.createWorktree(existingRetry.placement);
+        } catch (error) {
+          try {
+            await this.#markIntervention(lookup.run, lookup.task, existingRetry);
+          } finally {
+            if (existingRetry.placement.requiresEditingLease) {
+              await this.#release(lookup.run, existingRetry);
+            }
+          }
+          throw error;
+        }
+        if (materialized.kind !== "ready") {
+          await this.#markIntervention(lookup.run, lookup.task, existingRetry);
+          if (existingRetry.placement.requiresEditingLease) {
+            await this.#release(lookup.run, existingRetry);
+          }
+          return Object.freeze({
+            kind: "intervention_required",
+            reason: "replacement_not_conflict_free",
+            dispatchId: input.dispatchId
+          });
+        }
+      }
+      const dispatchId = await this.#launchWithIntervention(
+        lookup.run,
+        lookup.task,
+        existingRetry,
+        input.dispatchId
+      );
+      return Object.freeze({
+        kind: "retried",
+        dispatchId,
+        retryOf: input.dispatchId
+      });
+    }
+    if (durable.assignmentArtifactCleanupFailure !== undefined) {
+      await this.#markLaunchFailureIntervention(lookup);
       return Object.freeze({
         kind: "intervention_required",
         reason: "assignment_artifact_cleanup_failed",
         dispatchId: input.dispatchId
       });
+    }
+    if (durable.assignmentArtifactCleanup === undefined) {
+      const artifactCleanupReview = await this.#cleanupAssignmentArtifact(lookup);
+      if (artifactCleanupReview !== undefined) {
+        await this.#markLaunchFailureIntervention(lookup);
+        return Object.freeze({
+          kind: "intervention_required",
+          reason: "assignment_artifact_cleanup_failed",
+          dispatchId: input.dispatchId
+        });
+      }
     }
     if (lookup.dispatch.placement.requiresEditingLease) await this.#release(lookup.run, lookup.dispatch);
 
@@ -1571,6 +1720,129 @@ export class ExecutionService {
     );
     await this.#lifecycle.recordProviderInspection(lookup.dispatch.localId, receipt);
     return receipt;
+  }
+
+  async #reconcileLaunchGraph(
+    lookup: DispatchLookup
+  ): Promise<ExecutionReviewRequired | undefined> {
+    const durableDispatch = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    const durableTask = this.#lifecycle.task(lookup.task.localId);
+    if (
+      durableDispatch.state === "intervention_required"
+      && (durableDispatch.fenceReceipt !== undefined || durableDispatch.fenceFailure !== undefined)
+    ) {
+      return Object.freeze({
+        kind: "review_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: durableDispatch.orcaDispatchId ?? durableDispatch.id
+      });
+    }
+    const transitional = durableDispatch.state === "launching"
+      || (durableDispatch.state === "running" && durableTask.state !== "running");
+    if (!transitional) return undefined;
+    let recoveredInspection: ProviderInspectReceipt | undefined;
+    try {
+      if (
+        lookup.task.orcaTaskId === undefined
+        || lookup.run.orcaRunId === undefined
+        || durableDispatch.providerId === undefined
+        || durableDispatch.providerStartReceipt === undefined
+        || durableDispatch.assignmentArtifact === undefined
+        || durableDispatch.orcaDispatchId === undefined
+      ) {
+        throw new TypeError("durable launch identity is incomplete");
+      }
+      const provider = this.#providerFor(lookup.dispatch.assignment);
+      const startReceipt = this.#validatedStartReceipt(
+        provider.id,
+        lookup.dispatch.assignment,
+        lookup.task.orcaTaskId,
+        lookup.run.orcaRunId,
+        durableDispatch.assignmentArtifact,
+        durableDispatch.providerStartReceipt
+      );
+      if (
+        provider.id !== durableDispatch.providerId
+        || startReceipt.orcaDispatchId !== durableDispatch.orcaDispatchId
+      ) {
+        throw new TypeError("durable launch provider identity is inconsistent");
+      }
+      const inspections = durableDispatch.providerInspectReceipts ?? [];
+      if (inspections.length === 0) {
+        recoveredInspection = this.#validatedInspectReceipt(
+          provider.id,
+          durableDispatch.orcaDispatchId,
+          lookup.task.orcaTaskId,
+          lookup.run.orcaRunId,
+          startReceipt,
+          await provider.inspect(durableDispatch.orcaDispatchId)
+        );
+      } else {
+        for (const inspection of inspections) {
+          this.#validatedInspectReceipt(
+            provider.id,
+            durableDispatch.orcaDispatchId,
+            lookup.task.orcaTaskId,
+            lookup.run.orcaRunId,
+            startReceipt,
+            inspection
+          );
+        }
+      }
+    } catch {
+      return this.#interveneUnprovenLaunch(lookup);
+    }
+    if (recoveredInspection !== undefined) {
+      await this.#lifecycle.recordProviderInspection(
+        lookup.dispatch.localId,
+        recoveredInspection
+      );
+    }
+    await this.#lifecycle.recordLaunchSuccess(lookup.dispatch.localId);
+    return undefined;
+  }
+
+  async #interveneUnprovenLaunch(lookup: DispatchLookup): Promise<ExecutionReviewRequired> {
+    const current = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    const startReceipt = current.providerStartReceipt;
+    const trustedDispatchId =
+      lookup.task.orcaTaskId === undefined || startReceipt === undefined
+        ? undefined
+        : boundProviderStartDispatchId(startReceipt, lookup.task.orcaTaskId);
+    let outcome: Readonly<
+      | { fenceReceipt: OrcaReceipt }
+      | { fenceFailure: WorkerReleaseFailure }
+    >;
+    if (trustedDispatchId !== undefined && trustedDispatchId === current.orcaDispatchId) {
+      try {
+        const fenceReceipt = await this.#orca.execute({
+          kind: "stop_worker",
+          dispatchId: trustedDispatchId
+        });
+        if (stopDispatchIdFrom(fenceReceipt) !== trustedDispatchId) {
+          throw Object.assign(new Error("stop receipt does not match the exact Dispatch"), {
+            code: "orca_stop_receipt_mismatch",
+            retryable: false
+          });
+        }
+        outcome = Object.freeze({ fenceReceipt });
+      } catch (stopError) {
+        outcome = Object.freeze({ fenceFailure: releaseFailure(stopError) });
+      }
+    } else {
+      outcome = Object.freeze({
+        fenceFailure: Object.freeze({
+          code: "launch_identity_unproven",
+          retryable: false
+        })
+      });
+    }
+    await this.#lifecycle.recordLaunchIntervention(lookup.dispatch.localId, outcome);
+    return Object.freeze({
+      kind: "review_required",
+      reason: "launch_terminal_unproven",
+      dispatchId: current.orcaDispatchId ?? current.id
+    });
   }
 
   async #inspectLaunchFailureWorker(lookup: DispatchLookup): Promise<ProviderInspectReceipt> {
@@ -1976,8 +2248,7 @@ export class ExecutionService {
     this.#dispatchLookup.set(dispatch.localId, lookup);
     this.#dispatchLookup.set(dispatch.orcaDispatchId, lookup);
     await this.inspectWorker(dispatch.orcaDispatchId);
-    await this.#lifecycle.transitionDispatch(dispatch.localId, "running");
-    await this.#lifecycle.transitionTask(task.localId, "running");
+    await this.#lifecycle.recordLaunchSuccess(dispatch.localId);
     return dispatch.orcaDispatchId;
   }
 
@@ -2200,6 +2471,16 @@ export class ExecutionService {
     await this.#lifecycle.transitionDispatch(dispatch.localId, "intervention_required");
     await this.#lifecycle.transitionTask(task.localId, "intervention_required");
     await this.#lifecycle.transitionRun(context.localId, "intervention_required");
+  }
+
+  async #markLaunchFailureIntervention(lookup: DispatchLookup): Promise<void> {
+    const durable = this.#lifecycle.dispatch(lookup.dispatch.localId);
+    if (durable.fenceReceipt === undefined) {
+      throw new Error(`Dispatch ${lookup.dispatch.localId} has no durable launch-failure fence`);
+    }
+    await this.#lifecycle.recordLaunchIntervention(lookup.dispatch.localId, {
+      fenceReceipt: durable.fenceReceipt
+    });
   }
 
   #readyPendingTasks(context: RunContext): TaskContext[] {

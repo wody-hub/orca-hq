@@ -205,6 +205,62 @@ const LaunchFailureCommitStoreSchema = z.object({
   transition: LifecycleTransitionStoreSchema
 }).strict();
 
+const LaunchFailureReservationCommitStoreSchema = z.object({
+  message: z.object({
+    kind: z.literal("launch_failure"),
+    messageId: z.string().min(1),
+    dispatchId: z.string().min(1),
+    evidence: z.object({
+      kind: z.literal("orca_worker_state"),
+      state: z.enum(["launch_failed", "process_failed"])
+    }).strict()
+  }).strict(),
+  dispatch: LifecycleDispatchStoreSchema.extend({
+    state: z.literal("launch_failure_reserved"),
+    launchFailureId: z.string().min(1),
+    orcaDispatchId: z.string().min(1)
+  }).passthrough(),
+  transition: LifecycleTransitionStoreSchema
+}).strict();
+
+const LaunchSuccessCommitStoreSchema = z.object({
+  dispatch: LifecycleDispatchStoreSchema.extend({
+    state: z.literal("running"),
+    orcaDispatchId: z.string().min(1),
+    providerId: z.enum(["codex", "claude"]),
+    providerStartReceipt: ProviderStartReceiptSchema,
+    providerInspectReceipts: z.array(ProviderInspectReceiptSchema).min(1)
+  }).passthrough(),
+  task: LifecycleTaskStoreSchema.extend({ state: z.literal("running") }).passthrough(),
+  transitions: z.array(LifecycleTransitionStoreSchema).max(2)
+}).strict();
+
+const LaunchInterventionCommitStoreSchema = z.object({
+  dispatch: LifecycleDispatchStoreSchema.extend({
+    state: z.literal("intervention_required"),
+    orcaDispatchId: z.string().min(1).optional(),
+    fenceReceipt: OrcaReceiptSchema.optional(),
+    fenceFailure: z.object({
+      code: z.string().min(1),
+      retryable: z.boolean()
+    }).strict().optional()
+  }).passthrough().refine(
+    (dispatch) => (
+      dispatch.fenceReceipt !== undefined || dispatch.fenceFailure !== undefined
+    ) && (
+      dispatch.fenceReceipt === undefined || dispatch.orcaDispatchId !== undefined
+    ),
+    { message: "launch intervention requires a bound fence outcome" }
+  ),
+  task: LifecycleTaskStoreSchema.extend({
+    state: z.literal("intervention_required")
+  }).passthrough(),
+  run: LifecycleRunStoreSchema.extend({
+    state: z.literal("intervention_required")
+  }).passthrough(),
+  transitions: z.array(LifecycleTransitionStoreSchema).max(3)
+}).strict();
+
 export type InboxEvent = z.infer<typeof InboxEventSchema>;
 export type EnqueueOutboxMessage = z.infer<typeof EnqueueOutboxMessageSchema>;
 export type OutboxMessage = z.infer<typeof OutboxMessageSchema>;
@@ -767,6 +823,72 @@ type BoundProviderReceiptOptions = Readonly<{
   verifierSnapshotMode?: "completion" | "launch_failure" | undefined;
   expectedVerifierDiffSha256?: string | undefined;
 }>;
+
+function hasBoundActiveProviderReceipts(
+  payload: Record<string, unknown>,
+  provider: "codex" | "claude",
+  taskId: string,
+  dispatchId: string,
+  orcaTaskId: string,
+  orcaRunId: string,
+  inspectionMode: "active_start" | "launch_failure_identity" = "active_start"
+): boolean {
+  const startResult = ProviderStartReceiptSchema.safeParse(payload.providerStartReceipt);
+  const inspectionsResult = z.array(ProviderInspectReceiptSchema).min(1)
+    .safeParse(payload.providerInspectReceipts);
+  if (!startResult.success || !inspectionsResult.success) return false;
+  const start = startResult.data;
+  const orcaDispatchId = start.orcaDispatchId;
+  const assignment = objectValue(payload.assignment);
+  const assignmentArtifact = objectValue(payload.assignmentArtifact);
+  try {
+    const startReceiptResult = start.orcaReceipt.result;
+    for (const inspection of inspectionsResult.data) {
+      if (inspectionMode === "launch_failure_identity") {
+        assertAuthoritativeWorkerIdentityInspection(
+          inspection.showReceipt,
+          inspection.readReceipt,
+          { dispatchId: orcaDispatchId, taskId: orcaTaskId, runId: orcaRunId }
+        );
+      } else {
+        assertAuthoritativeActiveWorkerInspection(
+          inspection.showReceipt,
+          inspection.readReceipt,
+          {
+            dispatchId: orcaDispatchId,
+            taskId: orcaTaskId,
+            runId: orcaRunId,
+            workerState: start.orcaReceipt.result.state,
+            workerStage: start.orcaReceipt.result.stage
+          }
+        );
+      }
+      if (
+        inspection.provider !== provider
+        || inspection.dispatchId !== orcaDispatchId
+        || inspection.workerState !== inspection.showReceipt.result.worker.state
+      ) return false;
+    }
+    return payload.providerId === provider
+      && payload.id === dispatchId
+      && payload.taskId === taskId
+      && payload.orcaDispatchId === orcaDispatchId
+      && assignment?.taskId === taskId
+      && assignment.dispatchId === dispatchId
+      && start.provider === provider
+      && start.assignmentTaskId === taskId
+      && start.assignmentDispatchId === dispatchId
+      && start.orcaTaskId === orcaTaskId
+      && start.promptArtifact.ownerDispatchId === dispatchId
+      && assignmentArtifact !== undefined
+      && isDeepStrictEqual(assignmentArtifact, start.promptArtifact)
+      && startReceiptResult.dispatchId === orcaDispatchId
+      && startReceiptResult.taskId === orcaTaskId
+      && startReceiptResult.runId === orcaRunId;
+  } catch {
+    return false;
+  }
+}
 
 function hasBoundProviderReceipts(
   payload: Record<string, unknown>,
@@ -1385,6 +1507,364 @@ export class ControlStore implements CommandIngress {
     }).immediate();
   }
 
+  commitLaunchSuccess(inputValue: unknown): "inserted" | "duplicate" {
+    const input = LaunchSuccessCommitStoreSchema.parse(JsonValueSchema.parse(inputValue));
+    return this.database.transaction(() => {
+      const dispatchRow = this.database.prepare(`
+        SELECT task_id, state, payload_json FROM dispatches WHERE id = ?
+      `).get(input.dispatch.id) as StoredDispatchRow | undefined;
+      if (dispatchRow === undefined || dispatchRow.task_id !== input.dispatch.taskId) {
+        throw new Error(`Dispatch ${input.dispatch.id} is not persisted for launch success`);
+      }
+      const taskRow = this.database.prepare(`
+        SELECT run_id, state, payload_json FROM tasks WHERE id = ?
+      `).get(input.task.id) as StoredTaskRow | undefined;
+      if (
+        taskRow === undefined
+        || taskRow.run_id !== input.task.runId
+        || input.dispatch.taskId !== input.task.id
+      ) {
+        throw new Error(`Task ${input.task.id} is not persisted for launch success`);
+      }
+      const runRow = this.database.prepare(`
+        SELECT payload_json FROM runs WHERE id = ?
+      `).get(taskRow.run_id) as { payload_json: string } | undefined;
+      const runPayload = objectValue(
+        runRow === undefined ? undefined : parseJson(runRow.payload_json)
+      );
+      const taskPayload = objectValue(parseJson(taskRow.payload_json));
+      const dispatchPayload = objectValue(parseJson(dispatchRow.payload_json));
+      const provider = z.enum(["codex", "claude"]).safeParse(input.dispatch.providerId);
+      if (
+        typeof taskPayload?.orcaTaskId !== "string"
+        || typeof runPayload?.orcaRunId !== "string"
+        || !provider.success
+        || !hasBoundActiveProviderReceipts(
+          input.dispatch,
+          provider.data,
+          input.dispatch.taskId,
+          input.dispatch.id,
+          taskPayload.orcaTaskId,
+          runPayload.orcaRunId
+        )
+        || !isDeepStrictEqual(input.dispatch.providerStartReceipt, dispatchPayload?.providerStartReceipt)
+        || !isDeepStrictEqual(
+          input.dispatch.providerInspectReceipts,
+          dispatchPayload?.providerInspectReceipts
+        )
+        || input.dispatch.orcaDispatchId !== dispatchPayload?.orcaDispatchId
+      ) {
+        throw new TypeError("launch success receipts are not durably bound");
+      }
+      if (dispatchRow.state === "running" && taskRow.state === "running") {
+        return "duplicate" as const;
+      }
+      if (
+        !["launching", "running"].includes(dispatchRow.state)
+        || !["ready", "running"].includes(taskRow.state)
+      ) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch success`);
+      }
+      const expectedTransitions = [
+        ...(dispatchRow.state === "running"
+          ? []
+          : [{ entity: "dispatch", entityId: input.dispatch.id, from: "launching", to: "running" }]),
+        ...(taskRow.state === "running"
+          ? []
+          : [{ entity: "task", entityId: input.task.id, from: "ready", to: "running" }])
+      ];
+      if (!isDeepStrictEqual(
+        input.transitions.map(({ entity, entityId, from, to }) => ({ entity, entityId, from, to })),
+        expectedTransitions
+      )) {
+        throw new TypeError("launch success transitions do not match durable states");
+      }
+      if (dispatchRow.state === "launching") {
+        const update = this.database.prepare(`
+          UPDATE dispatches SET state = 'running', payload_json = ?, updated_at = ?
+          WHERE id = ? AND task_id = ? AND state = 'launching'
+        `).run(
+          JSON.stringify(input.dispatch),
+          new Date().toISOString(),
+          input.dispatch.id,
+          input.dispatch.taskId
+        );
+        if (update.changes !== 1) {
+          throw new Error(`Dispatch ${input.dispatch.id} changed during launch success`);
+        }
+      }
+      if (taskRow.state === "ready") {
+        const mergedTask = JsonValueSchema.parse({ ...(taskPayload ?? {}), ...input.task });
+        const update = this.database.prepare(`
+          UPDATE tasks SET state = 'running', payload_json = ?, updated_at = ?
+          WHERE id = ? AND run_id = ? AND state = 'ready'
+        `).run(
+          JSON.stringify(mergedTask),
+          new Date().toISOString(),
+          input.task.id,
+          input.task.runId
+        );
+        if (update.changes !== 1) {
+          throw new Error(`Task ${input.task.id} changed during launch success`);
+        }
+      }
+      for (const transition of input.transitions) this.appendTransition(transition);
+      return "inserted" as const;
+    }).immediate();
+  }
+
+  commitLaunchIntervention(inputValue: unknown): "inserted" | "duplicate" {
+    const input = LaunchInterventionCommitStoreSchema.parse(
+      JsonValueSchema.parse(inputValue)
+    );
+    return this.database.transaction(() => {
+      const dispatchRow = this.database.prepare(`
+        SELECT task_id, state, payload_json FROM dispatches WHERE id = ?
+      `).get(input.dispatch.id) as StoredDispatchRow | undefined;
+      const taskRow = this.database.prepare(`
+        SELECT run_id, state, payload_json FROM tasks WHERE id = ?
+      `).get(input.task.id) as StoredTaskRow | undefined;
+      const runRow = this.database.prepare(`
+        SELECT state, payload_json FROM runs WHERE id = ?
+      `).get(input.run.id) as { state: string; payload_json: string } | undefined;
+      if (
+        dispatchRow === undefined
+        || taskRow === undefined
+        || runRow === undefined
+        || dispatchRow.task_id !== input.task.id
+        || taskRow.run_id !== input.run.id
+      ) {
+        throw new Error(`Dispatch ${input.dispatch.id} has no durable launch graph`);
+      }
+      const dispatchPayload = objectValue(parseJson(dispatchRow.payload_json));
+      const taskPayload = objectValue(parseJson(taskRow.payload_json));
+      const runPayload = objectValue(parseJson(runRow.payload_json));
+      const terminalGraph = (
+        dispatchRow.state === "intervention_required"
+        && taskRow.state === "intervention_required"
+        && runRow.state === "intervention_required"
+      );
+      if (!terminalGraph && (
+        !["launching", "running", "launch_failed"].includes(dispatchRow.state)
+        || !["ready", "running"].includes(taskRow.state)
+        || runRow.state !== "active"
+      )) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch intervention`);
+      }
+      const hasFenceReceipt = input.dispatch.fenceReceipt !== undefined;
+      const hasFenceFailure = input.dispatch.fenceFailure !== undefined;
+      if (hasFenceReceipt === hasFenceFailure) {
+        throw new TypeError("launch intervention requires exactly one fence outcome");
+      }
+      if (
+        dispatchPayload?.fenceReceipt !== undefined
+        && !isDeepStrictEqual(dispatchPayload.fenceReceipt, input.dispatch.fenceReceipt)
+      ) {
+        throw new TypeError("launch intervention cannot replace durable fence proof");
+      }
+      if (
+        dispatchPayload?.fenceFailure !== undefined
+        && !isDeepStrictEqual(dispatchPayload.fenceFailure, input.dispatch.fenceFailure)
+      ) {
+        throw new TypeError("launch intervention cannot replace durable fence failure");
+      }
+      if (input.dispatch.fenceReceipt !== undefined) {
+        if (!input.dispatch.fenceReceipt.ok) {
+          throw new TypeError("launch intervention stop proof is not successful");
+        }
+        const receipt = parseOrcaOperationReceipt("stop_worker", input.dispatch.fenceReceipt);
+        const result = objectValue(receipt.result);
+        if (
+          result === undefined
+          || result.dispatchId !== input.dispatch.orcaDispatchId
+          || result.state !== "stopped"
+          || result.verdict !== "stopped"
+        ) {
+          throw new TypeError("launch intervention stop proof is not exact");
+        }
+      }
+      const {
+        fenceReceipt: _durableFenceReceipt,
+        fenceFailure: _durableFenceFailure,
+        ...dispatchIdentity
+      } = dispatchPayload ?? {};
+      const expectedDispatch = JsonValueSchema.parse({
+        ...dispatchIdentity,
+        id: input.dispatch.id,
+        taskId: dispatchRow.task_id,
+        state: "intervention_required",
+        ...(input.dispatch.fenceReceipt === undefined
+          ? { fenceFailure: input.dispatch.fenceFailure }
+          : { fenceReceipt: input.dispatch.fenceReceipt })
+      });
+      const expectedTask = JsonValueSchema.parse({
+        ...(taskPayload ?? {}),
+        id: input.task.id,
+        runId: taskRow.run_id,
+        state: "intervention_required"
+      });
+      const expectedRun = JsonValueSchema.parse({
+        ...(runPayload ?? {}),
+        id: input.run.id,
+        state: "intervention_required"
+      });
+      if (
+        !isDeepStrictEqual(input.dispatch, expectedDispatch)
+        || !isDeepStrictEqual(input.task, expectedTask)
+        || !isDeepStrictEqual(input.run, expectedRun)
+      ) {
+        throw new TypeError("launch intervention payloads do not match durable identity");
+      }
+      const expectedTransitions = [
+        ...(dispatchRow.state === "intervention_required"
+          ? []
+          : [{
+              entity: "dispatch",
+              entityId: input.dispatch.id,
+              from: dispatchRow.state,
+              to: "intervention_required",
+              ...(input.dispatch.fenceReceipt === undefined
+                ? {}
+                : { receiptId: input.dispatch.fenceReceipt.id })
+            }]),
+        ...(taskRow.state === "intervention_required"
+          ? []
+          : [{
+              entity: "task",
+              entityId: input.task.id,
+              from: taskRow.state,
+              to: "intervention_required"
+            }]),
+        ...(runRow.state === "intervention_required"
+          ? []
+          : [{
+              entity: "run",
+              entityId: input.run.id,
+              from: runRow.state,
+              to: "intervention_required"
+            }])
+      ];
+      const transitionIdentities = input.transitions.map((transition) => ({
+        entity: transition.entity,
+        entityId: transition.entityId,
+        from: transition.from,
+        to: transition.to,
+        ...(transition.receiptId === undefined ? {} : { receiptId: transition.receiptId })
+      }));
+      if (!isDeepStrictEqual(transitionIdentities, expectedTransitions)) {
+        throw new TypeError("launch intervention transitions do not match durable states");
+      }
+      if (terminalGraph) return "duplicate" as const;
+      const updateDispatch = this.database.prepare(`
+        UPDATE dispatches
+        SET state = 'intervention_required', payload_json = ?, updated_at = ?
+        WHERE id = ? AND state = ?
+      `).run(
+        JSON.stringify(input.dispatch),
+        new Date().toISOString(),
+        input.dispatch.id,
+        dispatchRow.state
+      );
+      const updateTask = this.database.prepare(`
+        UPDATE tasks SET state = 'intervention_required', payload_json = ?, updated_at = ?
+        WHERE id = ? AND state = ?
+      `).run(
+        JSON.stringify(JsonValueSchema.parse({ ...(taskPayload ?? {}), ...input.task })),
+        new Date().toISOString(),
+        input.task.id,
+        taskRow.state
+      );
+      const updateRun = this.database.prepare(`
+        UPDATE runs SET state = 'intervention_required', payload_json = ?, updated_at = ?
+        WHERE id = ? AND state = ?
+      `).run(
+        JSON.stringify(JsonValueSchema.parse({ ...(runPayload ?? {}), ...input.run })),
+        new Date().toISOString(),
+        input.run.id,
+        runRow.state
+      );
+      if (updateDispatch.changes !== 1 || updateTask.changes !== 1 || updateRun.changes !== 1) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch intervention`);
+      }
+      for (const transition of input.transitions) this.appendTransition(transition);
+      return "inserted" as const;
+    }).immediate();
+  }
+
+  reserveLaunchFailure(inputValue: unknown): "inserted" | "duplicate" {
+    const input = LaunchFailureReservationCommitStoreSchema.parse(
+      JsonValueSchema.parse(inputValue)
+    );
+    return this.database.transaction(() => {
+      const dispatchRow = this.database.prepare(`
+        SELECT task_id, state, payload_json
+        FROM dispatches
+        WHERE id = ?
+      `).get(input.dispatch.id) as StoredDispatchRow | undefined;
+      if (dispatchRow === undefined || dispatchRow.task_id !== input.dispatch.taskId) {
+        throw new Error(`Dispatch ${input.dispatch.id} is not persisted for launch failure`);
+      }
+      const existingPayload = objectValue(parseJson(dispatchRow.payload_json));
+      if (dispatchRow.state === "launch_failure_reserved") {
+        if (
+          existingPayload?.launchFailureId === input.message.messageId
+          && existingPayload.orcaDispatchId === input.message.dispatchId
+        ) return "duplicate" as const;
+        throw new Error(`Dispatch ${input.dispatch.id} has conflicting launch failure`);
+      }
+      if (dispatchRow.state !== "running") {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch failure reservation`);
+      }
+      const taskRow = this.database.prepare(`
+        SELECT run_id, payload_json FROM tasks WHERE id = ?
+      `).get(input.dispatch.taskId) as Pick<StoredTaskRow, "run_id" | "payload_json"> | undefined;
+      const taskPayload = objectValue(
+        taskRow === undefined ? undefined : parseJson(taskRow.payload_json)
+      );
+      const runRow = taskRow === undefined ? undefined : this.database.prepare(`
+        SELECT payload_json FROM runs WHERE id = ?
+      `).get(taskRow.run_id) as { payload_json: string } | undefined;
+      const runPayload = objectValue(
+        runRow === undefined ? undefined : parseJson(runRow.payload_json)
+      );
+      const provider = z.enum(["codex", "claude"]).safeParse(input.dispatch.providerId);
+      if (
+        input.dispatch.launchFailureId !== input.message.messageId
+        || input.dispatch.orcaDispatchId !== input.message.dispatchId
+        || taskRow === undefined
+        || typeof taskPayload?.orcaTaskId !== "string"
+        || typeof runPayload?.orcaRunId !== "string"
+        || !provider.success
+        || !hasBoundActiveProviderReceipts(
+          input.dispatch,
+          provider.data,
+          input.dispatch.taskId,
+          input.dispatch.id,
+          taskPayload.orcaTaskId,
+          runPayload.orcaRunId,
+          "launch_failure_identity"
+        )
+      ) {
+        throw new TypeError("launch failure reservation is not durably bound");
+      }
+      const update = this.database.prepare(`
+        UPDATE dispatches
+        SET state = 'launch_failure_reserved', payload_json = ?, updated_at = ?
+        WHERE id = ? AND task_id = ? AND state = 'running'
+      `).run(
+        JSON.stringify(input.dispatch),
+        new Date().toISOString(),
+        input.dispatch.id,
+        input.dispatch.taskId
+      );
+      if (update.changes !== 1) {
+        throw new Error(`Dispatch ${input.dispatch.id} changed during launch failure reservation`);
+      }
+      this.appendTransition(input.transition);
+      return "inserted" as const;
+    }).immediate();
+  }
+
   commitLaunchFailure(inputValue: unknown): "inserted" | "duplicate" {
     const input = LaunchFailureCommitStoreSchema.parse(JsonValueSchema.parse(inputValue));
     return this.database.transaction(() => {
@@ -1404,7 +1884,7 @@ export class ControlStore implements CommandIngress {
         ) return "duplicate" as const;
         throw new Error(`Dispatch ${input.dispatch.id} has conflicting launch failure`);
       }
-      if (dispatchRow.state !== "running") {
+      if (dispatchRow.state !== "launch_failure_reserved") {
         throw new Error(`Dispatch ${input.dispatch.id} changed during launch failure`);
       }
       const taskRow = this.database.prepare(`
@@ -1447,7 +1927,7 @@ export class ControlStore implements CommandIngress {
       const update = this.database.prepare(`
         UPDATE dispatches
         SET state = 'launch_failed', payload_json = ?, updated_at = ?
-        WHERE id = ? AND task_id = ? AND state = 'running'
+        WHERE id = ? AND task_id = ? AND state = 'launch_failure_reserved'
       `).run(
         JSON.stringify(input.dispatch),
         new Date().toISOString(),

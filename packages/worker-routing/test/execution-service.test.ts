@@ -36,6 +36,9 @@ import {
   type LifecycleStore,
   type LifecycleTransition,
   type LaunchFailureCommit,
+  type LaunchFailureReservationCommit,
+  type LaunchInterventionCommit,
+  type LaunchSuccessCommit,
   type ImplementationVerificationEvidence,
   type ProviderCapabilities,
   type ProviderInspectReceipt,
@@ -242,6 +245,7 @@ class RecordingOrca {
     state: "stopped",
     verdict: "stopped"
   };
+  afterStop?: (() => Promise<void>) | undefined;
   dispatchErrorOnCall: number | undefined;
   createTaskErrorOnCall: number | undefined;
   createTaskRunId: string | undefined;
@@ -385,11 +389,13 @@ class RecordingOrca {
         });
       case "stop_worker":
         if (this.stopError !== undefined) throw this.stopError;
-        return receipt(`stop-receipt-${operation.dispatchId}`, {
+        const stopReceipt = receipt(`stop-receipt-${operation.dispatchId}`, {
           dispatchId: operation.dispatchId,
           state: this.stopResult.state,
           verdict: this.stopResult.verdict
         });
+        await this.afterStop?.();
+        return stopReceipt;
       case "release_worker":
         if (this.releaseError !== undefined) throw this.releaseError;
         return receipt(`release-receipt-${operation.dispatchId}`, {
@@ -482,6 +488,33 @@ class MemoryLifecycleStore implements LifecycleStore {
     this.messages.push(structuredClone(input.message));
     this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
     this.transitions.push(structuredClone(input.transition));
+    return "inserted";
+  }
+
+  async reserveLaunchFailure(
+    input: LaunchFailureReservationCommit
+  ): Promise<"inserted" | "duplicate"> {
+    const current = this.dispatches.get(input.dispatch.id);
+    if (current?.state === "launch_failure_reserved") return "duplicate";
+    this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
+    this.transitions.push(structuredClone(input.transition));
+    return "inserted";
+  }
+
+  async commitLaunchSuccess(input: LaunchSuccessCommit): Promise<"inserted" | "duplicate"> {
+    this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
+    this.tasks.set(input.task.id, structuredClone(input.task));
+    this.transitions.push(...structuredClone(input.transitions));
+    return "inserted";
+  }
+
+  async commitLaunchIntervention(
+    input: LaunchInterventionCommit
+  ): Promise<"inserted" | "duplicate"> {
+    this.dispatches.set(input.dispatch.id, structuredClone(input.dispatch));
+    this.tasks.set(input.task.id, structuredClone(input.task));
+    this.runs.set(input.run.id, structuredClone(input.run));
+    this.transitions.push(...structuredClone(input.transitions));
     return "inserted";
   }
 
@@ -624,6 +657,51 @@ class RecordingLocks implements EditingLockPort {
   release(input: Parameters<EditingLockPort["release"]>[0]): ReturnType<EditingLockPort["release"]> {
     this.released.push(structuredClone(input));
     return { kind: "released" };
+  }
+}
+
+class DurableLocks implements EditingLockPort {
+  crashAfterReleaseOnce = false;
+  readonly acquired: Array<Parameters<EditingLockPort["acquire"]>[0]> = [];
+  readonly released: Array<Parameters<EditingLockPort["release"]>[0]> = [];
+
+  constructor(readonly store: ControlStore) {}
+
+  acquire(input: Parameters<EditingLockPort["acquire"]>[0]): ReturnType<EditingLockPort["acquire"]> {
+    this.acquired.push(structuredClone(input));
+    if (this.store.loadRunGraphForDispatch(input.dispatchId) === undefined) {
+      return { kind: "acquired" };
+    }
+    return this.store.acquireWorktreeLock({
+      ...input,
+      acquiredAt: "2026-09-03T00:00:00.000Z",
+      heartbeatAt: "2026-09-03T00:00:00.000Z",
+      expiresAt: "2026-09-03T00:05:00.000Z"
+    });
+  }
+
+  persistLatestAcquire(): void {
+    const input = this.acquired.at(-1);
+    if (input === undefined) throw new Error("no acquired lease to persist");
+    this.store.acquireWorktreeLock({
+      ...input,
+      acquiredAt: "2026-09-03T00:00:00.000Z",
+      heartbeatAt: "2026-09-03T00:00:00.000Z",
+      expiresAt: "2026-09-03T00:05:00.000Z"
+    });
+  }
+
+  release(input: Parameters<EditingLockPort["release"]>[0]): ReturnType<EditingLockPort["release"]> {
+    this.released.push(structuredClone(input));
+    const result = this.store.releaseWorktreeLock({
+      ...input,
+      releasedAt: "2026-09-03T00:01:00.000Z"
+    });
+    if (this.crashAfterReleaseOnce) {
+      this.crashAfterReleaseOnce = false;
+      throw new Error("synthetic process loss after durable lease release");
+    }
+    return result;
   }
 }
 
@@ -801,7 +879,9 @@ function durableExecutionService(
       }],
       auditReferences: ["audit:durable:implementation:dispatch"]
     }),
-  locks: EditingLockPort = new RecordingLocks()
+  locks: EditingLockPort = new RecordingLocks(),
+  assignmentArtifacts: AssignmentArtifactStore = new MemoryAssignmentArtifactStore(),
+  git: MemoryGit = new MemoryGit()
 ): ExecutionService {
   const lifecycle = new ExecutionLifecycle({ store, messages: new RecordingMessageSink() });
   const verification = new VerificationService({
@@ -815,10 +895,10 @@ function durableExecutionService(
   });
   return new ExecutionService({
     orca,
-    placements: new GitWorktreePlacementService(new MemoryGit()),
+    placements: new GitWorktreePlacementService(git),
     locks,
     lifecycle,
-    assignmentArtifacts: new MemoryAssignmentArtifactStore(),
+    assignmentArtifacts,
     providerCapabilities: {
       codex: { worker: "available", hq: "available" },
       claude: { worker: "available", hq: "unavailable" },
@@ -852,6 +932,43 @@ function seedDurableCommand(database: Database.Database, idempotencyKey: string)
       received_at, payload_json, created_at
     ) VALUES ('command-1', ?, 'slack', '171.003', 'owner', ?, '{}', ?)
   `).run(idempotencyKey, now, now);
+}
+
+function rewriteDurableLaunchCheckpoint(
+  database: Database.Database,
+  input: Readonly<{
+    dispatchState: "launching" | "running";
+    keepInspections: boolean;
+    mutateDispatch?: ((payload: Record<string, any>) => void) | undefined;
+  }>
+): void {
+  const dispatchRow = database.prepare(`
+    SELECT id, task_id, payload_json
+    FROM dispatches
+    WHERE json_extract(payload_json, '$.orcaDispatchId') = 'orca-dispatch-1'
+  `).get() as { id: string; task_id: string; payload_json: string };
+  const dispatchPayload = JSON.parse(dispatchRow.payload_json) as Record<string, any>;
+  dispatchPayload.state = input.dispatchState;
+  if (!input.keepInspections) delete dispatchPayload.providerInspectReceipts;
+  input.mutateDispatch?.(dispatchPayload);
+  database.prepare(`
+    UPDATE dispatches SET state = ?, payload_json = ? WHERE id = ?
+  `).run(input.dispatchState, JSON.stringify(dispatchPayload), dispatchRow.id);
+
+  const taskRow = database.prepare(`
+    SELECT payload_json FROM tasks WHERE id = ?
+  `).get(dispatchRow.task_id) as { payload_json: string };
+  const taskPayload = JSON.parse(taskRow.payload_json) as Record<string, unknown>;
+  taskPayload.state = "ready";
+  database.prepare(`
+    UPDATE tasks SET state = 'ready', payload_json = ? WHERE id = ?
+  `).run(JSON.stringify(taskPayload), dispatchRow.task_id);
+  database.prepare(`
+    DELETE FROM audit_events
+    WHERE event_type = 'lifecycle.transition'
+      AND subject_id IN (?, ?)
+      AND json_extract(data_json, '$.to') = 'running'
+  `).run(dispatchRow.id, dispatchRow.task_id);
 }
 
 function durableReport(
@@ -3992,6 +4109,362 @@ describe("worker lifecycle", () => {
     expect(store.runs.get("run:proposal-1")?.state).toBe("intervention_required");
   });
 
+  it("recovers a launching Dispatch with only a bound start receipt by inspecting before completion", async () => {
+    // Break caught: a crash after provider start but before inspection strands a live worker in launching forever.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-start-receipt-only");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: false
+      });
+      const callsBefore = orca.calls.length;
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-after-start-only-recovery",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "completed after launch recovery"
+      })).resolves.toMatchObject({ kind: "recorded" });
+
+      expect(orca.calls.slice(callsBefore, callsBefore + 2)).toEqual([
+        { kind: "show_worker", dispatchId: "orca-dispatch-1" },
+        { kind: "read_worker", dispatchId: "orca-dispatch-1", limit: 100 }
+      ]);
+      expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+        eventType: "lifecycle.transition",
+        data: expect.objectContaining({
+          entity: "dispatch",
+          from: "launching",
+          to: "running"
+        })
+      }));
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("promotes a launching Dispatch from its already durable bound show/read receipts", async () => {
+    // Break caught: replaying provider inspection after it is durable is unnecessary and launching still blocks completion.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-durable-inspection");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: true
+      });
+      const inspectionsBefore = orca.calls.filter((operation) =>
+        operation.kind === "show_worker" || operation.kind === "read_worker"
+      ).length;
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-after-durable-inspection-recovery",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "completed after durable inspection recovery"
+      })).resolves.toMatchObject({ kind: "recorded" });
+
+      const originalInspections = orca.calls.filter((operation) =>
+        (operation.kind === "show_worker" || operation.kind === "read_worker")
+        && operation.dispatchId === "orca-dispatch-1"
+      );
+      expect(originalInspections).toHaveLength(inspectionsBefore);
+      expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+        eventType: "lifecycle.transition",
+        data: expect.objectContaining({ entity: "task", from: "ready", to: "running" })
+      }));
+    } finally {
+      database.close();
+    }
+  });
+
+  it("repairs a durable Dispatch-running Task-ready split before accepting worker_done", async () => {
+    // Break caught: a crash between separate running writes leaves completion permanently blocked by an incoherent graph.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-running-ready-split");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "running",
+        keepInspections: true
+      });
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-after-running-ready-recovery",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "completed after split recovery"
+      })).resolves.toMatchObject({ kind: "recorded" });
+
+      expect(store.loadTaskRecord("task:proposal-1:implement")).toMatchObject({
+        state: "worker_done"
+      });
+      expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+        eventType: "lifecycle.transition",
+        data: expect.objectContaining({ entity: "task", from: "ready", to: "running" })
+      }));
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("fences and intervenes on a mismatched transitional inspection without accepting completion", async () => {
+    // Break caught: tampered transitional ownership must never be promoted or allowed to complete under the local identity.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-mismatched-inspection");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: true,
+        mutateDispatch: (payload) => {
+          payload.providerInspectReceipts[0].showReceipt.result.dispatch.task_id =
+            "orca-task-mismatched";
+        }
+      });
+      const restarted = durableExecutionService(store, orca);
+
+      await expect(restarted.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-against-mismatched-launch",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "must not be accepted"
+      })).resolves.toEqual({
+        kind: "review_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: "orca-dispatch-1"
+      });
+      await expect(restarted.recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-against-mismatched-launch-redelivery",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "must not be accepted"
+      })).resolves.toEqual({
+        kind: "review_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: "orca-dispatch-1"
+      });
+
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([{
+        kind: "stop_worker",
+        dispatchId: "orca-dispatch-1"
+      }]);
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "intervention_required", fenceReceipt: { ok: true } }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("retains fences and intervenes without stopping when a transitional identity is uncertain", async () => {
+    // Break caught: an unbound local launching record must not guess an external Dispatch identity or remain completable.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-uncertain-identity");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: false,
+        mutateDispatch: (payload) => {
+          delete payload.orcaDispatchId;
+          delete payload.providerStartReceipt;
+          delete payload.receipt;
+        }
+      });
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-against-uncertain-launch",
+        dispatchId: "dispatch:proposal-1:implement:1",
+        outcome: "completed",
+        summary: "must not be accepted"
+      })).resolves.toEqual({
+        kind: "review_required",
+        reason: "launch_terminal_unproven",
+        dispatchId: "dispatch:proposal-1:implement:1"
+      });
+
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+      const [intervened] = store.loadDispatchesForTask("task:proposal-1:implement");
+      expect(intervened).toMatchObject({
+        state: "intervention_required",
+        fenceFailure: { code: "launch_identity_unproven", retryable: false }
+      });
+      expect(intervened).not.toHaveProperty("assignmentArtifactCleanup");
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects launch-intervention transitions that do not match the durable graph", async () => {
+    // Break caught: caller-shaped transition audits must not describe a different pre-intervention state.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-intervention-transition-tamper");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: true,
+        mutateDispatch: (payload) => {
+          payload.providerInspectReceipts[0].showReceipt.result.dispatch.task_id =
+            "orca-task-mismatched";
+        }
+      });
+      const durableCommit = store.commitLaunchIntervention.bind(store);
+      const commitSpy = vi.spyOn(store, "commitLaunchIntervention").mockImplementation((value) => {
+        const commit = value as LaunchInterventionCommit;
+        return durableCommit({
+          ...commit,
+          transitions: commit.transitions.map((transition, index) => index === 0
+            ? { ...transition, from: "running" }
+            : transition)
+        });
+      });
+      try {
+        await expect(durableExecutionService(store, orca).recordWorkerMessage({
+          kind: "worker_done",
+          messageId: "done-during-launch-intervention-transition-tamper",
+          dispatchId: "orca-dispatch-1",
+          outcome: "completed",
+          summary: "must not be accepted"
+        })).rejects.toThrow("launch intervention transitions do not match durable states");
+      } finally {
+        commitSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launching" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement")).toMatchObject({ state: "ready" });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({ state: "active" });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects launch intervention payloads that rewrite durable Dispatch, Task, or Run identity", async () => {
+    // Break caught: the atomic intervention caller may add only its fence outcome and terminal states.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-intervention-identity-tamper");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: true,
+        mutateDispatch: (payload) => {
+          payload.providerInspectReceipts[0].showReceipt.result.dispatch.task_id =
+            "orca-task-mismatched";
+        }
+      });
+      const durableCommit = store.commitLaunchIntervention.bind(store);
+      const commitSpy = vi.spyOn(store, "commitLaunchIntervention").mockImplementation((value) => {
+        const commit = value as LaunchInterventionCommit;
+        return durableCommit({
+          ...commit,
+          dispatch: {
+            ...commit.dispatch,
+            assignment: { ...commit.dispatch.assignment, dispatchId: "dispatch:tampered" }
+          },
+          task: { ...commit.task, orcaTaskId: "orca-task-tampered" },
+          run: { ...commit.run, orcaRunId: "orca-run-tampered" }
+        });
+      });
+      try {
+        await expect(durableExecutionService(store, orca).recordWorkerMessage({
+          kind: "worker_done",
+          messageId: "done-during-launch-intervention-identity-tamper",
+          dispatchId: "orca-dispatch-1",
+          outcome: "completed",
+          summary: "must not be accepted"
+        })).rejects.toThrow("launch intervention payloads do not match durable identity");
+      } finally {
+        commitSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launching" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement")).toMatchObject({
+        state: "ready",
+        orcaTaskId: "orca-task-1"
+      });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({
+        state: "active",
+        orcaRunId: "orca-run-1"
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rolls back both launch promotion states when its Task transition audit fails", async () => {
+    // Break caught: Dispatch running must not commit alone when the Task half or its audit cannot be committed.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-recovery-atomic-promotion");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      await durableExecutionService(store, orca).start(authorized());
+      rewriteDurableLaunchCheckpoint(database, {
+        dispatchState: "launching",
+        keepInspections: true
+      });
+      database.exec(`
+        CREATE TRIGGER fail_recovered_task_running_transition
+        BEFORE INSERT ON audit_events
+        WHEN NEW.event_type = 'lifecycle.transition'
+          AND json_extract(NEW.data_json, '$.entity') = 'task'
+          AND json_extract(NEW.data_json, '$.to') = 'running'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced recovered Task transition failure');
+        END;
+      `);
+
+      await expect(durableExecutionService(store, orca).recordWorkerMessage({
+        kind: "worker_done",
+        messageId: "done-during-atomic-promotion-failure",
+        dispatchId: "orca-dispatch-1",
+        outcome: "completed",
+        summary: "must wait for atomic promotion"
+      })).rejects.toThrow("forced recovered Task transition failure");
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launching" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "ready" });
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
   it("authoritatively inspects and stops the exact possibly-live Dispatch before launch retry cleanup", async () => {
     // Break caught: caller-shaped launch_failed evidence alone can free attempt-one resources while its worker remains live.
     const { service, orca, artifacts, locks } = setup();
@@ -4065,9 +4538,543 @@ describe("worker lifecycle", () => {
 
       expect(database.prepare(`
         SELECT state FROM dispatches WHERE id = 'dispatch:proposal-1:implement:1'
-      `).get()).toEqual({ state: "running" });
+      `).get()).toEqual({ state: "launch_failure_reserved" });
       expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.launch_failure"))
         .toEqual([]);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("reserves launch failure before stop proof so a racing worker_done cannot win", async () => {
+    // Break caught: worker_done delivered after exact stop can terminalize a still-running durable Dispatch before launch_failed is committed.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failure-worker-done-race");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const service = durableExecutionService(store, orca);
+      await service.start(authorized());
+      let completionError: unknown;
+      orca.afterStop = async () => {
+        try {
+          await durableExecutionService(store, orca).recordWorkerMessage({
+            kind: "worker_done",
+            messageId: "worker-done-after-stop-proof",
+            dispatchId: "orca-dispatch-1",
+            outcome: "completed",
+            summary: "completion raced launch failure"
+          });
+        } catch (error) {
+          completionError = error;
+        }
+      };
+
+      await expect(service.recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "launch-failure-race-winner",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toMatchObject({
+        kind: "retried",
+        retryOf: "orca-dispatch-1"
+      });
+
+      expect(completionError).toMatchObject({ code: "worker_completion_conflict" });
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.worker_done"))
+        .toEqual([]);
+      expect(store.loadDispatchesForTask("task:proposal-1:implement")).toMatchObject([
+        { state: "launch_failed", launchFailureId: "launch-failure-race-winner" },
+        { state: "running", retryOf: "orca-dispatch-1" }
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("resumes the same launch failure after a crash immediately after its durable reservation", async () => {
+    // Break caught: a durable reservation without stop proof must be resumed, not treated as a completed duplicate.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failure-reservation-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const locks = new DurableLocks(store);
+      const firstService = durableExecutionService(store, orca, undefined, locks, artifacts, git);
+      await firstService.start(authorized());
+      locks.persistLatestAcquire();
+      const reserve = store.reserveLaunchFailure.bind(store);
+      const reserveSpy = vi.spyOn(store, "reserveLaunchFailure").mockImplementation((value) => {
+        reserve(value);
+        throw new Error("synthetic process loss after durable launch-failure reservation");
+      });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "reservation-crash",
+          evidence: { kind: "orca_worker_state", state: "launch_failed" }
+        })).rejects.toThrow("synthetic process loss after durable launch-failure reservation");
+      } finally {
+        reserveSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failure_reserved" }]);
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toEqual([]);
+
+      const resumed = await durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "reservation-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      });
+      expect(resumed).toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+
+      const resumedLocks = new DurableLocks(store);
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        resumedLocks,
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "reservation-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual(resumed);
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toHaveLength(1);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("reconciles an idempotent stop after a crash between exact stop proof and launch_failed", async () => {
+    // Break caught: an externally stopped worker with only a durable reservation must be stopped idempotently and resumed after restart.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failure-stop-proof-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const firstLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        undefined,
+        firstLocks,
+        artifacts,
+        git
+      );
+      await firstService.start(authorized());
+      firstLocks.persistLatestAcquire();
+      const commitSpy = vi.spyOn(store, "commitLaunchFailure").mockImplementation(() => {
+        throw new Error("synthetic process loss after exact stop proof");
+      });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "stop-proof-crash",
+          evidence: { kind: "orca_worker_state", state: "process_failed" }
+        })).rejects.toThrow("synthetic process loss after exact stop proof");
+      } finally {
+        commitSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failure_reserved" }]);
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toHaveLength(1);
+
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "stop-proof-crash",
+        evidence: { kind: "orca_worker_state", state: "process_failed" }
+      })).resolves.toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      expect(orca.calls.filter(({ kind }) => kind === "stop_worker")).toHaveLength(2);
+      expect(store.listAuditEvents().filter(({ eventType }) => eventType === "worker.launch_failure"))
+        .toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("resumes cleanup and one retry after a crash immediately after durable launch_failed", async () => {
+    // Break caught: durable launch_failed without cleanup must resume instead of returning duplicate and retaining its lease forever.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failed-before-cleanup-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const firstLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(store, orca, undefined, firstLocks, artifacts, git);
+      await firstService.start(authorized());
+      firstLocks.persistLatestAcquire();
+      const commit = store.commitLaunchFailure.bind(store);
+      const commitSpy = vi.spyOn(store, "commitLaunchFailure").mockImplementation((value) => {
+        commit(value);
+        throw new Error("synthetic process loss after durable launch_failed");
+      });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "launch-failed-before-cleanup",
+          evidence: { kind: "orca_worker_state", state: "launch_failed" }
+        })).rejects.toThrow("synthetic process loss after durable launch_failed");
+      } finally {
+        commitSpy.mockRestore();
+      }
+      const [launchFailed] = store.loadDispatchesForTask("task:proposal-1:implement");
+      expect(launchFailed).toMatchObject({ state: "launch_failed" });
+      expect(launchFailed).not.toHaveProperty("assignmentArtifactCleanup");
+      expect(store.getWorktreeLock(project.lockKey)?.dispatchId)
+        .toBe("dispatch:proposal-1:implement:1");
+
+      const resumedLocks = new DurableLocks(store);
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        resumedLocks,
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "launch-failed-before-cleanup",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      expect(artifacts.cleaned).toHaveLength(1);
+      expect(store.getWorktreeLock(project.lockKey)).toBeUndefined();
+      expect(resumedLocks.acquired.at(-1)?.dispatchId)
+        .toBe("dispatch:proposal-1:implement:2");
+    } finally {
+      database.close();
+    }
+  });
+
+  it("resumes one retry after cleanup and durable lease release crash", async () => {
+    // Break caught: replay after cleanup/release must skip both completed effects and create exactly one replacement identity.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failed-after-cleanup-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const crashingLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        undefined,
+        crashingLocks,
+        artifacts,
+        git
+      );
+      await firstService.start(authorized());
+      crashingLocks.persistLatestAcquire();
+      crashingLocks.crashAfterReleaseOnce = true;
+      await expect(firstService.recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "cleanup-release-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).rejects.toThrow("synthetic process loss after durable lease release");
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "launch_failed", assignmentArtifactCleanup: { kind: "removed" } }]);
+      expect(store.getWorktreeLock(project.lockKey)).toBeUndefined();
+
+      const resumed = await durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "cleanup-release-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      });
+      expect(resumed).toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "cleanup-release-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual(resumed);
+      expect(artifacts.cleaned).toHaveLength(1);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("materializes the existing retry worktree after a crash immediately after retry persistence", async () => {
+    // Break caught: replay of a durable planned retry must create its isolated worktree before starting that same identity.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failed-after-retry-persistence-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const firstLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        undefined,
+        firstLocks,
+        artifacts,
+        git
+      );
+      await firstService.start(authorized());
+      firstLocks.persistLatestAcquire();
+      const durableSaveDispatch = store.saveDispatch.bind(store);
+      const saveSpy = vi.spyOn(store, "saveDispatch").mockImplementation((value) => {
+        durableSaveDispatch(value);
+        const record = value as { id?: unknown; state?: unknown };
+        if (
+          record.id === "dispatch:proposal-1:implement:2"
+          && record.state === "planned"
+        ) {
+          throw new Error("synthetic process loss after durable retry persistence");
+        }
+      });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "retry-persistence-crash",
+          evidence: { kind: "orca_worker_state", state: "launch_failed" }
+        })).rejects.toThrow("synthetic process loss after durable retry persistence");
+      } finally {
+        saveSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement")).toMatchObject([
+        { state: "launch_failed", assignmentArtifactCleanup: { kind: "removed" } },
+        { id: "dispatch:proposal-1:implement:2", state: "planned", attempt: 2 }
+      ]);
+      expect(git.created).toHaveLength(1);
+
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "retry-persistence-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      const retry = store.loadDispatchesForTask("task:proposal-1:implement")[1] as DispatchRecord;
+      expect(git.created).toHaveLength(2);
+      expect(git.created[1]).toMatchObject({
+        repositoryPath: retry.assignment.repo.repositoryPath,
+        worktreePath: retry.assignment.worktree.path,
+        branch: retry.assignment.worktree.branch,
+        baseCommit: retry.assignment.base.commit
+      });
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("reuses the exact retry worktree after a crash between materialization and launch", async () => {
+    // Break caught: an exact durable retry worktree is replay success, not a branch conflict or a second Git create.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failed-after-retry-worktree-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const firstLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        undefined,
+        firstLocks,
+        artifacts,
+        git
+      );
+      await firstService.start(authorized());
+      firstLocks.persistLatestAcquire();
+      const durableSaveDispatch = store.saveDispatch.bind(store);
+      const saveSpy = vi.spyOn(store, "saveDispatch").mockImplementation((value) => {
+        durableSaveDispatch(value);
+        const record = value as { id?: unknown; state?: unknown };
+        if (
+          record.id === "dispatch:proposal-1:implement:2"
+          && record.state === "planned"
+        ) {
+          throw new Error("synthetic process loss after durable retry persistence");
+        }
+      });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "retry-worktree-crash",
+          evidence: { kind: "orca_worker_state", state: "launch_failed" }
+        })).rejects.toThrow("synthetic process loss after durable retry persistence");
+      } finally {
+        saveSpy.mockRestore();
+      }
+      const retry = store.loadDispatchesForTask("task:proposal-1:implement")[1] as DispatchRecord;
+      if (retry?.assignment.worktree.branch === null) {
+        throw new Error("expected an isolated retry worktree branch");
+      }
+      await git.createWorktree({
+        repositoryPath: retry.assignment.repo.repositoryPath,
+        worktreePath: retry.assignment.worktree.path,
+        branch: retry.assignment.worktree.branch,
+        baseCommit: retry.assignment.base.commit
+      });
+      expect(git.created).toHaveLength(2);
+
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "retry-worktree-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "retried",
+        dispatchId: "orca-dispatch-2",
+        retryOf: "orca-dispatch-1"
+      });
+      expect(git.created).toHaveLength(2);
+      expect(store.loadDispatchesForTask("task:proposal-1:implement")[1])
+        .toMatchObject({ state: "running", retryOf: "orca-dispatch-1" });
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("finishes graph intervention after a crash following durable launch-failure cleanup failure", async () => {
+    // Break caught: replay must not report intervention while leaving a launch_failed Dispatch on an active Run.
+    const database = openDatabase(":memory:");
+    try {
+      seedDurableCommand(database, "test:launch-failed-cleanup-failure-intervention-crash");
+      const store = new ControlStore(database);
+      const orca = new RecordingOrca();
+      const artifacts = new MemoryAssignmentArtifactStore();
+      const git = new MemoryGit();
+      const firstLocks = new DurableLocks(store);
+      const firstService = durableExecutionService(
+        store,
+        orca,
+        undefined,
+        firstLocks,
+        artifacts,
+        git
+      );
+      await firstService.start(authorized());
+      firstLocks.persistLatestAcquire();
+      artifacts.cleanupError = Object.assign(new Error("synthetic terminal cleanup failure"), {
+        code: "assignment_artifact_cleanup_failed",
+        retryable: false
+      });
+      let crashBeforeIntervention = true;
+      const interventionSpy = vi.spyOn(store, "commitLaunchIntervention")
+        .mockImplementation(() => {
+          if (!crashBeforeIntervention) {
+            throw new Error("unexpected duplicate cleanup-failure intervention");
+          }
+          crashBeforeIntervention = false;
+          throw new Error("synthetic process loss before cleanup-failure intervention");
+        });
+      try {
+        await expect(firstService.recordLaunchFailure({
+          dispatchId: "orca-dispatch-1",
+          failureId: "cleanup-failure-intervention-crash",
+          evidence: { kind: "orca_worker_state", state: "launch_failed" }
+        })).rejects.toThrow("synthetic process loss before cleanup-failure intervention");
+      } finally {
+        interventionSpy.mockRestore();
+      }
+      expect(store.loadDispatchesForTask("task:proposal-1:implement")).toMatchObject([{
+        state: "launch_failed",
+        assignmentArtifactCleanupFailure: {
+          code: "assignment_artifact_cleanup_failed",
+          retryable: false
+        }
+      }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement")).toMatchObject({ state: "running" });
+      expect(store.loadRunRecord("run:proposal-1")).toMatchObject({ state: "active" });
+
+      await expect(durableExecutionService(
+        store,
+        orca,
+        undefined,
+        new DurableLocks(store),
+        artifacts,
+        git
+      ).recordLaunchFailure({
+        dispatchId: "orca-dispatch-1",
+        failureId: "cleanup-failure-intervention-crash",
+        evidence: { kind: "orca_worker_state", state: "launch_failed" }
+      })).resolves.toEqual({
+        kind: "intervention_required",
+        reason: "assignment_artifact_cleanup_failed",
+        dispatchId: "orca-dispatch-1"
+      });
+      expect(store.loadDispatchesForTask("task:proposal-1:implement"))
+        .toMatchObject([{ state: "intervention_required" }]);
+      expect(store.loadTaskRecord("task:proposal-1:implement"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(store.loadRunRecord("run:proposal-1"))
+        .toMatchObject({ state: "intervention_required" });
+      expect(store.getWorktreeLock(project.lockKey)?.dispatchId)
+        .toBe("dispatch:proposal-1:implement:1");
       expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
     } finally {
       database.close();

@@ -330,6 +330,12 @@ export class GitWorktreePlacementService implements WorktreePlacementPort {
       (occupancy) => occupancy.branch === placement.worktree.branch
     );
     if (branchConflict !== undefined) {
+      if (
+        normalizedPath(branchConflict.path) === normalizedPath(placement.worktree.path)
+        && branchConflict.head === placement.baseCommit
+      ) {
+        return placement;
+      }
       return Object.freeze({
         kind: "review_required",
         reason: "target_branch_occupied",

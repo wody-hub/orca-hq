@@ -118,6 +118,7 @@ export type DispatchState =
   | "planned"
   | "launching"
   | "running"
+  | "launch_failure_reserved"
   | "worker_done"
   | "launch_failed"
   | "intervention_required";
@@ -281,6 +282,25 @@ export type LaunchFailureCommit = Readonly<{
   transition: LifecycleTransition;
 }>;
 
+export type LaunchFailureReservationCommit = Readonly<{
+  message: LaunchFailureMessage;
+  dispatch: DispatchRecord;
+  transition: LifecycleTransition;
+}>;
+
+export type LaunchSuccessCommit = Readonly<{
+  dispatch: DispatchRecord;
+  task: TaskRecord;
+  transitions: readonly LifecycleTransition[];
+}>;
+
+export type LaunchInterventionCommit = Readonly<{
+  dispatch: DispatchRecord;
+  task: TaskRecord;
+  run: RunRecord;
+  transitions: readonly LifecycleTransition[];
+}>;
+
 export type DurableRunGraph = Readonly<{
   run: RunRecord;
   tasks: readonly TaskRecord[];
@@ -297,7 +317,14 @@ export interface LifecycleStore {
   appendTransition(transition: LifecycleTransition): MaybePromise<void>;
   appendMessageOnce(message: LifecycleMessage): MaybePromise<"inserted" | "duplicate">;
   commitWorkerDone(input: WorkerDoneCommit): MaybePromise<"inserted" | "duplicate">;
+  reserveLaunchFailure(
+    input: LaunchFailureReservationCommit
+  ): MaybePromise<"inserted" | "duplicate">;
   commitLaunchFailure(input: LaunchFailureCommit): MaybePromise<"inserted" | "duplicate">;
+  commitLaunchSuccess(input: LaunchSuccessCommit): MaybePromise<"inserted" | "duplicate">;
+  commitLaunchIntervention(
+    input: LaunchInterventionCommit
+  ): MaybePromise<"inserted" | "duplicate">;
   ensureVerificationObligations(
     runId: string,
     obligations: readonly VerificationObligation[]
@@ -424,6 +451,81 @@ export class ExecutionLifecycle {
     return updated;
   }
 
+  async recordLaunchSuccess(localDispatchId: string): Promise<"recorded" | "duplicate"> {
+    const currentDispatch = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const currentTask = this.#required(this.#tasks, "Task", currentDispatch.taskId);
+    if (
+      !["launching", "running"].includes(currentDispatch.state)
+      || !["ready", "running"].includes(currentTask.state)
+    ) {
+      throw new Error(`Dispatch ${localDispatchId} has no coherent launch transition`);
+    }
+    const dispatch = Object.freeze({ ...currentDispatch, state: "running" as const });
+    const task = Object.freeze({ ...currentTask, state: "running" as const });
+    const transitions = Object.freeze([
+      ...(currentDispatch.state === "running"
+        ? []
+        : [this.#newTransition("dispatch", dispatch.id, currentDispatch.state, "running")]),
+      ...(currentTask.state === "running"
+        ? []
+        : [this.#newTransition("task", task.id, currentTask.state, "running")])
+    ]);
+    const result = await this.#store.commitLaunchSuccess(Object.freeze({
+      dispatch,
+      task,
+      transitions
+    }));
+    this.#dispatches.set(dispatch.id, dispatch);
+    this.#tasks.set(task.id, task);
+    return result === "duplicate" ? "duplicate" : "recorded";
+  }
+
+  async recordLaunchIntervention(
+    localDispatchId: string,
+    outcome: Readonly<
+      | { fenceReceipt: OrcaReceipt }
+      | { fenceFailure: WorkerReleaseFailure }
+    >
+  ): Promise<"recorded" | "duplicate"> {
+    const currentDispatch = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const currentTask = this.#required(this.#tasks, "Task", currentDispatch.taskId);
+    const currentRun = this.#required(this.#runs, "Run", currentTask.runId);
+    const dispatch = Object.freeze({
+      ...currentDispatch,
+      ...outcome,
+      state: "intervention_required" as const
+    });
+    const task = Object.freeze({ ...currentTask, state: "intervention_required" as const });
+    const run = Object.freeze({ ...currentRun, state: "intervention_required" as const });
+    const transitions = Object.freeze([
+      ...(currentDispatch.state === "intervention_required"
+        ? []
+        : [this.#newTransition(
+            "dispatch",
+            dispatch.id,
+            currentDispatch.state,
+            "intervention_required",
+            "fenceReceipt" in outcome ? outcome.fenceReceipt.id : undefined
+          )]),
+      ...(currentTask.state === "intervention_required"
+        ? []
+        : [this.#newTransition("task", task.id, currentTask.state, "intervention_required")]),
+      ...(currentRun.state === "intervention_required"
+        ? []
+        : [this.#newTransition("run", run.id, currentRun.state, "intervention_required")])
+    ]);
+    const result = await this.#store.commitLaunchIntervention(Object.freeze({
+      dispatch,
+      task,
+      run,
+      transitions
+    }));
+    this.#dispatches.set(dispatch.id, dispatch);
+    this.#tasks.set(task.id, task);
+    this.#runs.set(run.id, run);
+    return result === "duplicate" ? "duplicate" : "recorded";
+  }
+
   async recordWorkerMessage(
     message: WorkerMessage,
     localDispatchId: string
@@ -472,25 +574,53 @@ export class ExecutionLifecycle {
 
   async recordLaunchFailure(
     message: LaunchFailureMessage,
-    localDispatchId: string
+    localDispatchId: string,
+    fenceReceipt: OrcaReceipt
   ): Promise<"recorded" | "duplicate"> {
     const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
-    if (current.fenceReceipt === undefined || current.orcaDispatchId === undefined) {
-      throw new Error(`Dispatch ${localDispatchId} has no authoritative terminal proof`);
+    if (current.state !== "launch_failure_reserved" || current.orcaDispatchId === undefined) {
+      throw new Error(`Dispatch ${localDispatchId} has no launch-failure reservation`);
     }
     const updated = Object.freeze({
       ...current,
       state: "launch_failed" as const,
-      launchFailureId: message.messageId
+      launchFailureId: message.messageId,
+      fenceReceipt
     });
     const transition = this.#newTransition(
       "dispatch",
       localDispatchId,
       current.state,
       "launch_failed",
-      current.fenceReceipt.id
+      fenceReceipt.id
     );
     const result = await this.#store.commitLaunchFailure(Object.freeze({
+      message,
+      dispatch: updated,
+      transition
+    }));
+    if (result === "duplicate") return "duplicate";
+    this.#dispatches.set(localDispatchId, updated);
+    return "recorded";
+  }
+
+  async reserveLaunchFailure(
+    message: LaunchFailureMessage,
+    localDispatchId: string
+  ): Promise<"recorded" | "duplicate"> {
+    const current = this.#required(this.#dispatches, "Dispatch", localDispatchId);
+    const updated = Object.freeze({
+      ...current,
+      state: "launch_failure_reserved" as const,
+      launchFailureId: message.messageId
+    });
+    const transition = this.#newTransition(
+      "dispatch",
+      localDispatchId,
+      current.state,
+      "launch_failure_reserved"
+    );
+    const result = await this.#store.reserveLaunchFailure(Object.freeze({
       message,
       dispatch: updated,
       transition
