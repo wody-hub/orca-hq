@@ -76,4 +76,26 @@ production asset은 build 후 `/Users/`, `/srv/`, `secret`, `api[_-]?key`, `PRIV
 
 ### 유예 Minor
 
-이번 라운드는 M1–M10을 직접 수정하지 않았다. 특히 기존 보고서의 “44px controls” 표현은 링크까지 충족한다는 뜻으로 읽히지 않으며, 링크 터치 영역 M1은 유예 상태다; CSRF 누락(M2), 빈 200 응답(M3), 만료 타이머(M4), L2 완료 직후 상태(M5), 현재 단계(M6), 데스크톱 2열(M7), Playwright ignore(M8), bootstrap 재호출(M9) 및 기존 보고서 정합성의 나머지 항목(M10)도 후속 범위로 남긴다.
+이번 라운드는 M1–M10을 직접 수정하지 않았다. 특히 기존 보고서의 “44px controls” 표현은 링크까지 충족한다는 뜻으로 읽히지 않으며, 링크 터치 영역 M1은 유예 상태다; CSRF 누락(M2), 빈 200 응답(M3), 만료 타이머(M4), L2 완료 직후 상태(M5), 현재 단계(M6), 데스크톱 2열(M7), Playwright ignore(M8) 및 기존 보고서 정합성의 나머지 항목(M10)은 후속 범위로 남긴다. M9의 mount 1회 bootstrap 변경과 bounded 401 재인증은 아래 수정 2차에서 실제 구현과 일치하게 정정한다.
+
+## 수정 2차 — 세션 복구와 위험 제어 배치
+
+### Important 1 — 15분 세션 만료 뒤 복구 가능한 재인증
+
+- 원인: 앱 mount의 `bootstrap()`만으로는 15분 고정 세션 만료 뒤 API의 401을 새 세션과 CSRF로 복구할 경로가 없었다. mutation은 첫 요청 시점의 CSRF 헤더 객체를 재사용하므로, 단순 재시도만으로는 새 CSRF를 사용하지 못한다.
+- RED: `apps/web/src/api.test.ts`에서 query의 `/api/commands` 401 → `/auth/session` 성공 → 원래 query 성공 순서, mutation의 오래된/새 CSRF와 동일 `Idempotency-Key`, 영구 401과 bootstrap 실패의 단 한 번 경계를 추가했다. 생산 코드 전 `pnpm --filter @orca-hq/web test`는 이 네 동작이 빠져 4건 실패했다.
+- 수정: 공통 `request()` 경계는 401에서만 `bootstrap()`을 한 번 호출하고 같은 요청을 한 번만 다시 보낸다. mutation 요청 초기화는 재시도마다 CSRF를 다시 읽되 idempotency key와 `{ dispatchId }` 같은 최소 body를 보존한다; `/auth/session`의 401·네트워크 오류·403·404·409·5xx는 재시도 루프를 만들지 않고 기존 일반화된 `DashboardApiError`로 끝난다.
+- GREEN: query와 mutation의 실제 fetch 순서, 새 CSRF, body 최소화, 동일 key, 영구 401, bootstrap 실패, bootstrap 자체 401 단발을 포함한 API 테스트가 통과했다.
+
+### Important 2 — Dispatch 제어를 상세 증거 뒤에 배치
+
+- 원인: 다중 Task의 올바른 `dispatchId` 제어를 Task DAG 행에 넣으면서 파괴적 stop/retry 버튼이 diff/test·승인·감사 증거보다 먼저 렌더되었다.
+- RED: `apps/web/src/app.test.tsx`에 Task DAG, diff/test, 승인, 감사 및 채널 전달, Dispatch 제어의 카드 DOM 순서를 직접 비교하는 테스트를 추가했고, 기존 구조에서는 `Dispatch 제어` heading이 없어 실패했다.
+- 수정: Task DAG를 Task·의존성·worker/verifier·Dispatch 상태만 보여주는 읽기 전용 증거 카드로 복원했다. 별도 `Dispatch 제어` 카드를 감사 및 채널 전달 뒤로 옮기고, Task별 접근 가능한 이름, 정확한 `dispatchId` payload, worktree 비삭제 안내와 다중 Task 제어를 유지했다.
+- GREEN: 승인·감사·Dispatch 제어의 순서와 두 번째 Task만 stop/retry하는 기존 회귀 테스트가 함께 통과했다.
+
+### 수정 2차 검증과 유예 사항
+
+`pnpm --filter @orca-hq/web test`는 API 5건과 화면 23건, 총 28건을 통과했다. 수정 1차의 M9 기록은 정정한다: mount 1회 bootstrap으로 변경한 뒤, 수정 2차에서 bounded 401 재인증을 구현해 만료 세션은 공통 API 경계에서 한 번만 재수립한다.
+
+새 Minor 1·3·4·5·6과 수정 1차의 나머지 Minor는 유예한다. Task 5에서 `commandId` 대 `id` 매핑, 상세 view 확장, verification 값 집합, Task별 `canStop`/`canRetry`, Tailscale Serve·정적 asset serving·`/commands/:id` SPA fallback 계약을 명시적으로 확인한다.

@@ -64,10 +64,27 @@ function idempotencyKey(): string {
 
 export function createDashboardApi(fetcher: typeof fetch = fetch): DashboardApi {
   let csrfToken: string | undefined;
-  const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
+  const bootstrap = async (): Promise<void> => {
     try {
-      const response = await fetcher(path, { credentials: "same-origin", ...init });
+      const response = await fetcher("/auth/session", { method: "POST", credentials: "same-origin" });
       if (!response.ok) throw new DashboardApiError(response.status);
+      csrfToken = response.headers.get("x-csrf-token") ?? undefined;
+    } catch (error) {
+      if (error instanceof DashboardApiError) throw error;
+      throw new DashboardApiError();
+    }
+  };
+  const request = async <T>(path: string, init: RequestInit | (() => RequestInit) = {}, canRecover = true): Promise<T> => {
+    try {
+      const requestInit = typeof init === "function" ? init() : init;
+      const response = await fetcher(path, { credentials: "same-origin", ...requestInit });
+      if (!response.ok) {
+        if (response.status === 401 && canRecover) {
+          await bootstrap();
+          return request(path, init, false);
+        }
+        throw new DashboardApiError(response.status);
+      }
       return response.status === 204 ? undefined as T : await response.json() as T;
     } catch (error) {
       if (error instanceof DashboardApiError) throw error;
@@ -75,27 +92,19 @@ export function createDashboardApi(fetcher: typeof fetch = fetch): DashboardApi 
     }
   };
   const mutation = async (path: string, body: object): Promise<void> => {
-    await request(path, {
+    const key = idempotencyKey();
+    await request(path, () => ({
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-csrf-token": csrfToken ?? "",
-        "idempotency-key": idempotencyKey()
+        "idempotency-key": key
       },
       body: JSON.stringify(body)
-    });
+    }));
   };
   return {
-    async bootstrap() {
-      try {
-        const response = await fetcher("/auth/session", { method: "POST", credentials: "same-origin" });
-        if (!response.ok) throw new DashboardApiError(response.status);
-        csrfToken = response.headers.get("x-csrf-token") ?? undefined;
-      } catch (error) {
-        if (error instanceof DashboardApiError) throw error;
-        throw new DashboardApiError();
-      }
-    },
+    bootstrap,
     listCommands: () => request("/api/commands"),
     getCommand: (id) => request(`/api/commands/${encodeURIComponent(id)}`),
     confirmApproval: (id, input) => mutation(`/api/approvals/${encodeURIComponent(id)}/confirm`, input),

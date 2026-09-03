@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json && vite build",
-    "test": "vitest run --environment=jsdom --config vite.config.ts src/app.test.tsx",
+    "test": "vitest run --environment=jsdom --config vite.config.ts src/app.test.tsx src/api.test.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

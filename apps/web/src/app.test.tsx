@@ -85,9 +85,10 @@ describe("private dashboard", () => {
     render(<App api={api} />);
     await screen.findByText("승인 대시보드를 배포합니다");
     await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
-    for (const label of ["/redacted/hq", "경로 선택 근거", "task-ui", "worker: gpt-5 · verifier: gpt-5", "3 files changed, 20 insertions", "audit:cmd-42", "Telegram 전송 완료"]) {
+    for (const label of ["/redacted/hq", "경로 선택 근거", "worker: gpt-5 · verifier: gpt-5", "3 files changed, 20 insertions", "audit:cmd-42", "Telegram 전송 완료"]) {
       expect(await screen.findByText(label)).toBeTruthy();
     }
+    expect(within(screen.getByRole("heading", { name: "Task DAG" }).closest("section")!).getByText("task-ui")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Dispatch 중지: 모바일 화면 (dispatch-42)" }));
     expect(await screen.findByText("Dispatch 중지 요청이 완료되었습니다.")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Dispatch 재시도: 모바일 화면 (dispatch-42)" }));
@@ -127,6 +128,15 @@ describe("private dashboard", () => {
     expect(api.retryDispatch).toHaveBeenCalledWith("dispatch-99");
     expect(api.stopDispatch).not.toHaveBeenCalledWith("dispatch-42");
     expect(api.retryDispatch).not.toHaveBeenCalledWith("dispatch-42");
+  });
+
+  it("places dispatch controls after approval and audit evidence", async () => {
+    window.history.replaceState({}, "", "/commands/cmd-42");
+    render(<App api={apiFor()} initialCommandId="cmd-42" />);
+    await screen.findByRole("heading", { name: "Dispatch 제어" });
+
+    const cardHeadings = Array.from(document.querySelectorAll("article.detail > section > h2"), (heading) => heading.textContent);
+    expect(cardHeadings).toEqual(["경로 선택 근거", "변경 계약", "Task DAG", "diff/test", "승인", "감사 및 채널 전달", "Dispatch 제어"]);
   });
 
   it("returns to the command list when browser history goes back", async () => {
