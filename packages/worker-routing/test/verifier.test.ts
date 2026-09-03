@@ -484,6 +484,34 @@ describe("cross-model verification", () => {
     expect(store.commits[0]?.outboxMessage).toBeUndefined();
   });
 
+  it("durably commits passing evidence when delivery target resolution throws", async () => {
+    // Break caught: completion-target lookup runs before commit and erases an otherwise valid passing report.
+    const { store, database } = persistentStore();
+    const service = new VerificationService({
+      store,
+      completionTarget() {
+        throw new Error("raw resolver details must not escape");
+      }
+    });
+    const task = await service.start(input);
+    persistCompletedVerificationDispatches(database, task);
+
+    await expect(service.complete(report(task, "pass"))).resolves.toMatchObject({
+      kind: "verified_success"
+    });
+    expect(database.prepare("SELECT state FROM runs WHERE id = ?").get(task.runId))
+      .toEqual({ state: "verified_success" });
+    expect(store.listOutbox()).toEqual([]);
+    expect(store.listAuditEvents()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "verification.passed" }),
+      expect.objectContaining({
+        eventType: "delivery_target_unresolved",
+        data: expect.objectContaining({ reason: "resolver_failed" })
+      })
+    ]));
+    expect(JSON.stringify(store.listAuditEvents())).not.toContain("raw resolver details");
+  });
+
   it("requires intervention after two failed fix-and-verify cycles", async () => {
     // Break caught: an unbounded fix loop can run workers forever without user authority.
     const store = new MemoryVerificationStore();

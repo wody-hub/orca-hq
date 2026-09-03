@@ -200,9 +200,29 @@ export type VerificationCompletionTarget = Readonly<{
   nextAttemptAt: string;
 }>;
 
+export type VerificationCompletionTargetFailureReason =
+  | "run_not_durable"
+  | "command_not_durable"
+  | "invalid_external_message_id"
+  | "destination_unavailable"
+  | "resolver_failed";
+
+export type VerificationCompletionTargetResolution =
+  | VerificationCompletionTarget
+  | Readonly<{
+      kind: "unresolved";
+      reason: VerificationCompletionTargetFailureReason;
+    }>;
+
 export type VerificationCompletionTargetResolver = (
   report: VerificationReport
-) => MaybePromise<VerificationCompletionTarget>;
+) => MaybePromise<VerificationCompletionTargetResolution>;
+
+function isUnresolvedCompletionTarget(
+  target: VerificationCompletionTargetResolution
+): target is Extract<VerificationCompletionTargetResolution, { kind: "unresolved" }> {
+  return "kind" in target && target.kind === "unresolved";
+}
 
 export type VerificationAudit = Readonly<{
   subjectId: string;
@@ -232,6 +252,15 @@ export type VerificationCommit = Readonly<{
   audit: VerificationAudit;
   fixTask?: FixTask | undefined;
   outboxMessage?: VerificationOutboxMessage | undefined;
+  deliveryTargetFailure?: Readonly<{
+    subjectId: string;
+    eventType: "delivery_target_unresolved";
+    data: Readonly<{
+      reportId: string;
+      runId: string;
+      reason: VerificationCompletionTargetFailureReason;
+    }>;
+  }> | undefined;
 }>;
 
 type MaybePromise<T> = T | Promise<T>;
@@ -411,6 +440,21 @@ function outboxFor(
   });
 }
 
+function deliveryTargetFailureFor(
+  report: VerificationReport,
+  reason: VerificationCompletionTargetFailureReason
+): NonNullable<VerificationCommit["deliveryTargetFailure"]> {
+  return deepFreeze({
+    subjectId: report.verificationTaskId,
+    eventType: "delivery_target_unresolved" as const,
+    data: {
+      reportId: report.reportId,
+      runId: report.runId,
+      reason
+    }
+  });
+}
+
 export class VerificationService {
   readonly #store: VerificationLifecycleStore;
   readonly #completionTarget: VerificationCompletionTargetResolver;
@@ -476,15 +520,28 @@ export class VerificationService {
     const fixTask = decision.kind === "create_fix_task"
       ? createFixTask(task, decision)
       : undefined;
-    const outboxMessage = decision.kind === "create_fix_task"
-      ? undefined
-      : outboxFor(report, decision, await this.#completionTarget(report));
+    let outboxMessage: VerificationOutboxMessage | undefined;
+    let deliveryTargetFailure: VerificationCommit["deliveryTargetFailure"];
+    if (decision.kind !== "create_fix_task") {
+      let target: VerificationCompletionTargetResolution;
+      try {
+        target = await this.#completionTarget(report);
+      } catch {
+        target = { kind: "unresolved", reason: "resolver_failed" };
+      }
+      if (isUnresolvedCompletionTarget(target)) {
+        deliveryTargetFailure = deliveryTargetFailureFor(report, target.reason);
+      } else {
+        outboxMessage = outboxFor(report, decision, target);
+      }
+    }
     const commit = deepFreeze({
       report,
       decision,
       audit: auditFor(report, decision),
       ...(fixTask === undefined ? {} : { fixTask }),
-      ...(outboxMessage === undefined ? {} : { outboxMessage })
+      ...(outboxMessage === undefined ? {} : { outboxMessage }),
+      ...(deliveryTargetFailure === undefined ? {} : { deliveryTargetFailure })
     }) as VerificationCommit;
     await this.#store.commitVerification(commit);
     if (fixTask !== undefined) this.#fixTasks.set(report.verificationTaskId, fixTask);

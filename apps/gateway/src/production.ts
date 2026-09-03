@@ -18,7 +18,7 @@ import {
   VerificationService,
   type AssignmentArtifactStore,
   type ProviderCapabilities,
-  type VerificationCompletionTarget,
+  type VerificationCompletionTargetResolution,
   type VerificationEvidencePort,
   type VerificationReport,
   type WorkerLaunchPolicy,
@@ -265,15 +265,19 @@ function verificationCompletionTarget(
   report: VerificationReport,
   now: () => Date,
   destinations: GatewayProductionDependencies["completionDestinations"]
-): VerificationCompletionTarget {
+): VerificationCompletionTargetResolution {
   const runValue = store.loadRunRecord(report.runId);
   const run = typeof runValue === "object" && runValue !== null && !Array.isArray(runValue)
     ? runValue
     : undefined;
   const commandId = typeof run?.commandId === "string" ? run.commandId : undefined;
-  if (commandId === undefined) throw new Error(`Verification Run ${report.runId} is not durable`);
+  if (commandId === undefined) {
+    return Object.freeze({ kind: "unresolved", reason: "run_not_durable" });
+  }
   const command = store.listCommands().find((candidate) => candidate.commandId === commandId);
-  if (command === undefined) throw new Error(`Verification Command ${commandId} is not durable`);
+  if (command === undefined) {
+    return Object.freeze({ kind: "unresolved", reason: "command_not_durable" });
+  }
   let destination: string | undefined;
   if (command.channel === "telegram") {
     const separator = command.externalMessageId.lastIndexOf(":");
@@ -284,7 +288,12 @@ function verificationCompletionTarget(
     destination = destinations.tailscaleWeb;
   }
   if (destination === undefined || destination.length === 0) {
-    throw new Error(`Verification delivery destination for ${command.channel} is unavailable`);
+    return Object.freeze({
+      kind: "unresolved",
+      reason: command.channel === "telegram"
+        ? "invalid_external_message_id"
+        : "destination_unavailable"
+    });
   }
   return Object.freeze({
     commandId: command.commandId,

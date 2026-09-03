@@ -494,6 +494,21 @@ const VerificationCommitStoreSchema = z.object({
     channel: z.enum(["slack", "telegram", "tailscale-web"]),
     destination: z.string().min(1),
     nextAttemptAt: z.string().datetime()
+  }).strict().optional(),
+  deliveryTargetFailure: z.object({
+    subjectId: z.string().min(1),
+    eventType: z.literal("delivery_target_unresolved"),
+    data: z.object({
+      reportId: z.string().min(1),
+      runId: z.string().min(1),
+      reason: z.enum([
+        "run_not_durable",
+        "command_not_durable",
+        "invalid_external_message_id",
+        "destination_unavailable",
+        "resolver_failed"
+      ])
+    }).strict()
   }).strict().optional()
 }).strict();
 
@@ -2304,7 +2319,14 @@ export class ControlStore implements CommandIngress {
 
   commitVerification(commitInput: unknown): void {
     const commit = VerificationCommitStoreSchema.parse(JsonValueSchema.parse(commitInput));
-    const { report, decision, audit, fixTask, outboxMessage } = commit;
+    const {
+      report,
+      decision,
+      audit,
+      fixTask,
+      outboxMessage,
+      deliveryTargetFailure
+    } = commit;
     if (report.implementationProvider === report.verifierProvider) {
       throw new TypeError("verification report must use the opposite model family");
     }
@@ -2353,12 +2375,33 @@ export class ControlStore implements CommandIngress {
     ) {
       throw new TypeError("verification decision evidence does not match its report");
     }
+    const hasExactlyOneDeliveryOutcome =
+      (outboxMessage === undefined) !== (deliveryTargetFailure === undefined);
     if (
-      (passing && (fixTask !== undefined || outboxMessage?.template !== "success"))
-      || (fixing && (fixTask === undefined || outboxMessage !== undefined))
-      || (intervening && (fixTask !== undefined || outboxMessage?.template !== "intervention_required"))
+      (passing && (
+        fixTask !== undefined
+        || !hasExactlyOneDeliveryOutcome
+        || (outboxMessage !== undefined && outboxMessage.template !== "success")
+      ))
+      || (fixing && (
+        fixTask === undefined
+        || outboxMessage !== undefined
+        || deliveryTargetFailure !== undefined
+      ))
+      || (intervening && (
+        fixTask !== undefined
+        || !hasExactlyOneDeliveryOutcome
+        || (outboxMessage !== undefined && outboxMessage.template !== "intervention_required")
+      ))
     ) {
       throw new TypeError("verification side effects do not match the completion decision");
+    }
+    if (deliveryTargetFailure !== undefined && (
+      deliveryTargetFailure.subjectId !== report.verificationTaskId
+      || deliveryTargetFailure.data.reportId !== report.reportId
+      || deliveryTargetFailure.data.runId !== report.runId
+    )) {
+      throw new TypeError("delivery target failure does not match its verification report");
     }
     if (outboxMessage !== undefined) {
       const payload = outboxMessage.payload;
@@ -2692,6 +2735,14 @@ export class ControlStore implements CommandIngress {
         eventType: audit.eventType,
         data: audit.data
       });
+      if (deliveryTargetFailure !== undefined) {
+        this.appendAudit({
+          id: `${report.reportId}:delivery-target-unresolved`,
+          subjectId: deliveryTargetFailure.subjectId,
+          eventType: deliveryTargetFailure.eventType,
+          data: deliveryTargetFailure.data
+        });
+      }
       if (outboxMessage !== undefined && (!passing || finalPassingReport)) {
         this.enqueueOutbox({
           id: outboxMessage.id,

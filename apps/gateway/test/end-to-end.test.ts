@@ -687,6 +687,54 @@ describe("Gateway production state machine E2E", () => {
     }
   });
 
+  it("keeps verified evidence and audits an unresolved malformed Telegram delivery target", async () => {
+    // Break caught: malformed Telegram externalMessageId throws before verified_success can be committed.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-unresolved-delivery-"));
+    const orca = new FakeOrcaBoundary();
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      const host = await createGatewayHost(async () => boundaries(directory, orca, []));
+      composition = await createProductionGateway(host.config, host.dependencies);
+      await composition.gateway.start();
+      composition.services.store.insertCommand({
+        commandId: "command-malformed-telegram",
+        idempotencyKey: "test:command-malformed-telegram",
+        channel: "telegram",
+        externalMessageId: "malformed",
+        principalId: "owner",
+        receivedAt: "2026-09-03T00:00:00.000Z",
+        text: "샌드박스 프로젝트 테스트 수정해줘"
+      });
+      await composition.gateway.acceptCommand({
+        commandId: "command-malformed-telegram",
+        channel: "telegram",
+        text: "샌드박스 프로젝트 테스트 수정해줘"
+      });
+      const verificationTask = await completeImplementationAndVerifier(composition);
+
+      await expect(composition.services.execution.recordVerificationReport(
+        reportFor(verificationTask, "pass")
+      )).resolves.toMatchObject({ kind: "verified_success" });
+      expect(composition.services.store.listRunRecords()).toEqual([
+        expect.objectContaining({
+          commandId: "command-malformed-telegram",
+          state: "verified_success"
+        })
+      ]);
+      expect(composition.services.store.listOutbox()).toEqual([]);
+      expect(composition.services.store.listAuditEvents()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ eventType: "verification.passed" }),
+        expect.objectContaining({
+          eventType: "delivery_target_unresolved",
+          data: expect.objectContaining({ reason: "invalid_external_message_id" })
+        })
+      ]));
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("uses the real L0 investigation path without creating an approval or verifier", async () => {
     // Break caught: L0 is dead code or requires a fabricated approval before ExecutionService starts.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-l0-"));
