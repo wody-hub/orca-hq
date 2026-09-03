@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,6 +27,10 @@ const detail: CommandDetail = {
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
   audit: { reference: "audit:cmd-42", summary: "승인 대기 이벤트" },
   delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
+};
+
+const secondTask = {
+  id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued"
 };
 
 function apiFor(overrides: Partial<DashboardApi> = {}): DashboardApi {
@@ -60,6 +64,10 @@ describe("private dashboard", () => {
     render(<App api={api} />);
     await screen.findByText("승인 대시보드를 배포합니다");
     await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
+    expect(await screen.findByText("APPROVE RELEASE")).toBeTruthy();
+    for (const text of ["main", "apps/web/**", "외부 메시지 전송", "pnpm --filter @orca-hq/web test"]) {
+      expect(within(screen.getByRole("heading", { name: "승인" }).closest("section")!).getByText(text)).toBeTruthy();
+    }
     const approve = await screen.findByRole("button", { name: "L3 승인" });
     const phrase = screen.getByLabelText("승인 문구 입력");
     await user.type(phrase, "approve release");
@@ -77,12 +85,12 @@ describe("private dashboard", () => {
     render(<App api={api} />);
     await screen.findByText("승인 대시보드를 배포합니다");
     await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
-    for (const label of ["/redacted/hq", "경로 선택 근거", "main", "apps/web/**", "외부 메시지 전송", "task-ui", "worker: gpt-5 · verifier: gpt-5", "3 files changed, 20 insertions", "audit:cmd-42", "Telegram 전송 완료"]) {
+    for (const label of ["/redacted/hq", "경로 선택 근거", "task-ui", "worker: gpt-5 · verifier: gpt-5", "3 files changed, 20 insertions", "audit:cmd-42", "Telegram 전송 완료"]) {
       expect(await screen.findByText(label)).toBeTruthy();
     }
-    await user.click(screen.getByRole("button", { name: "Dispatch 중지" }));
+    await user.click(screen.getByRole("button", { name: "Dispatch 중지: 모바일 화면 (dispatch-42)" }));
     expect(await screen.findByText("Dispatch 중지 요청이 완료되었습니다.")).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Dispatch 재시도" }));
+    await user.click(screen.getByRole("button", { name: "Dispatch 재시도: 모바일 화면 (dispatch-42)" }));
     expect(api.stopDispatch).toHaveBeenCalledWith("dispatch-42");
     expect(api.retryDispatch).toHaveBeenCalledWith("dispatch-42");
   });
@@ -98,6 +106,116 @@ describe("private dashboard", () => {
     render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(expired) })} initialCommandId="cmd-42" />);
     expect((await screen.findByRole("button", { name: "L3 승인" })) as HTMLButtonElement).toHaveProperty("disabled", true);
     expect(screen.getByText("만료되어 승인할 수 없습니다.")).toBeTruthy();
+  });
+
+  it("does not present failed verification as complete", async () => {
+    const failed = { ...detail, verification: { ...detail.verification, status: "실패" } };
+    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(failed) })} initialCommandId="cmd-42" />);
+    expect(await screen.findByText("검증 실패")).toBeTruthy();
+    expect(screen.queryByText("검증 완료")).toBeNull();
+  });
+
+  it("controls only the selected task dispatch in a multi-task DAG", async () => {
+    const user = userEvent.setup();
+    const api = apiFor({ getCommand: vi.fn().mockResolvedValue({ ...detail, tasks: [...detail.tasks, secondTask] }) });
+    render(<App api={api} initialCommandId="cmd-42" />);
+    const stop = await screen.findByRole("button", { name: "Dispatch 중지: 검증 실행 (dispatch-99)" });
+    const retry = screen.getByRole("button", { name: "Dispatch 재시도: 검증 실행 (dispatch-99)" });
+    await user.click(stop);
+    await user.click(retry);
+    expect(api.stopDispatch).toHaveBeenCalledWith("dispatch-99");
+    expect(api.retryDispatch).toHaveBeenCalledWith("dispatch-99");
+    expect(api.stopDispatch).not.toHaveBeenCalledWith("dispatch-42");
+    expect(api.retryDispatch).not.toHaveBeenCalledWith("dispatch-42");
+  });
+
+  it("returns to the command list when browser history goes back", async () => {
+    const user = userEvent.setup();
+    render(<App api={apiFor()} />);
+    await user.click(await screen.findByRole("link", { name: "승인 대시보드를 배포합니다" }));
+    expect(window.location.pathname).toBe("/commands/cmd-42");
+    window.history.back();
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    expect(await screen.findByRole("heading", { name: "명령" })).toBeTruthy();
+    expect(window.location.pathname).toBe("/commands");
+  });
+
+  it("does not claim to be connected when loading fails", async () => {
+    render(<App api={apiFor({ listCommands: vi.fn().mockRejectedValue(new DashboardApiError()) })} />);
+    expect(await screen.findByText("정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")).toBeTruthy();
+    expect(screen.queryByText(/연결됨/)).toBeNull();
+    expect(screen.getByText("갱신 실패 · 재시도 필요")).toBeTruthy();
+  });
+
+  it.each([
+    [403, "이 정보에 접근할 권한이 없습니다."],
+    [404, "요청한 명령을 찾을 수 없습니다."],
+    [409, "제안이 변경되었습니다. 최신 정보를 확인해 주세요."],
+    [undefined, "정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."]
+  ])("shows a generalized error and retry for status %s", async (status, expected) => {
+    render(<App api={apiFor({ listCommands: vi.fn().mockRejectedValue(new DashboardApiError(status)) })} />);
+    expect(await screen.findByText(expected)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "다시 시도" })).toBeTruthy();
+  });
+
+  it("shows an empty command list", async () => {
+    render(<App api={apiFor({ listCommands: vi.fn().mockResolvedValue({ commands: [] }) })} />);
+    expect(await screen.findByText("표시할 명령이 없습니다.")).toBeTruthy();
+  });
+
+  it.each([
+    ["권한 없음", { permitted: false }, "이 역할에는 승인 권한이 없습니다."],
+    ["처리됨", { status: "approved" as const }, "이미 처리되어 승인할 수 없습니다."],
+    ["문구 없음", { operationPhrase: undefined }, "서버가 승인 문구를 제공하지 않았습니다."]
+  ])("makes %s approval unavailable", async (_caseName, approval, explanation) => {
+    const command = { ...detail, approval: { ...detail.approval, ...approval } };
+    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(command) })} initialCommandId="cmd-42" />);
+    expect((await screen.findByRole("button", { name: "L3 승인" })) as HTMLButtonElement).toHaveProperty("disabled", true);
+    expect(screen.getByText(explanation)).toBeTruthy();
+  });
+
+  it("keeps approval unavailable while a mutation is in progress", async () => {
+    let resolveApproval: (() => void) | undefined;
+    const api = apiFor({ confirmApproval: vi.fn().mockImplementation(() => new Promise<void>((resolve) => { resolveApproval = resolve; })) });
+    const user = userEvent.setup();
+    render(<App api={api} initialCommandId="cmd-42" />);
+    const approve = await screen.findByRole("button", { name: "L3 승인" });
+    await user.type(screen.getByLabelText("승인 문구 입력"), "APPROVE RELEASE");
+    await user.click(approve);
+    expect(approve).toHaveProperty("disabled", true);
+    resolveApproval?.();
+  });
+
+  it("allows approval to be retried after a mutation error", async () => {
+    const user = userEvent.setup();
+    const api = apiFor({ confirmApproval: vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(undefined) });
+    render(<App api={api} initialCommandId="cmd-42" />);
+    const approve = await screen.findByRole("button", { name: "L3 승인" });
+    await user.type(screen.getByLabelText("승인 문구 입력"), "APPROVE RELEASE");
+    await user.click(approve);
+    expect(await screen.findByText("승인 요청을 처리하지 못했습니다.")).toBeTruthy();
+    expect(approve).toHaveProperty("disabled", false);
+    await user.click(approve);
+    expect(api.confirmApproval).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the command list after a stale detail request resolves", async () => {
+    let resolveDetail: ((command: CommandDetail) => void) | undefined;
+    const api = apiFor({ getCommand: vi.fn().mockImplementation(() => new Promise<CommandDetail>((resolve) => { resolveDetail = resolve; })) });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("link", { name: "승인 대시보드를 배포합니다" }));
+    await user.click(screen.getByRole("link", { name: "Orca HQ" }));
+    resolveDetail?.(detail);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(window.location.pathname).toBe("/commands");
+    expect(screen.getByRole("heading", { name: "명령" })).toBeTruthy();
+  });
+
+  it("keeps the main content out of a broad live region", async () => {
+    render(<App api={apiFor()} />);
+    await screen.findByRole("heading", { name: "명령" });
+    expect(document.querySelector("main")?.getAttribute("aria-live")).toBeNull();
   });
 
   it("bootstraps the same-origin session before loading a direct command URL", async () => {

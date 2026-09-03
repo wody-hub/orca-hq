@@ -43,3 +43,37 @@ landmark, heading, 한국어 접근 가능한 이름, focus-visible, 44px contro
 - `apps/web/**`의 Vite 앱, API client, UI, 단위/E2E 테스트와 설정
 - `pnpm-lock.yaml`
 - 루트 `tsconfig.json`, `vitest.config.ts`의 TSX/웹 테스트 인식 설정
+
+## 수정 1차 — 독립 리뷰 Critical·Important 대응
+
+### TDD RED/GREEN 증거
+
+생산 코드 변경 전에 `apps/web/src/app.test.tsx`에 실패 검증·다중 Task의 두 번째 Dispatch 제어·L3 문구/변경 계약·문구 누락 fail-closed·브라우저 뒤로가기·오류 연결 상태·권한/처리됨/진행 중 승인 차단·빈 목록/403/404/409/네트워크 오류·main live region 범위 테스트를 추가했다. 이 상태에서 `pnpm --filter @orca-hq/web test`는 20개 중 8개 실패로 RED를 기록했으며, 실패 사유는 정확히 상수 `검증 완료`, 첫 Task 고정 제어, phrase/계약 미표시, popstate 미구독, 오류 중 `연결됨`, broad `main` live region이었다. 독립 리뷰의 후속 Important 두 건도 실패 테스트로 추가해, 승인 요청 오류 뒤 재시도 불가와 늦게 끝난 상세 요청이 목록 탐색을 덮어쓰는 RED를 확인했다. 최소 구현 후 단위 테스트 22/22와 Playwright 4/4가 통과했다.
+
+### 해결 내용
+
+- C1: verification status를 `완료/passed`, `대기/pending`, `실패/failed`의 한글 라벨로 매핑했다. 실패에서는 `검증 실패`만 표시되며 `검증 완료`는 표시되지 않는다.
+- C2: command 전역의 `tasks[0]` 제어를 제거하고, Task DAG 각 행의 제목과 Dispatch ID가 포함된 접근 가능한 stop/retry 버튼으로 바꿨다. 다중 Task fixture에서 두 번째 Task만 제어 API에 전달됨을 검증했다.
+- I1/I2: 승인 카드 안에 허용된 L3 operation phrase와 base·허용 scope·금지 효과·검증 명령을 표시했다. L3 phrase 누락 시 입력과 승인 버튼을 비활성화하고 원인을 안내한다.
+- I3/I4: `popstate`를 구독해 history 경로를 push 없이 다시 로드하고 cleanup한다. 헤더는 loading/ready/error/not-found 상태에서 각각 오해 없는 갱신 상태를 표시한다.
+- I5: `main`의 broad `aria-live`를 제거하고 로딩·오류·mutation 결과의 좁은 상태 영역만 알리도록 했다.
+- I6: 단위 20건과 Playwright 4건으로 승인 불가 경계, 일반화 오류/재시도, 빈 목록, 다중 Dispatch, back navigation, 두 viewport의 필수 증거, 키보드 `:focus-visible`, L3 phrase/계약 요약을 고정했다.
+- 독립 리뷰 후속: 오류 상태의 승인 버튼은 다시 시도할 수 있게 하고, 최신 탐색 epoch와 일치하지 않는 비동기 목록/상세 응답은 무시해 stale response가 URL·화면을 되돌리지 못하게 했다.
+
+### 수정 1차 검증
+
+```text
+pnpm --filter @orca-hq/web test       # 22 passed
+pnpm --filter @orca-hq/web test:e2e  # 4 passed (390×844, 1280×800, 키보드 focus, L3 payload)
+pnpm --filter @orca-hq/web build
+pnpm test
+pnpm typecheck
+pnpm build
+git diff --check
+```
+
+production asset은 build 후 `/Users/`, `/srv/`, `secret`, `api[_-]?key`, `PRIVATE KEY`, `test-csrf`, `redacted/hq`, `APPROVE RELEASE` 패턴을 검사한다. Playwright의 `test-results/` 및 `playwright-report/`은 커밋하지 않고 작업 트리에 남기지 않는다.
+
+### 유예 Minor
+
+이번 라운드는 M1–M10을 직접 수정하지 않았다. 특히 기존 보고서의 “44px controls” 표현은 링크까지 충족한다는 뜻으로 읽히지 않으며, 링크 터치 영역 M1은 유예 상태다; CSRF 누락(M2), 빈 200 응답(M3), 만료 타이머(M4), L2 완료 직후 상태(M5), 현재 단계(M6), 데스크톱 2열(M7), Playwright ignore(M8), bootstrap 재호출(M9) 및 기존 보고서 정합성의 나머지 항목(M10)도 후속 범위로 남긴다.

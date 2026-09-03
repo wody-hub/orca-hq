@@ -3,8 +3,11 @@ import { expect, test, type Page } from "@playwright/test";
 const command = {
   id: "cmd-42", summary: "승인 대시보드를 배포합니다", projectKey: "hq", status: "진행 중", riskLevel: "L3", createdAt: "2026-09-01T08:00:00Z", updatedAt: "2026-09-01T08:10:00Z",
   project: { key: "hq", displayName: "Orca HQ", path: "/redacted/hq" }, routing: { score: 92, selectedReason: "보호된 경로와 일치", candidates: ["primary: 92"] },
-  contract: { base: "main", allowedScope: ["apps/web/**"], prohibitedEffects: ["외부 메시지 전송"], testCommands: ["pnpm test"] },
-  tasks: [{ id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running" }],
+  contract: { base: "main", allowedScope: ["apps/web/**"], prohibitedEffects: ["외부 메시지 전송"], testCommands: ["pnpm --filter @orca-hq/web test"] },
+  tasks: [
+    { id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running" },
+    { id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued" }
+  ],
   verification: { status: "완료", commands: ["pnpm test"] }, diff: { summary: "3 files changed" },
   approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
   audit: { reference: "audit:cmd-42", summary: "승인 대기" }, delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
@@ -23,11 +26,35 @@ for (const viewport of [{ name: "모바일", width: 390, height: 844 }, { name: 
     await page.goto("/commands");
     await expect(page.getByRole("link", { name: command.summary })).toBeVisible();
     await page.getByRole("link", { name: command.summary }).click();
-    await expect(page.getByText("경로 선택 근거")).toBeVisible();
-    await expect(page.getByText("Slack 전송 대기")).toBeVisible();
+    for (const evidence of ["경로 선택 근거", "검증 완료", "Slack 전송 대기"]) {
+      await expect(page.getByText(evidence, { exact: true })).toBeVisible();
+    }
+    const approvalCard = page.getByRole("region", { name: "승인" });
+    for (const evidence of ["APPROVE RELEASE", "apps/web/**", "외부 메시지 전송", "pnpm --filter @orca-hq/web test"]) {
+      await expect(approvalCard.getByText(evidence, { exact: true })).toBeVisible();
+    }
+    await expect(page.getByRole("button", { name: "Dispatch 중지: 검증 실행 (dispatch-99)" })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 }
+
+test("키보드로 핵심 제어에 도달하면 focus outline이 표시된다", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/commands");
+  await page.keyboard.press("Tab");
+  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+  await page.getByRole("link", { name: command.summary }).click();
+  const phrase = page.getByLabel("승인 문구 입력");
+  for (let index = 0; index < 12 && !await phrase.evaluate((node) => document.activeElement === node); index += 1) {
+    await page.keyboard.press("Tab");
+  }
+  expect(await phrase.evaluate((node) => document.activeElement === node)).toBe(true);
+  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+  await page.keyboard.type("APPROVE RELEASE");
+  await page.keyboard.press("Tab");
+  expect(await page.getByRole("button", { name: "L3 승인" }).evaluate((node) => document.activeElement === node)).toBe(true);
+  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+});
 
 test("정확한 L3 문구만 승인 요청에 digest와 phrase로 전달한다", async ({ page }) => {
   let body = "";

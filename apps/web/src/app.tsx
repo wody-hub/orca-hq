@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { createDashboardApi, DashboardApiError, type CommandDetail, type CommandSummary, type DashboardApi } from "./api.js";
 import { CommandDetailView } from "./routes/command-detail.js";
@@ -22,18 +22,36 @@ export function App({ api = createDashboardApi(), initialCommandId }: Readonly<{
   const [detail, setDetail] = useState<CommandDetail>();
   const [state, setState] = useState<ViewState>("loading");
   const [error, setError] = useState("");
-  const loadList = async () => { setState("loading"); try { await api.bootstrap(); const result = await api.listCommands(); setCommands(result.commands); setState("ready"); } catch (cause) { setError(message(cause)); setState("error"); } };
-  const select = async (id: string) => { setState("loading"); try { const result = await api.getCommand(id); setDetail(result); window.history.pushState({}, "", `/commands/${encodeURIComponent(id)}`); setState("ready"); } catch (cause) { setError(message(cause)); setState(cause instanceof DashboardApiError && cause.status === 404 ? "not-found" : "error"); } };
+  const requestEpoch = useRef(0);
+  const loadList = async () => { const epoch = ++requestEpoch.current; setState("loading"); setDetail(undefined); try { const result = await api.listCommands(); if (epoch !== requestEpoch.current) return; setCommands(result.commands); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState("error"); } };
+  const loadDetail = async (id: string, push: boolean) => { const epoch = ++requestEpoch.current; setState("loading"); try { const result = await api.getCommand(id); if (epoch !== requestEpoch.current) return; setDetail(result); if (push) window.history.pushState({}, "", `/commands/${encodeURIComponent(id)}`); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState(cause instanceof DashboardApiError && cause.status === 404 ? "not-found" : "error"); } };
+  const loadPath = async (push = false) => {
+    const commandId = commandIdFromPath();
+    if (commandId === undefined) await loadList();
+    else await loadDetail(commandId, push);
+  };
   useEffect(() => {
-    const commandId = initialCommandId ?? commandIdFromPath();
-    if (commandId === undefined) { void loadList(); return; }
-    void api.bootstrap().then(() => select(commandId)).catch((cause: unknown) => { setError(message(cause)); setState("error"); });
+    const initialPath = initialCommandId === undefined ? commandIdFromPath() : initialCommandId;
+    const epoch = ++requestEpoch.current;
+    const start = async () => {
+      try {
+        await api.bootstrap();
+        if (epoch !== requestEpoch.current) return;
+        if (initialPath === undefined) await loadList();
+        else await loadDetail(initialPath, false);
+      } catch (cause) { if (epoch === requestEpoch.current) { setError(message(cause)); setState("error"); } }
+    };
+    const onPopState = () => { void loadPath(); };
+    window.addEventListener("popstate", onPopState);
+    void start();
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
-  const back = () => { setDetail(undefined); window.history.pushState({}, "", "/commands"); void loadList(); };
-  return <><header><nav aria-label="주요 탐색"><a href="/commands" onClick={(event) => { event.preventDefault(); back(); }}>Orca HQ</a><span>연결됨 · 갱신 상태 확인 중</span></nav></header><main aria-live="polite">
-    {state === "loading" && <p>정보를 불러오는 중입니다.</p>}
-    {state === "error" && <section className="card"><h1>확인 필요</h1><p>{error}</p><button type="button" onClick={() => void loadList()}>다시 시도</button></section>}
-    {state === "not-found" && <section className="card"><h1>명령을 찾을 수 없음</h1><p>{error}</p><button type="button" onClick={back}>명령 목록으로</button></section>}
-    {state === "ready" && (detail ? <CommandDetailView command={detail} api={api} onBack={back} onRefresh={() => void select(detail.id)} /> : <CommandList commands={commands} onSelect={(id) => void select(id)} />)}
+  const back = () => { window.history.pushState({}, "", "/commands"); void loadList(); };
+  const connectionLabel = state === "ready" ? "연결됨 · 최신 정보" : state === "loading" ? "정보 갱신 중" : state === "error" ? "갱신 실패 · 재시도 필요" : "요청한 명령 확인 필요";
+  return <><header><nav aria-label="주요 탐색"><a href="/commands" onClick={(event) => { event.preventDefault(); back(); }}>Orca HQ</a><span>{connectionLabel}</span></nav></header><main>
+    {state === "loading" && <p role="status">정보를 불러오는 중입니다.</p>}
+    {state === "error" && <section className="card" role="alert"><h1>확인 필요</h1><p>{error}</p><button type="button" onClick={() => void loadPath()}>다시 시도</button></section>}
+    {state === "not-found" && <section className="card" role="alert"><h1>명령을 찾을 수 없음</h1><p>{error}</p><button type="button" onClick={back}>명령 목록으로</button></section>}
+    {state === "ready" && (detail ? <CommandDetailView command={detail} api={api} onBack={back} onRefresh={() => void loadDetail(detail.id, false)} /> : <CommandList commands={commands} onSelect={(id) => void loadDetail(id, true)} />)}
   </main></>;
 }
