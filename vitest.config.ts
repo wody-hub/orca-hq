@@ -11,6 +11,14 @@ export default defineConfig({
           name: "orca-hq",
           include: ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts"]
         }
+      },
+      {
+        extends: true,
+        test: {
+          name: "orca-hq-web",
+          include: ["apps/web/src/**/*.test.tsx"],
+          environment: "jsdom"
+        }
       }
     ]
   },

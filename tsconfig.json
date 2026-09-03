@@ -2,6 +2,7 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "baseUrl": ".",
+    "jsx": "react-jsx",
     "noEmit": true,
     "paths": {
       "@orca-hq/core": ["packages/core/src/index.ts"],
@@ -13,5 +14,5 @@
       "@orca-hq/worker-routing": ["packages/worker-routing/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "vitest.config.ts"]
+  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "apps/*/src/**/*.tsx", "vitest.config.ts"]
 }
