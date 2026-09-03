@@ -42,6 +42,85 @@ function dependencies(events: string[], valid = true): GatewayProductionDependen
 }
 
 describe("production gateway composition", () => {
+  it("returns a typed audited failure when the accepted command is not durable", async () => {
+    // Break caught: a command/store mismatch throws through the ingress adapter before any audit evidence is committed.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-command-missing-"));
+    const path = join(directory, "control.sqlite");
+    const events: string[] = [];
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway(
+        { databasePath: path, shutdownDrainMs: 1_000 },
+        dependencies(events)
+      );
+      await composition.gateway.start();
+
+      await expect(composition.gateway.acceptCommand({
+        commandId: "missing-command",
+        channel: "slack",
+        text: "not durable"
+      })).resolves.toEqual({ state: "failure" });
+      expect(composition.services.store.listAuditEvents()).toContainEqual(
+        expect.objectContaining({
+          subjectId: "missing-command",
+          eventType: "command.planning_failed",
+          data: { reason: "durable_command_missing" }
+        })
+      );
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("collapses malformed HQ output into a redacted typed failure and audit event", async () => {
+    // Break caught: malformed model output leaks its raw payload or parser exception through the command ingress.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-hq-malformed-"));
+    const path = join(directory, "control.sqlite");
+    const events: string[] = [];
+    const malformedDependencies = {
+      ...dependencies(events),
+      proposalModel: {
+        async plan() {
+          return { malformed: true, secret: "model-secret-must-not-leak" };
+        }
+      }
+    } satisfies GatewayProductionDependencies;
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      composition = await createProductionGateway(
+        { databasePath: path, shutdownDrainMs: 1_000 },
+        malformedDependencies
+      );
+      await composition.gateway.start();
+      composition.services.store.insertCommand({
+        commandId: "malformed-command",
+        idempotencyKey: "malformed-command:key",
+        channel: "slack",
+        externalMessageId: "slack:malformed-command",
+        principalId: "owner",
+        receivedAt: "2026-09-03T00:00:00.000Z",
+        text: "malformed model result"
+      });
+
+      await expect(composition.gateway.acceptCommand({
+        commandId: "malformed-command",
+        channel: "slack",
+        text: "malformed model result"
+      })).resolves.toEqual({ state: "failure" });
+      const audit = composition.services.store.listAuditEvents();
+      expect(audit).toContainEqual(expect.objectContaining({
+        subjectId: "malformed-command",
+        eventType: "command.planning_failed",
+        data: { reason: "invalid_model_output" }
+      }));
+      expect(JSON.stringify(audit)).not.toContain("model-secret-must-not-leak");
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("validates config before opening/migrating the database and then starts every ingress in order", async () => {
     // Break caught: production opens SQLite before config/Keychain validation or starts an ingress out of lifecycle order.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-"));
@@ -159,8 +238,8 @@ describe("production gateway composition", () => {
     }
   });
 
-  it("confirms durable L2 digests and reconstructed L3 phrases through the production HTTP route", async () => {
-    // Break caught: the production adapter re-parses PersistedApprovalRequest and rejects every valid approval.
+  it("does not turn standalone approval fixtures into production execution authority", async () => {
+    // Break caught: confirming an orphaned approval returns success without revalidating its production proposal and project.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-approval-"));
     const path = join(directory, "control.sqlite");
     const events: string[] = [];
@@ -201,11 +280,11 @@ describe("production gateway composition", () => {
       const cookie = (login.headers["set-cookie"] as string).split(";")[0];
       const headers = { "tailscale-user-login": "owner@example.test", cookie, origin: "https://hq.tailnet.example", "x-csrf-token": login.headers["x-csrf-token"] as string, "idempotency-key": "approval-success" };
       const l2 = (await app.inject({ method: "GET", url: "/api/commands/command-l2", headers: { "tailscale-user-login": "owner@example.test", cookie } })).json() as { approval: { digest: string } };
-      expect((await app.inject({ method: "POST", url: "/api/approvals/approval-L2/confirm", payload: { digest: l2.approval.digest }, headers })).statusCode).toBe(200);
+      expect((await app.inject({ method: "POST", url: "/api/approvals/approval-L2/confirm", payload: { digest: l2.approval.digest }, headers })).statusCode).toBe(403);
       const l3 = (await app.inject({ method: "GET", url: "/api/commands/command-l3", headers: { "tailscale-user-login": "owner@example.test", cookie } })).json() as { approval: { digest: string; operationPhrase: string } };
       expect(l3.approval.operationPhrase).toBe(`APPROVE DEPLOY_PRODUCTION ${l3.approval.digest.slice(0, 12).toUpperCase()}`);
       expect((await app.inject({ method: "POST", url: "/api/approvals/approval-L3/confirm", payload: { digest: l3.approval.digest, phrase: "wrong" }, headers: { ...headers, "idempotency-key": "approval-wrong" } })).statusCode).toBe(403);
-      expect((await app.inject({ method: "POST", url: "/api/approvals/approval-L3/confirm", payload: { digest: l3.approval.digest, phrase: l3.approval.operationPhrase }, headers: { ...headers, "idempotency-key": "approval-l3" } })).statusCode).toBe(200);
+      expect((await app.inject({ method: "POST", url: "/api/approvals/approval-L3/confirm", payload: { digest: l3.approval.digest, phrase: l3.approval.operationPhrase }, headers: { ...headers, "idempotency-key": "approval-l3" } })).statusCode).toBe(403);
       await composition.gateway.stop();
     } finally {
       await rm(directory, { recursive: true, force: true });

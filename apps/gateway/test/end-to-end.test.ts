@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   IdentityResolver,
   type ExecutionProposal,
+  type PersistedApproval,
   type PrincipalBinding
 } from "@orca-hq/core";
 import type { OrcaOperation, OrcaReceipt } from "@orca-hq/orca-adapter";
@@ -152,7 +153,7 @@ class FakeOrcaBoundary {
   }
 }
 
-function executionProposal(commandId: string, riskLevel: "L0" | "L1"): ExecutionProposal {
+function executionProposal(commandId: string, riskLevel: "L0" | "L1" | "L2" | "L3"): ExecutionProposal {
   return {
     proposalId: "proposal-command-501",
     commandId,
@@ -209,7 +210,8 @@ function boundaries(
   directory: string,
   orca: FakeOrcaBoundary,
   deliveries: string[],
-  riskLevel: "L0" | "L1" = "L1"
+  riskLevel: "L0" | "L1" | "L2" | "L3" = "L1",
+  now: () => Date = () => new Date("2026-09-03T00:00:00.000Z")
 ): GatewayExternalBoundaries {
   const head = "a".repeat(40);
   const project = {
@@ -222,7 +224,7 @@ function boundaries(
     defaultBaseRef: "main",
     instructionsFiles: [],
     setupPolicy: "run",
-    allowedOperations: ["L0", "L1"],
+    allowedOperations: ["L0", "L1", "L2", "L3"],
     requiredChecks: ["pnpm test"],
     sensitivePaths: [".env"],
     lockKey: "sandbox"
@@ -328,8 +330,62 @@ function boundaries(
       }
     },
     dispatchControl: { async stop() { return true; }, async retry() { return true; } },
-    now: () => new Date("2026-09-03T00:00:00.000Z")
+    now
   };
+}
+
+async function approvalRequest(
+  composition: Awaited<ReturnType<typeof createProductionGateway>>,
+  riskLevel: "L2" | "L3"
+) {
+  const commandId = `command-${riskLevel.toLowerCase()}`;
+  composition.services.store.insertCommand({
+    commandId,
+    idempotencyKey: `test:${commandId}`,
+    channel: "tailscale-web",
+    externalMessageId: `dashboard:${commandId}`,
+    principalId: "owner",
+    receivedAt: "2026-09-03T00:00:00.000Z",
+    text: "샌드박스 프로젝트 변경 승인"
+  });
+  const accepted = await composition.gateway.acceptCommand({
+    commandId,
+    channel: "tailscale-web",
+    text: "샌드박스 프로젝트 변경 승인"
+  });
+  const approval = composition.services.store.listApprovals()[0];
+  if (approval === undefined) throw new Error("approval request missing");
+  return { accepted, approval };
+}
+
+async function confirmThroughDashboard(
+  composition: Awaited<ReturnType<typeof createProductionGateway>>,
+  approval: PersistedApproval,
+  phrase?: string
+) {
+  const app = composition.services.httpApp;
+  if (app === undefined) throw new Error("production HTTP app missing");
+  const login = await app.inject({
+    method: "POST",
+    url: "/auth/session",
+    headers: { "tailscale-user-login": "owner@example.test" }
+  });
+  const cookie = (login.headers["set-cookie"] as string).split(";")[0];
+  return app.inject({
+    method: "POST",
+    url: `/api/approvals/${approval.request.approvalId}/confirm`,
+    headers: {
+      "tailscale-user-login": "owner@example.test",
+      cookie,
+      origin: "https://hq.tailnet.example",
+      "x-csrf-token": login.headers["x-csrf-token"] as string,
+      "idempotency-key": `approve:${approval.request.approvalId}:${phrase ?? "l2"}`
+    },
+    payload: {
+      digest: approval.request.digest,
+      ...(phrase === undefined ? {} : { phrase })
+    }
+  });
 }
 
 async function acceptTelegram501(
@@ -412,6 +468,94 @@ async function completeImplementationAndVerifier(
 }
 
 describe("Gateway production state machine E2E", () => {
+  it("keeps an L2 proposal waiting without a Dispatch and resumes it once from durable approval", async () => {
+    // Break caught: production trusts a literal authorization capability and dispatches L2 before durable approval.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-l2-"));
+    const orca = new FakeOrcaBoundary();
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      const host = await createGatewayHost(async () => boundaries(directory, orca, [], "L2"));
+      composition = await createProductionGateway(host.config, host.dependencies);
+      await composition.gateway.start();
+
+      const { accepted, approval } = await approvalRequest(composition, "L2");
+      expect(accepted).toEqual({ state: "waiting_approval" });
+      expect(composition.services.store.listRunRecords()).toEqual([
+        expect.objectContaining({ commandId: "command-l2", state: "waiting_approval" })
+      ]);
+      expect(composition.services.store.listTasks()).toEqual([]);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(0);
+
+      expect((await confirmThroughDashboard(composition, approval)).statusCode).toBe(200);
+      expect(composition.services.store.findApproval(approval.request.approvalId)?.state).toBe("consumed");
+      expect(composition.services.store.listRunRecords()).toEqual([
+        expect.objectContaining({ commandId: "command-l2", state: "active" })
+      ]);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+
+      expect((await confirmThroughDashboard(composition, approval)).statusCode).toBe(403);
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an L3 proposal stopped for a wrong phrase and resumes only for the exact phrase", async () => {
+    // Break caught: a button click or arbitrary phrase creates an L3 Dispatch.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-l3-"));
+    const orca = new FakeOrcaBoundary();
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      const host = await createGatewayHost(async () => boundaries(directory, orca, [], "L3"));
+      composition = await createProductionGateway(host.config, host.dependencies);
+      await composition.gateway.start();
+
+      const { approval } = await approvalRequest(composition, "L3");
+      expect((await confirmThroughDashboard(composition, approval, "APPROVE OTHER")).statusCode).toBe(403);
+      expect(composition.services.store.findApproval(approval.request.approvalId)?.state).toBe("pending");
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(0);
+
+      const exactPhrase = `APPROVE DEPLOY_PRODUCTION ${approval.request.digest.slice(0, 12).toUpperCase()}`;
+      expect((await confirmThroughDashboard(composition, approval, exactPhrase)).statusCode).toBe(200);
+      expect(composition.services.store.findApproval(approval.request.approvalId)?.state).toBe("consumed");
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an approval that expires before durable execution resumes", async () => {
+    // Break caught: production confirms a stale digest and creates a Dispatch without revalidating its fixed expiry.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-expired-"));
+    const orca = new FakeOrcaBoundary();
+    let confirming = false;
+    let confirmationClockReads = 0;
+    const now = () => {
+      if (!confirming) return new Date("2026-09-03T10:00:00.000Z");
+      confirmationClockReads += 1;
+      return new Date(confirmationClockReads === 1
+        ? "2026-09-03T10:00:00.000Z"
+        : "2026-09-03T10:15:00.000Z");
+    };
+    let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      const host = await createGatewayHost(async () => boundaries(directory, orca, [], "L2", now));
+      composition = await createProductionGateway(host.config, host.dependencies);
+      await composition.gateway.start();
+      const { approval } = await approvalRequest(composition, "L2");
+
+      confirming = true;
+      expect((await confirmThroughDashboard(composition, approval)).statusCode).toBe(403);
+      expect(composition.services.store.findApproval(approval.request.approvalId)?.state).toBe("expired");
+      expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(0);
+    } finally {
+      await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("moves Telegram message 501 through worker, verifier and a delivered verified-success Outbox", async () => {
     // Break caught: a fake command flow can directly insert verified_success, Dispatches, or the expected delivery text.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-pass-"));

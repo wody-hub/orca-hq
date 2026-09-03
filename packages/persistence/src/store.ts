@@ -1106,6 +1106,16 @@ export class ControlStore implements CommandIngress {
     `).run(proposal.proposalId, proposal.commandId, JSON.stringify(proposal), now, now);
   }
 
+  findExecutionProposal(proposalIdInput: string): z.infer<typeof ExecutionProposalSchema> | undefined {
+    const proposalId = z.string().min(1).parse(proposalIdInput);
+    const row = this.database.prepare(`
+      SELECT payload_json FROM execution_proposals WHERE id = ?
+    `).get(proposalId) as { payload_json: string } | undefined;
+    return row === undefined
+      ? undefined
+      : ExecutionProposalSchema.parse(parseJson(row.payload_json));
+  }
+
   saveRun(recordInput: unknown): void {
     const payload = JsonValueSchema.parse(recordInput);
     const record = LifecycleRunStoreSchema.parse(payload);

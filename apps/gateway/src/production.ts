@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
+
 import {
   ApprovalService,
   type AuthenticatedPrincipal,
   type CommandEnvelope,
+  type ExecutionProposal,
   type PrincipalBinding
 } from "@orca-hq/core";
 import { HqResultSchema, type HqResult } from "@orca-hq/codex-hq";
@@ -108,7 +111,17 @@ function approvalPrincipal(principal: AuthenticatedPrincipal): PrincipalBinding 
   };
 }
 
-function approvalAdapter(store: ControlStore, now: () => Date): ApprovalConfirmationPort {
+type ApprovalResumeResult = Readonly<
+  | { kind: "started" }
+  | { kind: "changed" }
+  | { kind: "denied" }
+>;
+
+function approvalAdapter(
+  store: ControlStore,
+  now: () => Date,
+  resume: (approvalId: string) => Promise<ApprovalResumeResult>
+): ApprovalConfirmationPort {
   const service = new ApprovalService(store);
   return {
     async confirmExisting(input) {
@@ -131,7 +144,12 @@ function approvalAdapter(store: ControlStore, now: () => Date): ApprovalConfirma
         if (decision.kind === "changed") return { kind: "changed" };
         if (decision.kind !== "approved") return { kind: "denied" };
         const confirmed = store.findApproval(input.approvalId)?.approval;
-        return confirmed === undefined ? { kind: "denied" } : { kind: "approved", expiresAt: confirmed.expiresAt };
+        if (confirmed === undefined) return { kind: "denied" };
+        const resumed = await resume(input.approvalId);
+        if (resumed.kind === "changed") return { kind: "changed" };
+        return resumed.kind === "started"
+          ? { kind: "approved", expiresAt: confirmed.expiresAt }
+          : { kind: "denied" };
       } catch {
         // Invalid or stale durable content must never turn into an approval.
         return { kind: "denied" };
@@ -177,13 +195,48 @@ function repositoryHq(
 ): GatewayProductionServices["hq"] {
   return Object.freeze({
     async plan(command: CommandEnvelope): Promise<HqResult> {
-      const result = HqResultSchema.parse(await model.plan(command, projects));
+      let result: HqResult;
+      try {
+        const parsed = HqResultSchema.safeParse(await model.plan(command, projects));
+        if (!parsed.success) return Object.freeze({ kind: "failure", reason: "invalid_model_output" });
+        result = parsed.data;
+      } catch {
+        return Object.freeze({ kind: "failure", reason: "invalid_model_output" });
+      }
       if (result.kind === "proposal" && result.proposal.commandId !== command.commandId) {
         return Object.freeze({ kind: "failure", reason: "invalid_model_output" });
       }
       return result;
     }
   });
+}
+
+function commandDigest(command: CommandEnvelope): string {
+  return createHash("sha256").update(JSON.stringify(command)).digest("hex");
+}
+
+function approvalOperation(proposal: ExecutionProposal): Readonly<{
+  operation: "commit_changes" | "deploy_production";
+  targetEnvironment?: "production";
+}> {
+  return proposal.riskLevel === "L3"
+    ? Object.freeze({ operation: "deploy_production", targetEnvironment: "production" })
+    : Object.freeze({ operation: "commit_changes" });
+}
+
+function approvalValidation(
+  proposal: ExecutionProposal,
+  command: CommandEnvelope
+) {
+  const operation = approvalOperation(proposal);
+  return {
+    proposal,
+    operation: operation.operation,
+    commandDigest: commandDigest(command),
+    ...(operation.targetEnvironment === undefined
+      ? {}
+      : { targetEnvironment: operation.targetEnvironment })
+  };
 }
 
 function requireCompletionDestinations(
@@ -245,20 +298,129 @@ function productionCommandFlow(
   store: ControlStore,
   hq: GatewayProductionServices["hq"],
   execution: ExecutionService,
-  projects: readonly ProjectRegistryEntry[]
+  projects: readonly ProjectRegistryEntry[],
+  now: () => Date
 ) {
+  const approvals = new ApprovalService(store);
+  const runId = (proposalId: string): string => `run:${proposalId}`;
+  const runState = (proposalId: string): string | undefined => {
+    const run = store.loadRunRecord(runId(proposalId));
+    return typeof run === "object" && run !== null && !Array.isArray(run)
+      && typeof run.state === "string"
+      ? run.state
+      : undefined;
+  };
+  const projectFor = (proposal: ExecutionProposal): ProjectRegistryEntry | undefined =>
+    projects.find((candidate) => candidate.projectKey === proposal.selectedProjectKey);
+  const startAuthorized = async (
+    proposal: ExecutionProposal,
+    project: ProjectRegistryEntry,
+    authorization: Readonly<
+      | { kind: "automatic" }
+      | { kind: "durable_approval"; approvalId: string }
+    >
+  ) => {
+    if (
+      (proposal.riskLevel === "L2" || proposal.riskLevel === "L3")
+      !== (authorization.kind === "durable_approval")
+    ) {
+      throw new TypeError("production execution authorization does not match proposal risk");
+    }
+    const started = await execution.start({ authorization: "authorized", proposal, project });
+    return { state: started.kind === "started" ? "active" : started.kind };
+  };
+  const resumeApproval = async (approvalId: string): Promise<ApprovalResumeResult> => {
+    const persisted = store.findApproval(approvalId);
+    if (persisted === undefined || persisted.state !== "approved") return { kind: "denied" };
+    const proposal = store.findExecutionProposal(persisted.request.proposal.proposalId);
+    if (proposal === undefined) return { kind: "denied" };
+    const command = store.listCommands().find((candidate) => candidate.commandId === proposal.commandId);
+    if (command === undefined) return { kind: "denied" };
+    const project = projectFor(proposal);
+    if (project === undefined) return { kind: "denied" };
+    const validation = approvals.validate(
+      approvalId,
+      approvalValidation(proposal, command),
+      now()
+    );
+    if (validation.kind === "changed") return { kind: "changed" };
+    if (validation.kind !== "approved") return { kind: "denied" };
+    const started = await startAuthorized(proposal, project, {
+      kind: "durable_approval",
+      approvalId
+    });
+    return started.state === "active" ? { kind: "started" } : { kind: "denied" };
+  };
   return {
+    resumeApproval,
     async accept(command: GatewayCommand) {
       const durable = store.listCommands().find((candidate) => candidate.commandId === command.commandId);
-      if (durable === undefined) throw new Error("Gateway command is not durably accepted");
+      if (durable === undefined) {
+        store.appendAudit({
+          subjectId: command.commandId,
+          eventType: "command.planning_failed",
+          data: { reason: "durable_command_missing" }
+        });
+        return { state: "failure" };
+      }
       const result = await hq.plan(durable);
-      if (result.kind !== "proposal") return { state: result.kind };
+      if (result.kind !== "proposal") {
+        if (result.kind === "failure") {
+          store.appendAudit({
+            subjectId: durable.commandId,
+            eventType: "command.planning_failed",
+            data: { reason: result.reason }
+          });
+        }
+        return { state: result.kind };
+      }
       const proposal = result.proposal;
       store.saveExecutionProposal(proposal);
-      const project = projects.find((candidate) => candidate.projectKey === proposal.selectedProjectKey);
+      const project = projectFor(proposal);
       if (project === undefined) return { state: "review_required" };
-      const started = await execution.start({ authorization: "authorized", proposal, project });
-      return { state: started.kind === "started" ? "active" : started.kind };
+      if (proposal.riskLevel === "L2" || proposal.riskLevel === "L3") {
+        const approvalId = `approval:${proposal.proposalId}`;
+        const existing = store.findApproval(approvalId);
+        if (existing?.state === "approved") {
+          const resumed = await resumeApproval(approvalId);
+          return { state: resumed.kind === "started" ? "active" : "review_required" };
+        }
+        if (existing?.state === "consumed") {
+          return { state: runState(proposal.proposalId) ?? "review_required" };
+        }
+        if (existing?.state === "invalidated" || existing?.state === "expired") {
+          return { state: "review_required" };
+        }
+        if (existing === undefined) {
+          const operation = approvalOperation(proposal);
+          approvals.request({
+            approvalId,
+            proposal,
+            operation: operation.operation,
+            commandDigest: commandDigest(durable),
+            ...(operation.targetEnvironment === undefined
+              ? {}
+              : { targetEnvironment: operation.targetEnvironment }),
+            channel: "tailscale-web",
+            allowedChannels: ["slack", "tailscale-web"]
+          });
+        }
+        store.saveRun({
+          id: runId(proposal.proposalId),
+          proposalId: proposal.proposalId,
+          commandId: proposal.commandId,
+          objective: durable.text,
+          state: "waiting_approval",
+          recoveryContext: { proposal, project }
+        });
+        store.appendAudit({
+          subjectId: durable.commandId,
+          eventType: "command.waiting_approval",
+          data: { approvalId, riskLevel: proposal.riskLevel }
+        });
+        return { state: "waiting_approval" };
+      }
+      return startAuthorized(proposal, project, { kind: "automatic" });
     }
   };
 }
@@ -273,6 +435,7 @@ export async function createProductionGateway(
   // Database construction is deliberately deferred to database.migrate: config/secret
   // validation is the first lifecycle operation and a rejected config leaves no handle.
   let services: GatewayProductionServices | undefined;
+  let commandFlow: ReturnType<typeof productionCommandFlow> | undefined;
   let http: GatewayIngressPort | undefined = dependencies.http;
   const requireServices = (): GatewayProductionServices => {
     if (services === undefined) throw new Error("production services are unavailable before configuration validation");
@@ -328,11 +491,19 @@ export async function createProductionGateway(
               : { workerLaunchPolicy: dependencies.execution.workerLaunchPolicy })
           });
           const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
+          commandFlow = productionCommandFlow(
+            store,
+            hq,
+            execution,
+            dependencies.projects,
+            now
+          );
           let httpApp: ReturnType<typeof createHttpApp> | undefined;
           if (dependencies.httpOptions !== undefined) {
             const app = createHttpApp({
               ...dependencies.httpOptions, commands: createCommandDashboard(store), projects: createProjectDashboard(store),
-              approvals: approvalAdapter(store, now), actions: actionAdapter(store, dependencies.dispatchControl)
+              approvals: approvalAdapter(store, now, commandFlow.resumeApproval),
+              actions: actionAdapter(store, dependencies.dispatchControl)
             });
             httpApp = app;
             http = {
@@ -375,8 +546,9 @@ export async function createProductionGateway(
     transactions: dependencies.transactions,
     commandFlow: {
       async accept(command) {
-        const services = requireServices();
-        return productionCommandFlow(services.store, services.hq, services.execution, dependencies.projects).accept(command);
+        requireServices();
+        if (commandFlow === undefined) throw new Error("production command flow is unavailable");
+        return commandFlow.accept(command);
       }
     },
     audit: {
