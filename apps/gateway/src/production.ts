@@ -1,12 +1,27 @@
-import { ApprovalService, type AuthenticatedPrincipal, type PrincipalBinding } from "@orca-hq/core";
-import type { CodexHqSession } from "@orca-hq/codex-hq";
+import {
+  ApprovalService,
+  type AuthenticatedPrincipal,
+  type CommandEnvelope,
+  type PrincipalBinding
+} from "@orca-hq/core";
+import { HqResultSchema, type HqResult } from "@orca-hq/codex-hq";
 import { OrcaClient, type OrcaClientOptions } from "@orca-hq/orca-adapter";
 import { ControlStore, openDatabase, OutboxDispatcher, type OutboxDispatcherOptions } from "@orca-hq/persistence";
 import { WorktreeLockService } from "@orca-hq/project-registry";
 import type { ProjectRegistryEntry } from "@orca-hq/project-registry";
-import type { SlackAdapter } from "@orca-hq/slack-adapter";
-import type { TelegramAdapter } from "@orca-hq/telegram-adapter";
-import { ExecutionLifecycle, ExecutionService } from "@orca-hq/worker-routing";
+import {
+  ExecutionLifecycle,
+  ExecutionService,
+  VerificationService,
+  type AssignmentArtifactStore,
+  type ProviderCapabilities,
+  type VerificationCompletionTarget,
+  type VerificationEvidencePort,
+  type VerificationReport,
+  type WorkerLaunchPolicy,
+  type WorkerProviderRegistryPort,
+  type WorktreePlacementPort
+} from "@orca-hq/worker-routing";
 
 import {
   createGateway,
@@ -26,6 +41,22 @@ export interface GatewayDispatchControlPort {
   retry(input: Readonly<{ dispatchId: string; idempotencyKey: string }>): Promise<boolean>;
 }
 
+export interface GatewayProposalModelPort {
+  plan(
+    command: CommandEnvelope,
+    projects: readonly ProjectRegistryEntry[]
+  ): Promise<unknown>;
+}
+
+export interface GatewayExecutionComposition {
+  readonly placements: WorktreePlacementPort;
+  readonly assignmentArtifacts: AssignmentArtifactStore;
+  readonly verificationEvidence: VerificationEvidencePort;
+  readonly providers?: WorkerProviderRegistryPort | undefined;
+  readonly providerCapabilities?: ProviderCapabilities | undefined;
+  readonly workerLaunchPolicy?: WorkerLaunchPolicy | undefined;
+}
+
 /**
  * The concrete process composition boundary. Network/Keychain handles remain
  * injected, while durable storage, Orca, locking, execution, and outbox use
@@ -35,13 +66,11 @@ export interface GatewayProductionDependencies {
   readonly config: GatewayConfigPort;
   /** A real Orca client is external I/O and may be injected; options construct the default client. */
   readonly orca: OrcaClientOptions | Pick<OrcaClient, "health" | "execute">;
-  readonly execution: Omit<ConstructorParameters<typeof ExecutionService>[0], "orca" | "locks" | "lifecycle">;
-  /** HQ is the external model/I/O boundary; this module owns consuming its result. */
-  readonly hq: Pick<CodexHqSession, "plan">;
-  /** Validated local registry snapshot supplied by the deployment configuration boundary. */
+  readonly execution: GatewayExecutionComposition;
+  /** The external model only proposes; repository code validates and owns the HQ state flow. */
+  readonly proposalModel: GatewayProposalModelPort;
+  /** Host-validated local registry snapshot. */
   readonly projects: readonly ProjectRegistryEntry[];
-  readonly slackAdapter: SlackAdapter;
-  readonly telegramAdapter: TelegramAdapter;
   /** Legacy externally-hosted ingress. New hosts should supply httpOptions so production owns createHttpApp. */
   readonly http?: GatewayIngressPort;
   /** Keychain/session/identity-backed external boundary; production creates the HTTP app and loopback listener itself. */
@@ -49,13 +78,15 @@ export interface GatewayProductionDependencies {
   readonly slack: GatewayIngressPort;
   readonly telegram: GatewayIngressPort;
   readonly transactions: GatewayTransactionPort;
-  /** @deprecated only retained for durable adapter recovery hooks during migration. */
-  readonly reconcile?: (services: GatewayProductionServices) => Promise<void>;
   readonly outbox: Omit<OutboxDispatcherOptions, "store">;
   /** Required external Orca control boundary. Production refuses to expose mutating routes without it. */
   readonly dispatchControl: GatewayDispatchControlPort;
   /** Injectable clock for approval expiry tests; production defaults to the system clock. */
   readonly now?: () => Date;
+  readonly completionDestinations?: Readonly<{
+    slack?: string | undefined;
+    tailscaleWeb?: string | undefined;
+  }> | undefined;
 }
 
 export interface GatewayProductionServices {
@@ -64,10 +95,8 @@ export interface GatewayProductionServices {
   readonly orca: Pick<OrcaClient, "health" | "execute">;
   readonly locks: WorktreeLockService;
   readonly execution: ExecutionService;
-  readonly hq: Pick<CodexHqSession, "plan">;
+  readonly hq: Readonly<{ plan(command: CommandEnvelope): Promise<HqResult> }>;
   readonly outbox: OutboxDispatcher;
-  readonly slackAdapter: SlackAdapter;
-  readonly telegramAdapter: TelegramAdapter;
   /** Present only when production owns the HTTP app from httpOptions. */
   readonly httpApp?: ReturnType<typeof createHttpApp>;
 }
@@ -142,9 +171,58 @@ function actionAdapter(store: ControlStore, control: GatewayDispatchControlPort)
   };
 }
 
+function repositoryHq(
+  model: GatewayProposalModelPort,
+  projects: readonly ProjectRegistryEntry[]
+): GatewayProductionServices["hq"] {
+  return Object.freeze({
+    async plan(command: CommandEnvelope): Promise<HqResult> {
+      const result = HqResultSchema.parse(await model.plan(command, projects));
+      if (result.kind === "proposal" && result.proposal.commandId !== command.commandId) {
+        return Object.freeze({ kind: "failure", reason: "invalid_model_output" });
+      }
+      return result;
+    }
+  });
+}
+
+function verificationCompletionTarget(
+  store: ControlStore,
+  report: VerificationReport,
+  now: () => Date,
+  destinations: GatewayProductionDependencies["completionDestinations"]
+): VerificationCompletionTarget {
+  const runValue = store.loadRunRecord(report.runId);
+  const run = typeof runValue === "object" && runValue !== null && !Array.isArray(runValue)
+    ? runValue
+    : undefined;
+  const commandId = typeof run?.commandId === "string" ? run.commandId : undefined;
+  if (commandId === undefined) throw new Error(`Verification Run ${report.runId} is not durable`);
+  const command = store.listCommands().find((candidate) => candidate.commandId === commandId);
+  if (command === undefined) throw new Error(`Verification Command ${commandId} is not durable`);
+  let destination: string | undefined;
+  if (command.channel === "telegram") {
+    const separator = command.externalMessageId.lastIndexOf(":");
+    destination = separator > 0 ? command.externalMessageId.slice(0, separator) : undefined;
+  } else if (command.channel === "slack") {
+    destination = destinations?.slack;
+  } else {
+    destination = destinations?.tailscaleWeb;
+  }
+  if (destination === undefined || destination.length === 0) {
+    throw new Error(`Verification delivery destination for ${command.channel} is unavailable`);
+  }
+  return Object.freeze({
+    commandId: command.commandId,
+    channel: command.channel,
+    destination,
+    nextAttemptAt: now().toISOString()
+  });
+}
+
 function productionCommandFlow(
   store: ControlStore,
-  hq: Pick<CodexHqSession, "plan">,
+  hq: GatewayProductionServices["hq"],
   execution: ExecutionService,
   projects: readonly ProjectRegistryEntry[]
 ) {
@@ -180,7 +258,7 @@ export async function createProductionGateway(
     ? dependencies.orca
     : new OrcaClient(dependencies.orca);
   const exposedServices = {} as GatewayProductionServices;
-  for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "slackAdapter", "telegramAdapter", "httpApp"] as const) {
+  for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "httpApp"] as const) {
     Object.defineProperty(exposedServices, key, { enumerable: true, get: () => requireServices()[key] });
   }
   const gateway = await createGateway(config, {
@@ -194,13 +272,43 @@ export async function createProductionGateway(
           const store = new ControlStore(database);
           const locks = new WorktreeLockService(store);
           const lifecycle = new ExecutionLifecycle({ store });
-          const execution = new ExecutionService({ ...dependencies.execution, orca, locks, lifecycle });
+          const hq = repositoryHq(dependencies.proposalModel, dependencies.projects);
+          const now = dependencies.now ?? (() => new Date());
+          const verification = new VerificationService({
+            store,
+            completionTarget: (report) => verificationCompletionTarget(
+              store,
+              report,
+              now,
+              dependencies.completionDestinations
+            )
+          });
+          const execution = new ExecutionService({
+            orca,
+            locks,
+            lifecycle,
+            placements: dependencies.execution.placements,
+            assignmentArtifacts: dependencies.execution.assignmentArtifacts,
+            verification: {
+              service: verification,
+              evidence: dependencies.execution.verificationEvidence
+            },
+            ...(dependencies.execution.providers === undefined
+              ? {}
+              : { providers: dependencies.execution.providers }),
+            ...(dependencies.execution.providerCapabilities === undefined
+              ? {}
+              : { providerCapabilities: dependencies.execution.providerCapabilities }),
+            ...(dependencies.execution.workerLaunchPolicy === undefined
+              ? {}
+              : { workerLaunchPolicy: dependencies.execution.workerLaunchPolicy })
+          });
           const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
           let httpApp: ReturnType<typeof createHttpApp> | undefined;
           if (dependencies.httpOptions !== undefined) {
             const app = createHttpApp({
               ...dependencies.httpOptions, commands: createCommandDashboard(store), projects: createProjectDashboard(store),
-              approvals: approvalAdapter(store, dependencies.now ?? (() => new Date())), actions: actionAdapter(store, dependencies.dispatchControl)
+              approvals: approvalAdapter(store, now), actions: actionAdapter(store, dependencies.dispatchControl)
             });
             httpApp = app;
             http = {
@@ -208,8 +316,7 @@ export async function createProductionGateway(
               async stopIngress() { await app.close(); }
             };
           }
-          services = Object.freeze({ database, store, orca, locks, execution, hq: dependencies.hq, outbox,
-            slackAdapter: dependencies.slackAdapter, telegramAdapter: dependencies.telegramAdapter,
+          services = Object.freeze({ database, store, orca, locks, execution, hq, outbox,
             ...(httpApp === undefined ? {} : { httpApp }) });
           if (http === undefined) throw new Error("production HTTP security configuration is required");
         } catch (error) {
@@ -227,10 +334,10 @@ export async function createProductionGateway(
     },
     orca: { async check() { await orca.health(); } },
     reconcile: async () => {
-      // Durable stores are the recovery source of truth; startup never delegates
-      // reconciliation ownership to a deployment bootstrap module.
+      // Durable stores are the recovery source of truth. The deployment module
+      // cannot replace this reconciliation step with prebuilt state transitions.
       requireServices().store.listRunRecords();
-      await dependencies.reconcile?.(requireServices());
+      requireServices().store.listOutbox();
     },
     http: {
       async start() {
@@ -245,7 +352,7 @@ export async function createProductionGateway(
     commandFlow: {
       async accept(command) {
         const services = requireServices();
-        return productionCommandFlow(services.store, dependencies.hq, services.execution, dependencies.projects).accept(command);
+        return productionCommandFlow(services.store, services.hq, services.execution, dependencies.projects).accept(command);
       }
     },
     audit: {

@@ -254,3 +254,84 @@ git diff --check                               exit 0
 ### 남은 우려
 
 - C1/C3/N3/N12의 권위 있는 요구인 repository-owned host 성공 경로와 실제 ExecutionService의 worker→verifier→verification-failure Outbox 차단 E2E는 아직 별도 RED/GREEN으로 완결하지 못했다. 이 절의 변경은 해당 사실을 숨기지 않으며, 후속 작업에서 external bootstrap dependency를 Keychain/channel/Orca 경계로 더 축소하고 full durable state-machine E2E를 추가해야 한다.
+
+## 수정 5차
+
+### 구현 및 조립 경계
+
+- `host.ts`는 더 이상 외부 모듈의 완성된 `{ config, dependencies }`를 통과시키지 않는다. 외부 모듈에는 config/secret 검증, Orca·Git·channel·outbound·dispatch-control I/O, model proposal, 승인된 Orca project 발견 결과와 curated registry 파일 경로만 허용한다. 저장소의 `Registry.load`가 YAML과 발견 결과를 교차 검증하고 host가 `GitWorktreePlacementService`, `FileAssignmentArtifactStore`, execution option, Outbox option을 직접 조립한다. `dependencies`, `commandFlow`, `reconcile`, `execution`, `outbox`, 완성 host를 반환하면 redacted configuration 오류로 거부한다.
+- `production.ts`는 외부 model 출력을 `HqResultSchema`로 검증하는 HQ wrapper, durable `ControlStore`, `WorktreeLockService`, `ExecutionLifecycle`, `VerificationService`, `ExecutionService`, `OutboxDispatcher`, HTTP/dashboard/approval/action 포트와 store-owned reconciliation 경계를 직접 조립한다. production command flow가 durable command를 찾고 proposal을 저장한 뒤 등록 project와 `ExecutionService.start`를 연결한다.
+- verification completion target은 durable Run→Command 관계에서 command ID와 channel을 찾고 Telegram의 normalized `chatId:messageId`에서 destination을 계산한다. `VerificationService`가 생성하는 성공 payload의 literal text는 `검증 완료`이며, bounded Fix Task를 만드는 실패는 delivery target을 조회하거나 Outbox를 만들지 않는다.
+- 실제 production 경로가 발견한 ordering 결함을 `002-worktree-lock-reservations` migration으로 수정했다. `ExecutionService`의 권위 불변식인 “Dispatch persist 전 editing lease 예약”을 유지하면서 `worktree_locks.dispatch_id`의 선행 Dispatch FK만 제거했고, v1 active lease 보존과 future Dispatch 예약을 migration 회귀 테스트로 고정했다.
+
+### TDD RED/GREEN
+
+최초 host/E2E RED는 다음과 같았다.
+
+```text
+pnpm vitest run apps/gateway/test/entry.test.ts apps/gateway/test/end-to-end.test.ts
+2 files failed, 4 tests failed, 2 passed
+```
+
+기존 `createGatewayHost`가 주입 loader를 무시하고 `GATEWAY_EXTERNAL_ADAPTERS`에서 full dependency graph를 읽었으며, E2E는 repository-owned production 상태 머신을 실행할 수 없었다. host/production 조립 뒤 실제 L1 실행이 Dispatch 생성 전 lease를 얻는 단계까지 진행하면서 SQLite v1 FK 결함도 다음 RED로 드러났다.
+
+```text
+pnpm vitest run packages/project-registry/test/locks.test.ts apps/gateway/test/end-to-end.test.ts
+2 files failed, 3 tests failed, 12 passed
+SqliteError: FOREIGN KEY constraint failed
+ControlStore.acquireWorktreeLock → WorktreeLockService.acquire → ExecutionService.start
+```
+
+또한 동적 completion route를 self-review하면서 실패 Fix cycle이 불필요한 delivery destination 조회 때문에 중단되는 RED를 추가했다.
+
+```text
+pnpm vitest run packages/worker-routing/test/verifier.test.ts -t "does not resolve a delivery target"
+1 test failed, 36 skipped
+Error: delivery destination unavailable
+```
+
+최종 focused GREEN은 host/production/E2E, lock migration과 4차 HTTP 회귀를 함께 실행했다.
+
+```text
+pnpm vitest run packages/persistence/test/store.test.ts packages/project-registry/test/locks.test.ts apps/gateway/test/entry.test.ts apps/gateway/test/end-to-end.test.ts apps/gateway/test/production.test.ts
+5 files passed, 46 tests passed
+
+pnpm vitest run packages/worker-routing/test/verifier.test.ts -t "does not resolve a delivery target"
+1 test passed, 36 skipped
+```
+
+### 실제 상태 전이와 외부 fake 경계
+
+- 성공: 실제 Telegram adapter가 update 501을 normalized durable command로 저장하고, production HQ wrapper와 command flow가 L1 proposal을 저장한다. 실제 `ExecutionService`가 implementation Task/Dispatch를 만든 뒤 `recordWorkerMessage(worker_done)`가 반대 family verifier Task/Dispatch를 만들며, 실제 verification pass가 Run을 `verified_success`로 전이한다. Dispatch I/O는 정확히 2회다.
+- 성공 전달: verification commit이 `report-command-501:success` Outbox를 command ID, `telegram`, destination `20`과 함께 enqueue한다. 실제 `OutboxDispatcher.tick()`과 Telegram renderer/provider fake를 통과한 durable 행은 `delivered`, provider message ID `9001`이며 외부 delivery는 literal `검증 완료` 한 건이다.
+- 실패: 같은 실제 worker/verifier 경로에서 fail report는 verifier Task를 `verification_failed`로 저장하고 Run은 bounded fix cycle 때문에 `active`를 유지하며 `verification.failed` audit을 남긴다. success Outbox와 외부 delivery는 모두 0건이다.
+- L0: 동일한 production command flow가 approval 없이 investigate Task/Dispatch 하나를 실행하고 worker completion 뒤 Run을 `investigation_complete`로 전이한다. approval, verifier, Outbox는 생성하지 않는다.
+- deterministic fake는 secret validation, Orca receipts, Git/worktree I/O, model proposal, verification evidence, channel ingress lifecycle과 outbound provider에만 있다. project registry는 임시 실제 YAML을 저장소 `Registry.load`로 읽고, 상태·Task·Dispatch·verification·Outbox는 fake가 직접 insert하지 않는다.
+
+### Finding 및 4차 회귀 self-review
+
+| Finding | 결과 및 근거 |
+| --- | --- |
+| C1 | 해결. `host.ts`가 최소 external boundary를 검증하고 project registry/execution/Outbox option을 조립하며, `production.ts`가 HQ command flow/verification/execution/HTTP/reconciliation을 소유한다. `entry.test.ts`는 host→entry→production 성공과 prebuilt dependency 거부를 실행한다. |
+| C3 | 해결. `end-to-end.test.ts`는 fake command flow와 직접 durable insert를 제거하고 실제 `ExecutionService` worker/verifier completion 및 verification commit을 실행한다. |
+| N3 | 해결. normalized Telegram ingress부터 production accept, durable evidence, 실제 Outbox tick과 renderer까지 단일 실행 경로로 연결했다. |
+| N12 | 해결. expected text는 literal `검증 완료`이고 product `VerificationService`가 payload를 만들며, fake는 전달된 text를 기록만 한다. 성공/실패 양쪽에서 Outbox와 delivery를 별도 단정한다. |
+| 수정 4차 보존 | `production.test.ts`의 실제 HTTP L2 exact digest 200, L3 wrong phrase 403/exact phrase 200, durable dispatch stop/retry 각 1회 I/O와 redacted audit가 GREEN이다. 전체 suite에는 durable verifier diff, unknown risk, `verification_failed` 표시 회귀도 포함된다. |
+
+### 전체 검증
+
+```text
+pnpm test                                      30 files, 509 tests passed
+pnpm typecheck                                 exit 0
+pnpm build                                     exit 0 (13 workspace projects)
+pnpm --filter @orca-hq/web test:e2e            4 passed
+git diff --check                               exit 0
+```
+
+Playwright에는 `NO_COLOR`/`FORCE_COLOR` Node 경고만 있었고 실패는 없었다. 실제 Slack, Telegram, Tailscale, Keychain, Orca credential·설정·network는 생성하거나 변경하지 않았다. 사용자 소유 roadmap과 Playwright `apps/web/test-results/` 산출물은 수정·stage·commit하지 않는다.
+
+### 변경 파일, 커밋 및 남은 우려
+
+- 변경 파일은 `apps/gateway/src/{entry,host,production}.ts`, `apps/gateway/test/{entry,end-to-end,production}.test.ts`, `packages/persistence/{package.json,src/database.ts,src/migrations/002-worktree-lock-reservations.ts,test/store.test.ts}`, `packages/project-registry/test/locks.test.ts`, `packages/worker-routing/src/verifier.ts`, `packages/worker-routing/test/verifier.test.ts`와 이 보고서다.
+- 커밋은 이 절 작성 뒤 의도된 파일만 stage해 하나의 원자적 커밋으로 만든다.
+- 남은 우려는 deployment가 실제 external boundary와 Slack/Tailscale completion destination을 올바르게 제공해야 한다는 점이다. 이번 테스트는 의도대로 실제 credential/provider connection을 만들지 않으며, 그 운영 설정의 가용성은 배포 canary 범위다.

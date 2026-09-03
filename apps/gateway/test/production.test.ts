@@ -4,16 +4,35 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 import { ApprovalService, IdentityResolver, type PrincipalBinding } from "@orca-hq/core";
+import type { ProjectRegistryEntry } from "@orca-hq/project-registry";
 import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
 
 import { createProductionGateway, type GatewayProductionDependencies } from "../src/production.js";
+
+const sandboxProject = {
+  projectKey: "sandbox",
+  orcaProjectId: "orca-sandbox",
+  repoId: "repo-sandbox",
+  absolutePath: "/srv/sandbox",
+  aliases: ["sandbox"],
+  component: "backend",
+  defaultBaseRef: "main",
+  instructionsFiles: [],
+  setupPolicy: "run",
+  allowedOperations: ["L0", "L1", "L2", "L3"],
+  requiredChecks: ["pnpm test"],
+  sensitivePaths: [],
+  lockKey: "sandbox"
+} satisfies ProjectRegistryEntry;
 
 function dependencies(events: string[], valid = true): GatewayProductionDependencies {
   const ingress = (name: string) => ({ async start() { events.push(`${name}.started`); }, async stopIngress() { events.push(`${name}.stopped`); } });
   return {
     config: { async validate() { events.push("config.valid"); if (!valid) throw new Error("secret provider rejected configuration"); } },
     orca: { async health() { events.push("orca.checked"); return {} as never; }, async execute() { throw new Error("not used"); } },
-    execution: {} as never, hq: { async plan() { return { kind: "failure", reason: "invalid_command" } as never; } }, projects: [], slackAdapter: {} as never, telegramAdapter: {} as never,
+    execution: {} as never,
+    proposalModel: { async plan() { return { kind: "failure", reason: "invalid_command" }; } },
+    projects: [],
     http: ingress("http"), slack: ingress("slack"), telegram: ingress("telegram"),
     transactions: { async drain() { events.push("transactions.drained"); } },
     outbox: { workerId: "test", providers: {} },
@@ -80,24 +99,23 @@ describe("production gateway composition", () => {
       principalId: "owner", slackUserIds: [], telegramUserIds: [], telegramChatIds: [],
       tailscaleLoginNames: ["owner@example.test"], roles: ["owner"]
     };
-    const { http: _http, reconcile: _reconcile, ...baseDependencies } = dependencies(events);
+    const { http: _http, ...baseDependencies } = dependencies(events);
     const productionDependencies: GatewayProductionDependencies = {
       ...baseDependencies,
+      projects: [sandboxProject],
       httpOptions: {
         bindings: [owner], resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
         sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(1) }), peerAddress: () => "127.0.0.1",
         allowedOrigin: "https://hq.tailnet.example", csrfSigningKey: new Uint8Array(32).fill(2)
-      },
-      reconcile: async (services) => {
-      services.store.insertCommand({ commandId: "command-1", idempotencyKey: "key-1", channel: "telegram", externalMessageId: "20:1", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
-      const proposal = { proposalId: "proposal-1", commandId: "command-1", selectedProjectKey: "sandbox", routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias"] }], allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L1" as const, tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement" as const, preferredAgent: "codex" as const }] };
-      services.store.saveExecutionProposal(proposal);
-      services.store.saveRun({ id: "run-1", proposalId: "proposal-1", commandId: "command-1", state: "active", recoveryContext: { proposal } });
       }
     };
     try {
       const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
       await composition.gateway.start();
+      composition.services.store.insertCommand({ commandId: "command-1", idempotencyKey: "key-1", channel: "telegram", externalMessageId: "20:1", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
+      const proposal = { proposalId: "proposal-1", commandId: "command-1", selectedProjectKey: "sandbox", routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias"] }], allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L1" as const, tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement" as const, preferredAgent: "codex" as const }] };
+      composition.services.store.saveExecutionProposal(proposal);
+      composition.services.store.saveRun({ id: "run-1", proposalId: "proposal-1", commandId: "command-1", state: "active", recoveryContext: { proposal } });
       const app = composition.services.httpApp;
       if (app === undefined) throw new Error("production http app missing");
       const login = await app.inject({ method: "POST", url: "/auth/session", headers: { "tailscale-user-login": "owner@example.test" } });
@@ -122,35 +140,33 @@ describe("production gateway composition", () => {
       principalId: "owner", slackUserIds: [], telegramUserIds: [], telegramChatIds: [],
       tailscaleLoginNames: ["owner@example.test"], roles: ["owner"]
     };
-    const { http: _http, reconcile: _reconcile, ...baseDependencies } = dependencies(events);
+    const { http: _http, ...baseDependencies } = dependencies(events);
     const productionDependencies: GatewayProductionDependencies = {
       ...baseDependencies,
       httpOptions: {
         bindings: [owner], resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
         sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(1) }), peerAddress: () => "127.0.0.1",
         allowedOrigin: "https://hq.tailnet.example", csrfSigningKey: new Uint8Array(32).fill(2)
-      },
-      reconcile: async (services) => {
-        const approvalService = new ApprovalService(services.store);
-        for (const [commandId, riskLevel, operation] of [
-          ["command-l2", "L2", "commit_changes"],
-          ["command-l3", "L3", "deploy_production"]
-        ] as const) {
-          services.store.insertCommand({ commandId, idempotencyKey: `key-${commandId}`, channel: "tailscale-web", externalMessageId: commandId, principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: operation });
-          const proposal = {
-            proposalId: `proposal-${riskLevel}`, commandId, selectedProjectKey: "sandbox",
-            routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias"] }], allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel,
-            tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement" as const, preferredAgent: "codex" as const }]
-          };
-          services.store.saveExecutionProposal(proposal);
-          services.store.saveRun({ id: `run-${riskLevel}`, proposalId: proposal.proposalId, commandId, state: "active", recoveryContext: { proposal } });
-          approvalService.request({ approvalId: `approval-${riskLevel}`, proposal, operation, commandDigest: "a".repeat(64), channel: "tailscale-web", allowedChannels: ["tailscale-web"] });
-        }
       }
     };
     try {
       const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
       await composition.gateway.start();
+      const approvalService = new ApprovalService(composition.services.store);
+      for (const [commandId, riskLevel, operation] of [
+        ["command-l2", "L2", "commit_changes"],
+        ["command-l3", "L3", "deploy_production"]
+      ] as const) {
+        composition.services.store.insertCommand({ commandId, idempotencyKey: `key-${commandId}`, channel: "tailscale-web", externalMessageId: commandId, principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: operation });
+        const proposal = {
+          proposalId: `proposal-${riskLevel}`, commandId, selectedProjectKey: "sandbox",
+          routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias"] }], allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel,
+          tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement" as const, preferredAgent: "codex" as const }]
+        };
+        composition.services.store.saveExecutionProposal(proposal);
+        composition.services.store.saveRun({ id: `run-${riskLevel}`, proposalId: proposal.proposalId, commandId, state: "active", recoveryContext: { proposal } });
+        approvalService.request({ approvalId: `approval-${riskLevel}`, proposal, operation, commandDigest: "a".repeat(64), channel: "tailscale-web", allowedChannels: ["tailscale-web"] });
+      }
       const app = composition.services.httpApp;
       if (app === undefined) throw new Error("production http app missing");
       const login = await app.inject({ method: "POST", url: "/auth/session", headers: { "tailscale-user-login": "owner@example.test" } });
@@ -178,7 +194,7 @@ describe("production gateway composition", () => {
       principalId: "owner", slackUserIds: [], telegramUserIds: [], telegramChatIds: [],
       tailscaleLoginNames: ["owner@example.test"], roles: ["owner"]
     };
-    const { http: _http, reconcile: _reconcile, ...baseDependencies } = dependencies(events);
+    const { http: _http, ...baseDependencies } = dependencies(events);
     const productionDependencies: GatewayProductionDependencies = {
       ...baseDependencies,
       dispatchControl: {
@@ -189,17 +205,15 @@ describe("production gateway composition", () => {
         bindings: [owner], resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
         sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(1) }), peerAddress: () => "127.0.0.1",
         allowedOrigin: "https://hq.tailnet.example", csrfSigningKey: new Uint8Array(32).fill(2)
-      },
-      reconcile: async (services) => {
-        services.store.insertCommand({ commandId: "command-action", idempotencyKey: "key-action", channel: "tailscale-web", externalMessageId: "action", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
-        services.store.saveRun({ id: "run-action", proposalId: "proposal-action", commandId: "command-action", state: "active" });
-        services.store.saveTask({ id: "task-action", runId: "run-action", title: "수정", role: "implement", preferredAgent: "codex", dependsOn: [], state: "running" });
-        services.store.saveDispatch({ id: "dispatch-action", taskId: "task-action", state: "running" });
       }
     };
     try {
       const composition = await createProductionGateway({ databasePath: path, shutdownDrainMs: 1_000 }, productionDependencies);
       await composition.gateway.start();
+      composition.services.store.insertCommand({ commandId: "command-action", idempotencyKey: "key-action", channel: "tailscale-web", externalMessageId: "action", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z", text: "수정" });
+      composition.services.store.saveRun({ id: "run-action", proposalId: "proposal-action", commandId: "command-action", state: "active" });
+      composition.services.store.saveTask({ id: "task-action", runId: "run-action", title: "수정", role: "implement", preferredAgent: "codex", dependsOn: [], state: "running" });
+      composition.services.store.saveDispatch({ id: "dispatch-action", taskId: "task-action", state: "running" });
       const app = composition.services.httpApp;
       if (app === undefined) throw new Error("production http app missing");
       const login = await app.inject({ method: "POST", url: "/auth/session", headers: { "tailscale-user-login": "owner@example.test" } });

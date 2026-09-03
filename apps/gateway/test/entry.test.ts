@@ -1,7 +1,87 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { IdentityResolver, type PrincipalBinding } from "@orca-hq/core";
+import { OutboxDispatcher } from "@orca-hq/persistence";
+import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
+import { ExecutionService } from "@orca-hq/worker-routing";
 import { describe, expect, it } from "vitest";
 
 import { run } from "../src/entry.js";
-import type { GatewayProductionDependencies } from "../src/production.js";
+import {
+  createGatewayHost,
+  type GatewayExternalBoundaries
+} from "../src/host.js";
+
+const owner: PrincipalBinding = {
+  principalId: "owner",
+  slackUserIds: [],
+  telegramUserIds: ["10"],
+  telegramChatIds: ["20"],
+  tailscaleLoginNames: ["owner@example.test"],
+  roles: ["owner"]
+};
+
+function externalBoundaries(directory: string, events: string[]): GatewayExternalBoundaries {
+  const project = {
+    projectKey: "sandbox", orcaProjectId: "orca-sandbox", repoId: "repo-sandbox",
+    absolutePath: directory, aliases: ["sandbox"], component: "backend", defaultBaseRef: "main",
+    instructionsFiles: [], setupPolicy: "run", allowedOperations: ["L0", "L1"],
+    requiredChecks: ["pnpm test"], sensitivePaths: [], lockKey: "sandbox"
+  } as const;
+  const projectRegistryPath = join(directory, "projects.yaml");
+  writeFileSync(
+    projectRegistryPath,
+    `projects:\n${JSON.stringify([project], null, 2).replace(/^/gm, "  ")}`,
+    "utf8"
+  );
+  const ingress = (name: string) => ({
+    async start() { events.push(`${name}.started`); },
+    async stopIngress() { events.push(`${name}.stopped`); }
+  });
+  return {
+    settings: {
+      gateway: { databasePath: join(directory, "control.sqlite"), shutdownDrainMs: 1_000 },
+      projectRegistryPath,
+      discoveredProjects: [{ orcaProjectId: "orca-sandbox", absolutePath: directory, approved: true }],
+      assignmentArtifactRootDirectory: join(directory, "assignments"),
+      outboxWorkerId: "entry-test"
+    },
+    secrets: { async validate() { events.push("config.valid"); } },
+    orca: {
+      async health() { events.push("orca.checked"); return {} as never; },
+      async execute() { throw new Error("not used"); }
+    },
+    proposalModel: { async plan() { return { kind: "failure", reason: "invalid_command" }; } },
+    git: {
+      async repositoryStatus() { return { dirty: false, head: "a".repeat(40), branch: "main" }; },
+      async resolveRevision() { return "a".repeat(40); },
+      async branchOccupancy() { return []; },
+      async pathExists() { return false; },
+      async createWorktree() {}
+    },
+    verificationEvidence: {
+      collectImplementation() { throw new Error("not used"); },
+      collectVerifierCommands() { throw new Error("not used"); },
+      captureRepositorySnapshot() { throw new Error("not used"); }
+    },
+    httpOptions: {
+      bindings: [owner],
+      resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
+      sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(1) }),
+      peerAddress: () => "127.0.0.1",
+      allowedOrigin: "https://hq.tailnet.example",
+      csrfSigningKey: new Uint8Array(32).fill(2)
+    },
+    slack: ingress("slack"),
+    telegram: ingress("telegram"),
+    transactions: { async drain() { events.push("transactions.drained"); } },
+    outboundProviders: {},
+    dispatchControl: { async stop() { return false; }, async retry() { return false; } }
+  };
+}
 
 describe("gateway production entry", () => {
   it("fails closed with a redacted configuration error when no external secret host is configured", async () => {
@@ -16,20 +96,28 @@ describe("gateway production entry", () => {
     }
   });
 
-  it("uses the repository entry and production host path with injected external boundaries", async () => {
-    // Break caught: package entry requires an out-of-repository bootstrap before production composition can start.
+  it("runs host, entry and production with only external I/O boundaries", async () => {
+    // Break caught: host.ts accepts a prebuilt GatewayProductionDependencies object instead of assembling repository services.
+    const directory = await mkdtemp(join(tmpdir(), "orca-entry-host-"));
     const events: string[] = [];
-    const ingress = (name: string) => ({ async start() { events.push(`${name}.started`); }, async stopIngress() {} });
-    const dependencies: GatewayProductionDependencies = {
-      config: { async validate() { events.push("config.valid"); } },
-      orca: { async health() { events.push("orca.checked"); return {} as never; }, async execute() { throw new Error("not used"); } },
-      execution: {} as never, hq: { async plan() { return { kind: "failure", reason: "invalid_command" } as never; } }, projects: [], slackAdapter: {} as never, telegramAdapter: {} as never,
-      http: ingress("http"), slack: ingress("slack"), telegram: ingress("telegram"),
-      transactions: { async drain() {} },
-      outbox: { workerId: "entry-test", providers: {} },
-      dispatchControl: { async stop() { return false; }, async retry() { return false; } }
-    };
-    await run(async () => ({ config: { databasePath: ":memory:", shutdownDrainMs: 1_000 }, dependencies }));
-    expect(events).toEqual(["config.valid", "orca.checked", "http.started", "slack.started", "telegram.started"]);
+    try {
+      const composition = await run(() => createGatewayHost(async () => externalBoundaries(directory, events)));
+      expect(composition.gateway.status.kind).toBe("running");
+      expect(composition.services.execution).toBeInstanceOf(ExecutionService);
+      expect(composition.services.outbox).toBeInstanceOf(OutboxDispatcher);
+      expect(events).toEqual(["config.valid", "orca.checked", "slack.started", "telegram.started"]);
+      await composition.gateway.stop();
+      expect(events.slice(-3)).toEqual(["telegram.stopped", "slack.stopped", "transactions.drained"]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an external module that returns prebuilt production dependencies", async () => {
+    // Break caught: the default host loader silently trusts the old { config, dependencies } bootstrap contract.
+    await expect(createGatewayHost(async () => ({
+      config: { databasePath: ":memory:", shutdownDrainMs: 1_000 },
+      dependencies: {}
+    }))).rejects.toThrow("Gateway configuration or secret provider is unavailable");
   });
 });

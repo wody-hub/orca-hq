@@ -107,6 +107,16 @@ afterEach(() => {
 });
 
 describe("WorktreeLockService", () => {
+  it("reserves an editing lease before the lifecycle persists its Dispatch", () => {
+    // Break caught: ExecutionService acquires edit authority before planning a Dispatch, so a Dispatch FK makes production startup impossible.
+    const { locks } = setup();
+
+    expect(locks.acquire(lease("repo:a", "dispatch:future"))).toMatchObject({
+      kind: "acquired",
+      lease: { dispatchId: "dispatch:future" }
+    });
+  });
+
   it("allows only one editing lease per lock key", () => {
     const { locks } = setup("dispatch:1", "dispatch:2");
 

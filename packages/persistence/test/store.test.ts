@@ -21,6 +21,7 @@ import {
   openDatabase,
   type JsonValue
 } from "../src/index.js";
+import { initialMigration } from "../src/migrations/001-initial.js";
 
 const command = {
   commandId: "cmd-1",
@@ -588,7 +589,8 @@ describe("SQLite migrations", () => {
       "worktree_locks"
     ]);
     expect(database.prepare("SELECT version, name FROM schema_migrations").all()).toEqual([
-      { version: 1, name: "initial" }
+      { version: 1, name: "initial" },
+      { version: 2, name: "worktree-lock-reservations" }
     ]);
   });
 
@@ -604,6 +606,72 @@ describe("SQLite migrations", () => {
     expect(
       database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'principals'").get()
     ).toBeUndefined();
+  });
+
+  it("preserves existing leases while allowing pre-Dispatch reservations", () => {
+    // Break caught: rebuilding the v1 lock table can lose active leases or retain the ordering-invalid Dispatch FK.
+    const database = new Database(temporaryDatabasePath());
+    openDatabases.push(database);
+    database.pragma("foreign_keys = ON");
+    database.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    initialMigration.up(database);
+    database.prepare(`
+      INSERT INTO schema_migrations (version, name, applied_at)
+      VALUES (1, 'initial', '2026-09-01T00:00:00.000Z')
+    `).run();
+    const store = new ControlStore(database);
+    store.insertCommand(command);
+    store.saveRun({
+      id: "run-lock-migration",
+      proposalId: "proposal-lock-migration",
+      commandId: command.commandId,
+      state: "active"
+    });
+    store.saveTask({
+      id: "task-lock-migration",
+      runId: "run-lock-migration",
+      title: "Migrate lock",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "running"
+    });
+    store.saveDispatch({
+      id: "dispatch-lock-migration",
+      taskId: "task-lock-migration",
+      state: "running"
+    });
+    const existingLease = {
+      lockKey: "repo:existing",
+      commandId: command.commandId,
+      taskId: "task-lock-migration",
+      projectKey: "project-a",
+      worktreePath: "/srv/worktrees/existing",
+      branch: "dispatch/existing",
+      dispatchId: "dispatch-lock-migration",
+      acquiredAt: "2026-09-01T00:00:00.000Z",
+      heartbeatAt: "2026-09-01T00:00:00.000Z",
+      expiresAt: "2026-09-01T00:05:00.000Z"
+    };
+    store.acquireWorktreeLock(existingLease);
+
+    migrate(database);
+
+    expect(store.getWorktreeLock(existingLease.lockKey)).toEqual(existingLease);
+    expect(database.pragma("foreign_key_list(worktree_locks)")).toEqual([]);
+    expect(store.acquireWorktreeLock({
+      ...existingLease,
+      lockKey: "repo:future",
+      worktreePath: "/srv/worktrees/future",
+      branch: "dispatch/future",
+      dispatchId: "dispatch-not-persisted"
+    })).toMatchObject({ kind: "acquired", lease: { dispatchId: "dispatch-not-persisted" } });
   });
 
   it("opens databases in WAL mode with foreign keys enabled", () => {

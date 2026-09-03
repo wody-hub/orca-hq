@@ -467,6 +467,23 @@ describe("cross-model verification", () => {
     expect(store.tasks[1]?.taskId).not.toBe(task.taskId);
   });
 
+  it("does not resolve a delivery target while a failed verifier creates a Fix Task", async () => {
+    // Break caught: a missing channel destination must not block durable failure evidence or the bounded fix cycle.
+    const store = new MemoryVerificationStore();
+    const service = new VerificationService({
+      store,
+      completionTarget() {
+        throw new Error("delivery destination unavailable");
+      }
+    });
+    const task = await service.start(input);
+
+    await expect(service.complete(report(task, "fail"))).resolves.toMatchObject({
+      kind: "create_fix_task"
+    });
+    expect(store.commits[0]?.outboxMessage).toBeUndefined();
+  });
+
   it("requires intervention after two failed fix-and-verify cycles", async () => {
     // Break caught: an unbounded fix loop can run workers forever without user authority.
     const store = new MemoryVerificationStore();

@@ -1,8 +1,9 @@
 import Database from "better-sqlite3";
 
 import { initialMigration } from "./migrations/001-initial.js";
+import { worktreeLockReservationsMigration } from "./migrations/002-worktree-lock-reservations.js";
 
-const migrations = [initialMigration] as const;
+const migrations = [initialMigration, worktreeLockReservationsMigration] as const;
 
 export function migrate(database: Database.Database): void {
   database.exec(`

@@ -200,6 +200,10 @@ export type VerificationCompletionTarget = Readonly<{
   nextAttemptAt: string;
 }>;
 
+export type VerificationCompletionTargetResolver = (
+  report: VerificationReport
+) => MaybePromise<VerificationCompletionTarget>;
+
 export type VerificationAudit = Readonly<{
   subjectId: string;
   eventType: "verification.passed" | "verification.failed" | "verification.intervention_required";
@@ -375,6 +379,7 @@ function outboxFor(
       template: "intervention_required" as const,
       ...route,
       payload: {
+        text: "검증 개입 필요",
         state: "intervention_required",
         reportId: report.reportId,
         implementationTaskId: report.implementationTaskId,
@@ -388,6 +393,7 @@ function outboxFor(
     template: "success" as const,
     ...route,
     payload: {
+      text: "검증 완료",
       state: "verified_success",
       reportId: report.reportId,
       implementationTaskId: report.implementationTaskId,
@@ -407,7 +413,7 @@ function outboxFor(
 
 export class VerificationService {
   readonly #store: VerificationLifecycleStore;
-  readonly #completionTarget: VerificationCompletionTarget;
+  readonly #completionTarget: VerificationCompletionTargetResolver;
   readonly #tasks = new Map<string, VerificationTask>();
   readonly #completed = new Map<string, Readonly<{
     report: VerificationReport;
@@ -417,13 +423,16 @@ export class VerificationService {
 
   constructor(options: Readonly<{
     store: VerificationLifecycleStore;
-    completionTarget: VerificationCompletionTarget;
+    completionTarget: VerificationCompletionTarget | VerificationCompletionTargetResolver;
   }>) {
     this.#store = options.store;
-    if (options.completionTarget === undefined) {
+    const completionTarget = options.completionTarget;
+    if (completionTarget === undefined) {
       throw new TypeError("verification completion target is required");
     }
-    this.#completionTarget = deepFreeze({ ...options.completionTarget });
+    this.#completionTarget = typeof completionTarget === "function"
+      ? completionTarget
+      : () => deepFreeze<VerificationCompletionTarget>({ ...completionTarget });
   }
 
   async start(input: VerificationInput): Promise<VerificationTask> {
@@ -467,7 +476,9 @@ export class VerificationService {
     const fixTask = decision.kind === "create_fix_task"
       ? createFixTask(task, decision)
       : undefined;
-    const outboxMessage = outboxFor(report, decision, this.#completionTarget);
+    const outboxMessage = decision.kind === "create_fix_task"
+      ? undefined
+      : outboxFor(report, decision, await this.#completionTarget(report));
     const commit = deepFreeze({
       report,
       decision,
