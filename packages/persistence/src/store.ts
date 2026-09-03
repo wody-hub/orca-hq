@@ -2,11 +2,16 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  ApprovalConfirmationSchema,
+  ApprovalRecordSchema,
   ChannelMessageJsonSchema,
   CommandEnvelopeSchema,
   type ChannelMessageJson,
   type CommandEnvelope,
-  type CommandIngress
+  type CommandIngress,
+  type ApprovalConfirmation,
+  type ApprovalRecord,
+  type PersistedApproval
 } from "@orca-hq/core";
 import { OrcaReceiptSchema, parseOrcaOperationReceipt } from "@orca-hq/orca-adapter";
 import {
@@ -554,6 +559,12 @@ interface AuditEventRow {
   event_type: string;
   data_json: string;
   created_at: string;
+}
+
+interface ApprovalRow {
+  execution_proposal_id: string;
+  state: string;
+  payload_json: string;
 }
 
 interface WorktreeLockRow {
@@ -2714,6 +2725,111 @@ export class ControlStore implements CommandIngress {
         eventType: "outbox.delivery_failed",
         data: { channel, attempts, failure }
       });
+    }).immediate();
+  }
+
+  confirmApproval(approvalInput: ApprovalConfirmation): ApprovalRecord {
+    const approval = ApprovalConfirmationSchema.parse(approvalInput);
+    const record = ApprovalRecordSchema.parse({
+      approvalId: approval.approvalId,
+      proposalDigest: approval.proposalDigest,
+      operationDigest: approval.operationDigest,
+      principalId: approval.principalId,
+      channel: approval.channel,
+      approvedAt: approval.approvedAt,
+      expiresAt: approval.expiresAt,
+      ...(approval.typedPhraseDigest === undefined
+        ? {}
+        : { typedPhraseDigest: approval.typedPhraseDigest })
+    });
+    return this.database.transaction(() => {
+      const existing = this.database.prepare(`
+        SELECT execution_proposal_id, state, payload_json
+        FROM approvals WHERE id = ?
+      `).get(record.approvalId) as ApprovalRow | undefined;
+      if (existing !== undefined) {
+        const existingRecord = ApprovalRecordSchema.parse(parseJson(existing.payload_json));
+        if (
+          existing.execution_proposal_id !== approval.executionProposalId
+          || !isDeepStrictEqual(existingRecord, record)
+        ) {
+          throw new Error(`Approval ${record.approvalId} has conflicting confirmation content`);
+        }
+        return existingRecord;
+      }
+      const now = new Date().toISOString();
+      this.database.prepare(`
+        INSERT INTO approvals (
+          id, execution_proposal_id, state, payload_json, created_at, updated_at
+        ) VALUES (?, ?, 'approved', ?, ?, ?)
+      `).run(
+        record.approvalId,
+        approval.executionProposalId,
+        JSON.stringify(record),
+        now,
+        now
+      );
+      this.appendAudit({
+        subjectId: record.approvalId,
+        eventType: "approval.confirmed",
+        data: {}
+      });
+      return record;
+    }).immediate();
+  }
+
+  findApproval(approvalIdInput: string): PersistedApproval | undefined {
+    const approvalId = z.string().min(1).parse(approvalIdInput);
+    const row = this.database.prepare(`
+      SELECT state, payload_json FROM approvals WHERE id = ?
+    `).get(approvalId) as Pick<ApprovalRow, "state" | "payload_json"> | undefined;
+    if (row === undefined) return undefined;
+    return z.object({
+      approval: ApprovalRecordSchema,
+      state: z.enum(["approved", "consumed", "invalidated"])
+    }).strict().parse({
+      approval: parseJson(row.payload_json),
+      state: row.state
+    });
+  }
+
+  consumeApproval(approvalIdInput: string): boolean {
+    const approvalId = z.string().min(1).parse(approvalIdInput);
+    return this.database.transaction(() => {
+      const now = new Date().toISOString();
+      const result = this.database.prepare(`
+        UPDATE approvals SET state = 'consumed', updated_at = ?
+        WHERE id = ? AND state = 'approved'
+      `).run(now, approvalId);
+      if (result.changes === 0) return false;
+      this.appendAudit({
+        subjectId: approvalId,
+        eventType: "approval.consumed",
+        data: {}
+      });
+      return true;
+    }).immediate();
+  }
+
+  invalidateApproval(
+    approvalIdInput: string,
+    reasonInput: "digest_changed" | "manual"
+  ): boolean {
+    const approvalId = z.string().min(1).parse(approvalIdInput);
+    const reason = z.enum(["digest_changed", "manual"]).parse(reasonInput);
+    return this.database.transaction(() => {
+      const now = new Date().toISOString();
+      const result = this.database.prepare(`
+        UPDATE approvals SET state = 'invalidated', updated_at = ?
+        WHERE id = ? AND state = 'approved'
+      `).run(now, approvalId);
+      if (result.changes === 0) return false;
+      this.appendAudit({
+        subjectId: approvalId,
+        eventType: "approval.invalidated",
+        data: { reason }
+      });
+      return true;
     }).immediate();
   }
 

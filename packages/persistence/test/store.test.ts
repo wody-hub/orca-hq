@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { CommandEnvelope } from "@orca-hq/core";
+import type { ApprovalConfirmation, CommandEnvelope } from "@orca-hq/core";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZodError } from "zod";
@@ -64,6 +64,58 @@ afterEach(() => {
 });
 
 describe("ControlStore", () => {
+  it("persists, consumes, and audits an invalidated approval without persisting its phrase", () => {
+    // Break caught: a changed operation can retain an active approval or its L3 phrase in SQLite.
+    const database = openDatabase(temporaryDatabasePath());
+    openDatabases.push(database);
+    const store = new ControlStore(database);
+    store.insertCommand(command);
+    database.prepare(`
+      INSERT INTO execution_proposals (
+        id, command_id, project_registry_entry_id, state, payload_json, created_at, updated_at
+      ) VALUES (?, ?, NULL, 'proposed', '{}', ?, ?)
+    `).run("proposal-approval", command.commandId, "2026-09-01T10:00:00.000Z", "2026-09-01T10:00:00.000Z");
+    const approval = {
+      approvalId: "approval-1",
+      proposalDigest: "a".repeat(64),
+      operationDigest: "b".repeat(64),
+      principalId: "owner-1",
+      channel: "tailscale-web",
+      approvedAt: "2026-09-01T10:00:00.000Z",
+      expiresAt: "2026-09-01T10:15:00.000Z",
+      typedPhraseDigest: "c".repeat(64),
+      executionProposalId: "proposal-approval"
+    } satisfies ApprovalConfirmation;
+
+    expect(store.confirmApproval(approval)).toEqual(
+      expect.objectContaining({ approvalId: approval.approvalId, typedPhraseDigest: approval.typedPhraseDigest })
+    );
+    expect(store.findApproval(approval.approvalId)).toEqual({
+      approval: expect.objectContaining({ approvalId: approval.approvalId }),
+      state: "approved"
+    });
+    expect(store.consumeApproval(approval.approvalId)).toBe(true);
+    expect(store.consumeApproval(approval.approvalId)).toBe(false);
+
+    const changed = { ...approval, approvalId: "approval-changed" } satisfies ApprovalConfirmation;
+    store.confirmApproval(changed);
+    expect(store.invalidateApproval(changed.approvalId, "digest_changed")).toBe(true);
+    expect(store.findApproval(changed.approvalId)).toEqual({
+      approval: expect.objectContaining({ approvalId: changed.approvalId }),
+      state: "invalidated"
+    });
+    expect(store.listAuditEvents()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subjectId: changed.approvalId,
+        eventType: "approval.invalidated",
+        data: { reason: "digest_changed" }
+      })
+    ]));
+    const storedPayload = database.prepare("SELECT payload_json FROM approvals WHERE id = ?")
+      .get(changed.approvalId) as { payload_json: string };
+    expect(storedPayload.payload_json).not.toContain("APPROVE ");
+  });
+
   it("keeps one command, inbox event, and audit for an exact composite redelivery", () => {
     const store = testStore();
     const redelivery = { ...command, commandId: "cmd-redelivered" };
