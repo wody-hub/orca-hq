@@ -21,6 +21,15 @@ import { classifyRisk } from "./policy.js";
 const APPROVAL_WINDOW_MS = 15 * 60 * 1_000;
 const SHA_256 = /^[a-f0-9]{64}$/;
 
+export class ApprovalRequestPersistenceError extends Error {
+  readonly code = "proposal_not_persisted" as const;
+
+  constructor() {
+    super("approval request requires a persisted execution proposal");
+    this.name = "ApprovalRequestPersistenceError";
+  }
+}
+
 function freeze<T>(value: T): Readonly<T> {
   return Object.freeze(value);
 }
@@ -73,6 +82,13 @@ function sameValue(left: unknown, right: unknown): boolean {
   return isDeepStrictEqual(left, right);
 }
 
+function isForeignKeyConstraint(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === "SQLITE_CONSTRAINT_FOREIGNKEY";
+}
+
 export class ApprovalService {
   constructor(private readonly store: ApprovalStore) {}
 
@@ -98,7 +114,12 @@ export class ApprovalService {
       })
     }));
     const { operationPhrase: _operationPhrase, ...persistedRequest } = request;
-    this.store.persistApprovalRequest(PersistedApprovalRequestSchema.parse(persistedRequest));
+    try {
+      this.store.persistApprovalRequest(PersistedApprovalRequestSchema.parse(persistedRequest));
+    } catch (error) {
+      if (isForeignKeyConstraint(error)) throw new ApprovalRequestPersistenceError();
+      throw error;
+    }
     return request;
   }
 

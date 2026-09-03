@@ -2,7 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ApprovalConfirmation, CommandEnvelope, PersistedApprovalRequest } from "@orca-hq/core";
+import {
+  ApprovalService,
+  type ApprovalConfirmation,
+  type CommandEnvelope,
+  type ExecutionProposal,
+  type PersistedApprovalRequest,
+  type PrincipalBinding
+} from "@orca-hq/core";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZodError } from "zod";
@@ -35,6 +42,39 @@ const outboxMessage = {
   nextAttemptAt: "2026-09-01T00:00:00.000Z"
 };
 
+const approvalOwner = {
+  principalId: "owner-1",
+  slackUserIds: ["U1"],
+  telegramUserIds: [],
+  telegramChatIds: [],
+  tailscaleLoginNames: ["owner@example.test"],
+  roles: ["owner"]
+} satisfies PrincipalBinding;
+
+function approvalProposal(overrides: Partial<ExecutionProposal> = {}): ExecutionProposal {
+  return {
+    proposalId: "proposal-approval-service",
+    commandId: command.commandId,
+    selectedProjectKey: "project-a",
+    routeCandidates: [{ projectKey: "project-a", score: 1, evidence: ["explicit"] }],
+    baseRef: "main",
+    allowedScope: ["src/**"],
+    prohibitedEffects: ["delete_data"],
+    acceptanceCommands: ["pnpm test"],
+    riskLevel: "L3",
+    tasks: [{ localId: "implement", title: "Implement", dependsOn: [], role: "implement", preferredAgent: "codex" }],
+    ...overrides
+  };
+}
+
+function persistExecutionProposal(database: Database.Database, proposal: ExecutionProposal): void {
+  database.prepare(`
+    INSERT INTO execution_proposals (
+      id, command_id, project_registry_entry_id, state, payload_json, created_at, updated_at
+    ) VALUES (?, ?, NULL, 'proposed', '{}', ?, ?)
+  `).run(proposal.proposalId, proposal.commandId, "2026-09-01T10:00:00.000Z", "2026-09-01T10:00:00.000Z");
+}
+
 const temporaryDirectories: string[] = [];
 const openDatabases: Array<{ close(): void }> = [];
 
@@ -64,6 +104,72 @@ afterEach(() => {
 });
 
 describe("ControlStore", () => {
+  it("converts an unpersisted approval proposal into a stable domain error", () => {
+    // Break caught: an ordinary proposal-save ordering error leaks a raw SQLite foreign-key error from request().
+    const database = openDatabase(temporaryDatabasePath());
+    openDatabases.push(database);
+    const store = new ControlStore(database);
+    const service = new ApprovalService(store);
+
+    let thrown: unknown;
+    try {
+      service.request({
+        approvalId: "approval-unpersisted-proposal",
+        proposal: approvalProposal({ proposalId: "proposal-not-yet-persisted", riskLevel: "L2" }),
+        operation: "create_pull_request",
+        commandDigest: "a".repeat(64),
+        channel: "slack",
+        allowedChannels: ["slack"]
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({
+      name: "ApprovalRequestPersistenceError",
+      code: "proposal_not_persisted",
+      message: "approval request requires a persisted execution proposal"
+    });
+    expect(thrown).not.toMatchObject({ code: "SQLITE_CONSTRAINT_FOREIGNKEY" });
+    expect(store.findApproval("approval-unpersisted-proposal")).toBeUndefined();
+  });
+
+  it("confirms and consumes a JSON-round-tripped L3 approval through ControlStore", () => {
+    // Break caught: JSON serialization changes a valid request and makes ApprovalService reject it as tampered.
+    const database = openDatabase(temporaryDatabasePath());
+    openDatabases.push(database);
+    const store = new ControlStore(database);
+    store.insertCommand(command);
+    const proposal = approvalProposal();
+    persistExecutionProposal(database, proposal);
+    const service = new ApprovalService(store);
+
+    const request = service.request({
+      approvalId: "approval-service-durable",
+      proposal,
+      operation: "deploy_production",
+      commandDigest: "a".repeat(64),
+      channel: "slack",
+      allowedChannels: ["slack"]
+    });
+    const confirmation = service.confirm(
+      request,
+      approvalOwner,
+      new Date("2026-09-01T10:00:00.000Z"),
+      request.operationPhrase
+    );
+
+    expect(confirmation).toEqual({ kind: "approved", id: request.approvalId });
+    expect(service.validate(request.approvalId, request.digest, new Date("2026-09-01T10:01:00.000Z")))
+      .toEqual({ kind: "approved" });
+    expect(store.findApproval(request.approvalId)).toEqual(expect.objectContaining({ state: "consumed" }));
+    expect(store.listAuditEvents()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subjectId: request.approvalId, eventType: "approval.requested", data: {} }),
+      expect.objectContaining({ subjectId: request.approvalId, eventType: "approval.confirmed", data: {} }),
+      expect.objectContaining({ subjectId: request.approvalId, eventType: "approval.consumed", data: {} })
+    ]));
+  });
+
   it("durably persists a redacted pending approval request across a restart", () => {
     // Break caught: an approval request only exists in process memory until it is confirmed.
     const path = temporaryDatabasePath();
