@@ -30,6 +30,37 @@ const createApp = (options: {
 const trustedHeaders = { "tailscale-user-login": "owner@example.test" };
 
 describe("gateway HTTP authentication boundary", () => {
+  it("serves configured static assets and SPA routes without swallowing API or auth misses", async () => {
+    // Break caught: a dashboard deep link 404s, or an unknown protected route is masked by index.html.
+    const app = createHttpApp({
+      bindings: [owner],
+      resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
+      sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(7) }),
+      peerAddress: () => "127.0.0.1",
+      webAssets: {
+        async asset(path) {
+          return path === "/assets/app.js"
+            ? { contentType: "text/javascript", body: "console.log('safe')" }
+            : undefined;
+        },
+        async indexHtml() {
+          return "<!doctype html><div id=\"root\"></div>";
+        }
+      }
+    });
+    try {
+      const asset = await app.inject({ method: "GET", url: "/assets/app.js" });
+      expect(asset.statusCode).toBe(200);
+      expect(asset.headers["content-type"]).toContain("text/javascript");
+      expect(asset.body).toContain("console.log");
+      expect((await app.inject({ method: "GET", url: "/commands/command-1" })).statusCode).toBe(200);
+      expect((await app.inject({ method: "GET", url: "/api/missing" })).statusCode).toBe(404);
+      expect((await app.inject({ method: "GET", url: "/auth/missing" })).statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("returns only unauthorized without calling protected work when the session is absent", async () => {
     // Break caught: an unauthenticated request reads command metadata before the session boundary.
     const onCommands = vi.fn();

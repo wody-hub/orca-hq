@@ -16,7 +16,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: "orca-hq-web",
-          include: ["apps/web/src/**/*.test.tsx"],
+          include: ["apps/web/src/**/*.test.{ts,tsx}"],
           environment: "jsdom"
         }
       }

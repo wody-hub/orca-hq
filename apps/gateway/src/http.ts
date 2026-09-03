@@ -20,6 +20,13 @@ export type { ApprovalConfirmationPort } from "./routes/approvals.js";
 export type { CommandDashboardPort } from "./routes/commands.js";
 export type { ProjectDashboardPort } from "./routes/projects.js";
 
+export interface GatewayWebAssetsPort {
+  /** Returns only a prebuilt public asset; request paths are never mapped directly to the filesystem. */
+  asset(path: string): Promise<Readonly<{ contentType: string; body: string | Uint8Array }> | undefined>;
+  /** The prebuilt SPA entry document used for client-side dashboard routes. */
+  indexHtml(): Promise<string | Uint8Array>;
+}
+
 export interface GatewayHttpOptions {
   readonly bindings: readonly PrincipalBinding[];
   readonly resolver: IdentityResolver;
@@ -36,6 +43,8 @@ export interface GatewayHttpOptions {
   readonly approvals?: ApprovalConfirmationPort;
   /** Adapter supplied by Task 5, which owns durable idempotency and redacted audit writes. */
   readonly actions?: DispatchActionPort;
+  /** Optional prebuilt dashboard asset source. API and authentication routes never use its SPA fallback. */
+  readonly webAssets?: GatewayWebAssetsPort;
   /** @deprecated retained only for the Task 2 authentication route test. */
   readonly onCommands?: (principal: AuthenticatedPrincipal) => unknown | Promise<unknown>;
 }
@@ -186,6 +195,19 @@ export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
   registerProjectRoutes(app, context, options.projects);
   registerApprovalRoutes(app, context, options.approvals);
   registerActionRoutes(app, context, options.actions);
+
+  app.get("/*", async (request, reply) => {
+    const path = request.url.split("?", 1)[0] ?? "/";
+    if (path.startsWith("/api/") || path === "/api" || path.startsWith("/auth/") || path === "/auth") {
+      return notFound(reply);
+    }
+    if (options.webAssets === undefined) return notFound(reply);
+    const asset = await options.webAssets.asset(path);
+    if (asset !== undefined) return reply.type(asset.contentType).send(asset.body);
+    // Requests naming a missing file should remain 404; extension-less paths are dashboard routes.
+    if (path.split("/").at(-1)?.includes(".") === true) return notFound(reply);
+    return reply.type("text/html; charset=utf-8").send(await options.webAssets.indexHtml());
+  });
 
   return app;
 }
