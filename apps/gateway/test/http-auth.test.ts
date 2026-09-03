@@ -1,0 +1,114 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { IdentityResolver, type PrincipalBinding } from "@orca-hq/core";
+import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
+import { createHttpApp } from "../src/http.js";
+
+const owner = {
+  principalId: "owner",
+  slackUserIds: [],
+  telegramUserIds: [],
+  telegramChatIds: [],
+  tailscaleLoginNames: ["owner@example.test"],
+  roles: ["owner"]
+} satisfies PrincipalBinding;
+
+const createApp = (options: {
+  peerAddress?: string;
+  onCommands?: (principal: { principalId: string }) => unknown;
+} = {}) => {
+  const resolver = new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] });
+  return createHttpApp({
+    bindings: [owner],
+    resolver,
+    sessions: createLocalSessionService({ signingKey: new Uint8Array(32).fill(7) }),
+    peerAddress: () => options.peerAddress ?? "127.0.0.1",
+    onCommands: options.onCommands
+  });
+};
+
+const trustedHeaders = { "tailscale-user-login": "owner@example.test" };
+
+describe("gateway HTTP authentication boundary", () => {
+  it("returns only unauthorized without calling protected work when the session is absent", async () => {
+    // Break caught: an unauthenticated request reads command metadata before the session boundary.
+    const onCommands = vi.fn();
+    const app = createApp({ onCommands });
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/commands", headers: trustedHeaders });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: "unauthorized" });
+      expect(onCommands).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("issues a secure local session only for a trusted allowlisted login", async () => {
+    // Break caught: a direct client can obtain an authenticated local cookie by setting a Tailscale header.
+    const app = createApp();
+    try {
+      const response = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
+      expect(response.statusCode).toBe(204);
+      expect(response.headers["set-cookie"]).toContain("__Host-orca_hq_session=");
+      expect(response.headers["set-cookie"]).toContain("Secure");
+      expect(response.headers["set-cookie"]).toContain("HttpOnly");
+      expect(response.headers["set-cookie"]).toContain("SameSite=Strict");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects spoofed headers from a non-loopback peer", async () => {
+    // Break caught: an untrusted peer can impersonate a tailnet login through a request header.
+    const app = createApp({ peerAddress: "192.0.2.10" });
+    try {
+      const response = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: "unauthorized" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns only unauthorized without calling protected work for a tampered session", async () => {
+    // Break caught: a forged cookie reaches the command query despite failing local-session verification.
+    const onCommands = vi.fn();
+    const app = createApp({ onCommands });
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/commands",
+        headers: { ...trustedHeaders, cookie: "__Host-orca_hq_session=forged" }
+      });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: "unauthorized" });
+      expect(onCommands).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("calls protected work only after the current login and cookie agree", async () => {
+    // Break caught: an old or mismatched session can invoke the protected command query.
+    const onCommands = vi.fn((principal: { principalId: string }) => ({
+      principalId: principal.principalId,
+      commands: []
+    }));
+    const app = createApp({ onCommands });
+    try {
+      const issued = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
+      const sessionCookie = issued.headers["set-cookie"]?.split(";")[0];
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/commands",
+        headers: { ...trustedHeaders, cookie: sessionCookie }
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ principalId: "owner", commands: [] });
+      expect(onCommands).toHaveBeenCalledWith(expect.objectContaining({ principalId: "owner" }));
+    } finally {
+      await app.close();
+    }
+  });
+});

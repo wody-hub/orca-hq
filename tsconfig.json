@@ -8,9 +8,10 @@
       "@orca-hq/orca-adapter": ["packages/orca-adapter/src/index.ts"],
       "@orca-hq/persistence": ["packages/persistence/src/index.ts"],
       "@orca-hq/project-registry": ["packages/project-registry/src/index.ts"],
+      "@orca-hq/tailscale-adapter": ["packages/tailscale-adapter/src/index.ts"],
       "@orca-hq/voice": ["packages/voice/src/index.ts"],
       "@orca-hq/worker-routing": ["packages/worker-routing/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "vitest.config.ts"]
+  "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "vitest.config.ts"]
 }

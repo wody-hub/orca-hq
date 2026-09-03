@@ -9,7 +9,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: "orca-hq",
-          include: ["packages/*/test/**/*.test.ts"]
+          include: ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts"]
         }
       }
     ]
@@ -25,6 +25,9 @@ export default defineConfig({
       ),
       "@orca-hq/project-registry": fileURLToPath(
         new URL("./packages/project-registry/src/index.ts", import.meta.url)
+      ),
+      "@orca-hq/tailscale-adapter": fileURLToPath(
+        new URL("./packages/tailscale-adapter/src/index.ts", import.meta.url)
       ),
       "@orca-hq/voice": fileURLToPath(new URL("./packages/voice/src/index.ts", import.meta.url)),
       "@orca-hq/worker-routing": fileURLToPath(
