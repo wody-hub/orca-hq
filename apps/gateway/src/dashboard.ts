@@ -119,12 +119,14 @@ export function createCommandDashboard(store: ControlStore): CommandDashboardPor
         };
       });
       const commandAudit = store.listAuditEvents().filter((event) => event.subjectId === commandId).at(-1);
-      const persistedApprovals = proposal === undefined ? [] : store.listApprovals()
-        .filter((item) => item.request.proposal.proposalId === proposal.proposalId);
-      const persistedApproval = persistedApprovals.at(-1);
-      const approvalHistory = persistedApprovals.slice(-DASHBOARD_HISTORY_LIMIT).reverse()
+      const commandApprovals = store.listApprovals()
+        .filter((item) => item.request.proposal.commandId === commandId);
+      const persistedApproval = proposal === undefined ? undefined : commandApprovals
+        .filter((item) => item.request.proposal.proposalId === proposal.proposalId)
+        .at(-1);
+      const approvalHistory = commandApprovals.slice(-DASHBOARD_HISTORY_LIMIT).reverse()
         .map(approvalHistoryItem);
-      const auditSubjects = new Set([commandId, ...persistedApprovals.map((item) => item.request.approvalId)]);
+      const auditSubjects = new Set([commandId, ...commandApprovals.map((item) => item.request.approvalId)]);
       const auditHistory = store.listAuditEvents()
         .filter((event) => auditSubjects.has(event.subjectId))
         .slice(-DASHBOARD_HISTORY_LIMIT)

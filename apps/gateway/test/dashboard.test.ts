@@ -86,36 +86,53 @@ describe("production command dashboard", () => {
         externalMessageId: "history", principalId: "owner", receivedAt: "2026-09-03T00:00:00.000Z",
         text: "승인 이력 확인"
       });
-      const proposal: ExecutionProposal = {
-        proposalId: "proposal-history", commandId: "command-history", selectedProjectKey: "sandbox",
+      const expiredProposal: ExecutionProposal = {
+        proposalId: "proposal-history-expired", commandId: "command-history", selectedProjectKey: "sandbox",
         routeCandidates: [{ projectKey: "sandbox", score: 1, evidence: ["alias:sandbox"] }],
         allowedScope: ["src"], prohibitedEffects: [], acceptanceCommands: ["pnpm test"], riskLevel: "L2",
         tasks: [{ localId: "implement", title: "수정", dependsOn: [], role: "implement", preferredAgent: "codex" }]
       };
+      const currentProposal: ExecutionProposal = {
+        ...expiredProposal,
+        proposalId: "proposal-history-current",
+        prohibitedEffects: ["deploy"]
+      };
       store.saveRun({
-        id: "run-history", proposalId: proposal.proposalId, commandId: proposal.commandId,
-        state: "waiting_approval", recoveryContext: { proposal }
+        id: "run-01-history-expired", proposalId: expiredProposal.proposalId,
+        commandId: expiredProposal.commandId, state: "waiting_approval",
+        recoveryContext: { proposal: expiredProposal }
       });
-      store.saveExecutionProposal(proposal);
-      const proposalHash = proposalDigest(proposal);
-      const operationHash = approvalOperationDigest({
-        proposalDigest: proposalHash, operation: "create_pull_request", commandDigest: "a".repeat(64)
+      store.saveRun({
+        id: "run-02-history-current", proposalId: currentProposal.proposalId,
+        commandId: currentProposal.commandId, state: "waiting_approval",
+        recoveryContext: { proposal: currentProposal }
       });
-      const request = (approvalId: string) => ({
-        approvalId, proposal, operation: "create_pull_request", commandDigest: "a".repeat(64),
-        channel: "tailscale-web" as const, allowedChannels: ["tailscale-web" as const],
-        proposalDigest: proposalHash, digest: operationHash, riskLevel: "L2" as const
-      });
+      store.saveExecutionProposal(expiredProposal);
+      store.saveExecutionProposal(currentProposal);
+      const request = (approvalId: string, proposal: ExecutionProposal) => {
+        const proposalHash = proposalDigest(proposal);
+        return {
+          approvalId, proposal, operation: "create_pull_request", commandDigest: "a".repeat(64),
+          channel: "tailscale-web" as const, allowedChannels: ["tailscale-web" as const],
+          proposalDigest: proposalHash,
+          digest: approvalOperationDigest({
+            proposalDigest: proposalHash, operation: "create_pull_request", commandDigest: "a".repeat(64)
+          }),
+          riskLevel: "L2" as const
+        };
+      };
 
-      store.persistApprovalRequest(request("approval-expired"));
+      const expiredRequest = request("approval-expired", expiredProposal);
+      store.persistApprovalRequest(expiredRequest);
       store.confirmApproval({
-        approvalId: "approval-expired", proposalDigest: proposalHash, operationDigest: operationHash,
+        approvalId: "approval-expired", proposalDigest: expiredRequest.proposalDigest,
+        operationDigest: expiredRequest.digest,
         principalId: "owner", channel: "tailscale-web", approvedAt: "2026-09-03T00:00:00.000Z",
-        expiresAt: "2026-09-03T00:15:00.000Z", executionProposalId: proposal.proposalId
+        expiresAt: "2026-09-03T00:15:00.000Z", executionProposalId: expiredProposal.proposalId
       });
       store.recordApprovalAudit("approval-expired", "approval.denied", "replayed");
       expect(store.expireApproval("approval-expired")).toBe(true);
-      store.persistApprovalRequest(request("approval-invalidated"));
+      store.persistApprovalRequest(request("approval-invalidated", currentProposal));
       expect(store.invalidateApproval("approval-invalidated", "manual")).toBe(true);
 
       const detail = await createCommandDashboard(store).getCommand({
