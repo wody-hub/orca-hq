@@ -6,10 +6,12 @@ type GatewayHostBootstrap = () => Promise<Readonly<{
   dependencies: GatewayProductionDependencies;
 }>>;
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
   const moduleUrl = process.env.GATEWAY_HOST_BOOTSTRAP;
   if (moduleUrl === undefined || !moduleUrl.startsWith("file:")) {
-    throw new Error("GATEWAY_HOST_BOOTSTRAP must name a local typed host bootstrap module");
+    // Deliberately redacted: a process without its injected secret/client host
+    // fails closed as configuration, never as a missing repository module.
+    throw new Error("Gateway configuration or secret provider is unavailable");
   }
   const loaded = await import(moduleUrl) as unknown;
   if (typeof loaded !== "object" || loaded === null || !("createGatewayHost" in loaded)
@@ -20,4 +22,6 @@ async function run(): Promise<void> {
   await startProductionGateway(host.config, host.dependencies);
 }
 
-void run();
+if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  void run();
+}

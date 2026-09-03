@@ -1229,6 +1229,15 @@ export class ControlStore implements CommandIngress {
     });
   }
 
+  /** Redacted durable run projections for dashboard/query adapters. */
+  listRunRecords(): JsonValue[] {
+    const rows = this.database.prepare(`SELECT id, state, payload_json FROM runs ORDER BY created_at, id`)
+      .all() as Array<{ id: string; state: string; payload_json: string }>;
+    return rows.map((row) => JsonValueSchema.parse({
+      ...objectValue(parseJson(row.payload_json)), id: row.id, state: row.state
+    }));
+  }
+
   loadTaskRecord(idInput: unknown): JsonValue | undefined {
     const id = z.string().min(1).parse(idInput);
     const row = this.database.prepare(`SELECT id, run_id, state, payload_json FROM tasks WHERE id = ?`)

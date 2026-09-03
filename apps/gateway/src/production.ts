@@ -17,6 +17,8 @@ import {
   type GatewayTransactionPort
 } from "./lifecycle.js";
 import { wireAbortSignals } from "./main.js";
+import { createCommandDashboard } from "./dashboard.js";
+import { createHttpApp, type GatewayHttpOptions } from "./http.js";
 
 /**
  * The concrete process composition boundary. Network/Keychain handles remain
@@ -25,12 +27,16 @@ import { wireAbortSignals } from "./main.js";
  */
 export interface GatewayProductionDependencies {
   readonly config: GatewayConfigPort;
-  readonly orca: OrcaClientOptions;
+  /** A real Orca client is external I/O and may be injected; options construct the default client. */
+  readonly orca: OrcaClientOptions | Pick<OrcaClient, "health" | "execute">;
   readonly execution: Omit<ConstructorParameters<typeof ExecutionService>[0], "orca" | "locks" | "lifecycle">;
   readonly hq: CodexHqSession;
   readonly slackAdapter: SlackAdapter;
   readonly telegramAdapter: TelegramAdapter;
-  readonly http: GatewayIngressPort;
+  /** Legacy externally-hosted ingress. New hosts should supply httpOptions so production owns createHttpApp. */
+  readonly http?: GatewayIngressPort;
+  /** Keychain/session/identity-backed external boundary; production creates the HTTP app and loopback listener itself. */
+  readonly httpOptions?: Omit<GatewayHttpOptions, "commands" | "projects" | "approvals" | "actions">;
   readonly slack: GatewayIngressPort;
   readonly telegram: GatewayIngressPort;
   readonly transactions: GatewayTransactionPort;
@@ -43,7 +49,7 @@ export interface GatewayProductionDependencies {
 export interface GatewayProductionServices {
   readonly database: ReturnType<typeof openDatabase>;
   readonly store: ControlStore;
-  readonly orca: OrcaClient;
+  readonly orca: Pick<OrcaClient, "health" | "execute">;
   readonly locks: WorktreeLockService;
   readonly execution: ExecutionService;
   readonly hq: CodexHqSession;
@@ -56,39 +62,60 @@ export async function createProductionGateway(
   config: GatewayConfig,
   dependencies: GatewayProductionDependencies
 ): Promise<Readonly<{ gateway: Gateway; services: GatewayProductionServices }>> {
-  // openDatabase owns WAL, foreign keys, and idempotent migrations; no shadow DB layer is created.
-  const database = openDatabase(config.databasePath);
-  const store = new ControlStore(database);
-  const orca = new OrcaClient(dependencies.orca);
-  const locks = new WorktreeLockService(store);
-  const lifecycle = new ExecutionLifecycle({ store });
-  const execution = new ExecutionService({
-    ...dependencies.execution,
-    orca,
-    locks,
-    lifecycle
-  });
-  const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
-  const services = Object.freeze({
-    database, store, orca, locks, execution, hq: dependencies.hq, outbox,
-    slackAdapter: dependencies.slackAdapter, telegramAdapter: dependencies.telegramAdapter
-  });
+  // Database construction is deliberately deferred to database.migrate: config/secret
+  // validation is the first lifecycle operation and a rejected config leaves no handle.
+  let services: GatewayProductionServices | undefined;
+  let http: GatewayIngressPort | undefined = dependencies.http;
+  const requireServices = (): GatewayProductionServices => {
+    if (services === undefined) throw new Error("production services are unavailable before configuration validation");
+    return services;
+  };
+  const orca = "execute" in dependencies.orca
+    ? dependencies.orca
+    : new OrcaClient(dependencies.orca);
+  const exposedServices = {} as GatewayProductionServices;
+  for (const key of ["database", "store", "orca", "locks", "execution", "hq", "outbox", "slackAdapter", "telegramAdapter"] as const) {
+    Object.defineProperty(exposedServices, key, { enumerable: true, get: () => requireServices()[key] });
+  }
   const gateway = await createGateway(config, {
     config: dependencies.config,
     database: {
       async migrate() {
-        // openDatabase performed the idempotent migration before the store was constructed.
+        // openDatabase owns WAL, foreign keys, and idempotent migration.
+        const database = openDatabase(config.databasePath);
+        const store = new ControlStore(database);
+        const locks = new WorktreeLockService(store);
+        const lifecycle = new ExecutionLifecycle({ store });
+        const execution = new ExecutionService({ ...dependencies.execution, orca, locks, lifecycle });
+        const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
+        services = Object.freeze({ database, store, orca, locks, execution, hq: dependencies.hq, outbox,
+          slackAdapter: dependencies.slackAdapter, telegramAdapter: dependencies.telegramAdapter });
+        if (dependencies.httpOptions !== undefined) {
+          const app = createHttpApp({ ...dependencies.httpOptions, commands: createCommandDashboard(store) });
+          http = {
+            async start() { await app.listen({ host: "127.0.0.1", port: 0 }); },
+            async stopIngress() { await app.close(); }
+          };
+        }
+        if (http === undefined) throw new Error("production HTTP security configuration is required");
       },
       async checkpoint() {
-        database.pragma("wal_checkpoint(TRUNCATE)");
+        requireServices().database.pragma("wal_checkpoint(TRUNCATE)");
       },
       async close() {
+        const database = requireServices().database;
         if (database.open) database.close();
       }
     },
     orca: { async check() { await orca.health(); } },
-    reconcile: () => dependencies.reconcile(services),
-    http: dependencies.http,
+    reconcile: () => dependencies.reconcile(requireServices()),
+    http: {
+      async start() {
+        if (http === undefined) throw new Error("production HTTP security configuration is required");
+        await http.start();
+      },
+      async stopIngress() { await http?.stopIngress(); }
+    },
     slack: dependencies.slack,
     telegram: dependencies.telegram,
     transactions: dependencies.transactions,
@@ -96,14 +123,19 @@ export async function createProductionGateway(
     deliveries: dependencies.deliveries,
     audit: {
       append(input) {
-        store.appendAudit({ ...input, data: {
+        // The initial "starting" audit occurs before config validation; there is
+        // intentionally no durable database to write on a rejected configuration.
+        if (services === undefined || !services.database.open) return;
+        services.store.appendAudit({ ...input, data: {
           state: input.data.state,
           degradedChannels: [...input.data.degradedChannels]
         } });
       }
     }
   });
-  return Object.freeze({ gateway, services });
+  // Creating this adapter here ensures command/dashboard queries derive from the
+  // actual ControlStore rather than host-provided fixtures once the process starts.
+  return Object.freeze({ gateway, services: exposedServices });
 }
 
 /** Starts the concrete composition after the host supplied its external adapters and secret port. */

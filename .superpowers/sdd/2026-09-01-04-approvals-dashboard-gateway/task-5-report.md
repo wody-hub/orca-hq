@@ -138,3 +138,39 @@ git diff --check                               exit 0
 - 변경 파일: `apps/gateway/{package.json,src/{entry,production,http,lifecycle,routes/commands}.ts,test/{api,end-to-end,http-auth,lifecycle}.test.ts}`, `apps/web/{src/{api,app.test,routes/command-detail}.tsx,e2e/mobile-dashboard.spec.ts}`, `tsconfig.json`, `pnpm-lock.yaml`.
 - 커밋은 이 수정 절 작성 뒤 의도된 파일만 stage하여 생성한다. 사용자 소유 roadmap은 읽거나 stage하지 않았다.
 - 남은 우려: production host module은 deployment 환경이 typed external clients와 Keychain secret port를 제공해야 하며, 이 저장소의 테스트는 실제 credential 또는 provider connection을 생성하지 않는다.
+
+## 수정 2차
+
+### 구현 및 데이터 흐름
+
+- `production.ts`는 DB open/migration을 lifecycle의 `config.validate` 뒤로 지연했다. 따라서 config 또는 Keychain secret 검증 거부 시 SQLite handle/file과 ingress가 생기지 않으며, 시작 뒤에는 concrete `openDatabase`/`ControlStore`/lock/execution/outbox 조립을 한 번만 수행한다.
+- `dashboard.ts`의 `createCommandDashboard`는 `ControlStore`의 command/run/task/dispatch/audit/outbox durable record에서 목록·상세를 계산한다. run/task/dispatch가 없거나 terminal이 아닌 경우는 `pending`과 빈 evidence를 사용하며, dispatch 상태표가 `canStop`/`canRetry`를 서버에서 계산한다.
+- lifecycle 취소 cleanup의 소유자를 stop path로 통일해, HTTP 또는 Slack/Telegram 시작 경계에서 취소되어도 ingress stop → transaction drain → WAL checkpoint → DB close를 보장했다. entry는 host module 부재를 노출하지 않고 redacted config/secret 오류로 fail-closed 한다.
+
+### TDD RED/GREEN
+
+- RED: `stops ... ingress before drain and durable close ...` parameterized lifecycle test는 기존 코드에서 `db.closed`가 `http.stopped`/drain보다 먼저 나오는 것을 재현했다.
+- GREEN: `pnpm vitest run apps/gateway/test/lifecycle.test.ts`는 10 tests passed로 HTTP/Slack/Telegram 세 시작 경계와 기존 migration 취소를 통과했다.
+- RED: `dashboard.test.ts`는 없는 production dashboard module로 실패했고, 실제 store query adapter를 추가한 뒤 `pnpm vitest run apps/gateway/test/dashboard.test.ts`가 1 test passed가 되었다.
+
+### Self-review: 7개 finding 대응
+
+| Finding | 구현 위치 | 회귀/동작 테스트 |
+| --- | --- | --- |
+| C1 | `apps/gateway/src/production.ts`, `entry.ts` | `production.test.ts`의 config 후 concrete DB 조립·ingress 시작, `entry.test.ts` fail-closed |
+| C3 | `apps/gateway/test/end-to-end.test.ts` | `takes normalized Telegram command 501 through Gateway acceptance...` |
+| I1 | `apps/gateway/src/dashboard.ts`, `packages/persistence/src/store.ts` | `dashboard.test.ts` durable pending evidence projection |
+| I2 | `dashboard.ts`, `apps/web/src/app.test.tsx` | disabled `canStop=false`/`canRetry=false` UI regression |
+| N1 | `apps/gateway/src/lifecycle.ts` | HTTP/Slack/Telegram boundary parameterized shutdown test |
+| N2 | `apps/gateway/src/production.ts` | config reject DB-file absence 및 startup order production test |
+| N3 | `production.test.ts`, `entry.test.ts`, `end-to-end.test.ts` | production startup/fail-closed, entry, `acceptCommand → delivery` 실행 |
+
+### 검증과 커밋
+
+- focused: `pnpm vitest run apps/gateway/test` — 7 files, 39 tests passed; `pnpm vitest run --project orca-hq-web apps/web/src/app.test.tsx` — 24 tests passed.
+- 전체: `pnpm test` — 30 files, 500 tests passed; `pnpm typecheck` — exit 0; `pnpm build` — 13 workspace projects exit 0; `pnpm --filter @orca-hq/web test:e2e` — 4 passed; `git diff --check a927feef333bf94a021a89970679796d1b9e4975..HEAD` 및 worktree diff check — exit 0.
+- 커밋: `fix(gateway): complete production lifecycle` (이 보고서가 포함된 원자적 커밋).
+
+### 실제 남은 우려
+
+- 실제 Slack/Telegram/Tailscale/Keychain/Orca 연결은 의도적으로 생성·변경하지 않았다. production에는 이 외부 I/O·secret 경계만 주입하며, 테스트는 fake client와 loopback/store를 사용한다.

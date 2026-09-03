@@ -13,6 +13,7 @@ import { ControlStore, openDatabase } from "@orca-hq/persistence";
 import { createTelegramAdapter } from "@orca-hq/telegram-adapter";
 import { describe, expect, it } from "vitest";
 
+import { createGateway, type RuntimeAdapters } from "../src/lifecycle.js";
 const owner: PrincipalBinding = {
   principalId: "owner", slackUserIds: [], telegramUserIds: ["10"], telegramChatIds: ["20"],
   tailscaleLoginNames: ["owner@example.test"], roles: ["owner"]
@@ -33,6 +34,43 @@ function proposal(riskLevel: "L0" | "L1" | "L2" | "L3"): ExecutionProposal {
 }
 
 describe("Gateway end-to-end durable boundaries", () => {
+  it("takes normalized Telegram command 501 through Gateway acceptance into a separate delivery boundary", async () => {
+    // Break caught: Gateway.acceptCommand bypasses the durable normalized command or silently drops its delivery.
+    const database = openDatabase(":memory:");
+    const store = new ControlStore(database);
+    const deliveries: string[] = [];
+    const identities = new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] });
+    const adapter = createTelegramAdapter({ botIdentity: "bot", maxVoiceBytes: 1_000 }, {
+      ingress: store, identities, cursorStore: { async load() { return undefined; }, async save() {} },
+      outbox: { async enqueue() {} }, approvalPort: { async request() {} }
+    });
+    const ingress = { async start() {}, async stopIngress() {} };
+    const runtime: RuntimeAdapters = {
+      config: { async validate() {} }, database: { async migrate() {}, async checkpoint() {}, async close() {} },
+      orca: { async check() {} }, reconcile: async () => {}, http: ingress, slack: ingress, telegram: ingress,
+      transactions: { async drain() {} },
+      commandFlow: { async accept(command) {
+        if (!store.listCommands().some(({ commandId }) => commandId === command.commandId)) throw new Error("command was not durable");
+        return { state: "verified_success", delivery: "검증 완료" };
+      } },
+      deliveries: { async deliver(result) { if (result.delivery !== undefined) deliveries.push(result.delivery); } }
+    };
+    try {
+      const gateway = await createGateway({ databasePath: ":memory:", shutdownDrainMs: 1_000 }, runtime);
+      await gateway.start();
+      await adapter.handleUpdate({ update_id: 501, message: {
+        message_id: 501, date: 1_788_220_800, from: { id: 10 }, chat: { id: 20 }, text: "샌드박스 테스트 수정"
+      } });
+      const command = store.listCommands().find(({ externalMessageId }) => externalMessageId === "20:501");
+      if (command === undefined) throw new Error("normalized command missing");
+      await gateway.acceptCommand({ commandId: command.commandId, channel: "telegram", text: command.text });
+      expect(deliveries).toEqual(["검증 완료"]);
+      expect(store.listCommands()).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
   it("normalizes Telegram ingress into the real durable command store before policy is evaluated", async () => {
     // Break caught: a provider-shaped update bypasses normalization/idempotency and feeds a fake command result.
     const database = openDatabase(":memory:");

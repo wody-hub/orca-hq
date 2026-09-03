@@ -160,9 +160,35 @@ describe("Gateway lifecycle", () => {
 
     await expect(starting).rejects.toThrow("Gateway startup was stopped");
     await stopping;
-    expect(events).toEqual(["config.valid", "db.migrating", "db.migrated", "db.closed"]);
+    expect(events).toEqual(["config.valid", "db.migrating", "db.migrated", "db.checkpointed", "db.closed"]);
     expect(gateway.status).toEqual({ kind: "stopped", degradedChannels: [] });
   });
+
+  it.each(["http", "slack", "telegram"] as const)(
+    "stops %s ingress before drain and durable close when cancellation arrives at its startup boundary",
+    async (boundary) => {
+      // Break caught: startup cleanup closes SQLite before an already-open ingress is stopped and drained.
+      const events: string[] = [];
+      let gateway: Awaited<ReturnType<typeof createGateway>> | undefined;
+      const adapters = runtime(events);
+      const stopAtBoundary = async (started: string) => {
+        events.push(started);
+        void gateway?.stop();
+      };
+      adapters.http.start = () => stopAtBoundary("http.started");
+      adapters.slack.start = () => stopAtBoundary("slack.started");
+      adapters.telegram.start = () => stopAtBoundary("telegram.started");
+      gateway = await createGateway(config, adapters);
+
+      await expect(gateway.start()).rejects.toThrow("Gateway startup was stopped");
+      await gateway.stop();
+
+      const ingressStops = events.filter((event) => event.endsWith(".stopped"));
+      expect(events.slice(-3)).toEqual(["transactions.drained", "db.checkpointed", "db.closed"]);
+      expect(ingressStops).not.toEqual([]);
+      expect(gateway.status).toEqual({ kind: "stopped", degradedChannels: [] });
+    }
+  );
 
   it("shares one shutdown latch across concurrent and post-failure stops", async () => {
     // Break caught: multiple callers checkpoint or close the same durable database more than once.

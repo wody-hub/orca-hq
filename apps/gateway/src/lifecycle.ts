@@ -153,7 +153,9 @@ export class Gateway {
       this.#httpStarted = true;
       this.#throwIfStopRequested();
     } catch (error) {
-      if (this.#databaseOpened) {
+      // A concurrent stop owns teardown so an already-open ingress is always
+      // stopped and local claims are drained before checkpoint/close.
+      if (this.#databaseOpened && !this.#stopRequested) {
         try {
           await this.#adapters.database.close();
         } catch {

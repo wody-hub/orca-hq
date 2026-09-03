@@ -130,6 +130,17 @@ describe("private dashboard", () => {
     expect(api.retryDispatch).not.toHaveBeenCalledWith("dispatch-42");
   });
 
+  it("disables both dispatch controls when durable task policy marks them unavailable", async () => {
+    // Break caught: a server-calculated false control state still leaves a mutating UI button enabled.
+    const blocked = {
+      ...detail,
+      tasks: [{ ...detail.tasks[0]!, canStop: false, canRetry: false }]
+    };
+    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(blocked) })} initialCommandId="cmd-42" />);
+    expect((await screen.findByRole("button", { name: "Dispatch 중지: 모바일 화면 (dispatch-42)" })) as HTMLButtonElement).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Dispatch 재시도: 모바일 화면 (dispatch-42)" })).toHaveProperty("disabled", true);
+  });
+
   it("places dispatch controls after approval and audit evidence", async () => {
     window.history.replaceState({}, "", "/commands/cmd-42");
     render(<App api={apiFor()} initialCommandId="cmd-42" />);
