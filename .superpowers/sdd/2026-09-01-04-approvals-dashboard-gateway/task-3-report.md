@@ -44,3 +44,27 @@
 ## 남은 우려
 
 - Task 5가 실제 `ApprovalService`, 현재 proposal, durable action/audit 저장소를 각 포트에 조립해야 운영 경로가 완성된다. 이 Task의 gateway는 의도적으로 그 구현 의존성을 갖지 않는다.
+
+## 수정 1차
+
+### I1 — malformed JSON의 generic 400 매핑
+
+- `apps/gateway/src/http.ts` error handler가 Zod 오류뿐 아니라 Fastify가 `statusCode`로 4xx를 판정한 입력 오류도 정확히 `400 {"error":"bad_request"}`로 평탄화하도록 변경했다. 이로써 `FST_ERR_CTP_INVALID_JSON`과 향후 unsupported content type 같은 framework 입력 오류는 parser 원문·오류 code·경로 없이 응답한다. 그 외 예외는 기존처럼 `500 {"error":"internal_error"}`이며, 이 계약은 `apps/gateway/test/http-auth.test.ts`의 실제 session-service 예외 테스트가 계속 고정한다.
+- covering test: `apps/gateway/test/api.test.ts`의 `returns a generic bad request for malformed JSON before authentication`가 미인증 `POST /api/actions/stop`에 `{oops` JSON을 전송해 400과 단일 generic body, parser 원문 비노출을 확인한다.
+
+### I2 — 무상태 HMAC CSRF
+
+- 만료·삭제 경로가 없던 `csrfSessions` Map을 제거했다. gateway는 주입된 최소 32바이트 `csrfSigningKey`로 raw session token과 `principalId`를 함께 HMAC-SHA256하여 base64url CSRF 값을 결정적으로 발급하고, 검증 시 길이·encoding을 먼저 확인한 뒤 `timingSafeEqual`로 비교한다.
+- 유효한 키가 없거나 32바이트보다 짧으면 CSRF 부트스트랩을 만들지 않고 mutation을 `403 {"error":"forbidden"}`으로 fail-closed 한다. 예측 가능한 기본 키나 프로세스별 random fallback은 없다.
+- covering test: `apps/gateway/test/api.test.ts`의 `derives CSRF tokens across instances and rejects a different principal or signing key`가 같은 session/CSRF signing key의 두 app instance 사이에서 cookie와 CSRF token으로 mutation이 통과함을 검증하고, 다른 key 및 다른 principal CSRF는 403임을 확인한다. `fails closed for mutation APIs when the CSRF signing key is shorter than 32 bytes`는 짧은 key에서의 fail-closed 경계를 고정한다.
+
+### RED/GREEN 및 회귀 결과
+
+- RED: `pnpm test apps/gateway/test/api.test.ts` 실행에서 13개 중 3개가 의도대로 실패했다. 핵심 출력은 malformed JSON의 `expected 500 to be 400`, 새 instance CSRF의 `expected 403 to be 200`, 짧은 key의 `expected 200 to be 403`이었다.
+- GREEN: `pnpm test apps/gateway/test/api.test.ts apps/gateway/test/http-auth.test.ts` — 2 files, 21 tests 통과.
+- 전체 회귀: `pnpm test` — 23 files, 453 tests 통과; `pnpm typecheck` 통과; `pnpm build` 통과; `git diff --check` 통과.
+- 커밋: `0e741c6 fix(api): harden gateway request boundaries`.
+
+### 남은 우려
+
+- Task 5의 실제 조립 단계는 Keychain에서 안정적인 32바이트 이상 `csrfSigningKey`를 주입해야 한다. 키 누락 또는 형식 오류 상태에서는 의도적으로 mutation이 모두 403이므로, 배포 설정 검증이 필요하다.
