@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { IdentityResolver, type PrincipalBinding } from "@orca-hq/core";
-import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
+import { createLocalSessionService, type LocalSessionService } from "@orca-hq/tailscale-adapter";
 import { createHttpApp } from "../src/http.js";
 
 const owner = {
@@ -66,6 +66,76 @@ describe("gateway HTTP authentication boundary", () => {
       const response = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
       expect(response.statusCode).toBe(401);
       expect(response.json()).toEqual({ error: "unauthorized" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns a generic internal error when session issuance throws before authentication", async () => {
+    // Break caught: an unauthenticated caller receives session-service secrets from Fastify's default error response.
+    const sessions = {
+      startLocalSession() {
+        throw new Error("secret detail: /Users/example/private");
+      },
+      verify() {
+        return { kind: "denied" as const };
+      }
+    } satisfies LocalSessionService;
+    const app = createHttpApp({
+      bindings: [owner],
+      resolver: new IdentityResolver({ bindings: [owner], allowedSlackWorkspaceIds: ["T123"] }),
+      sessions,
+      peerAddress: () => "127.0.0.1"
+    });
+    try {
+      const response = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({ error: "internal_error" });
+      expect(response.body).not.toContain("secret");
+      expect(response.body).not.toContain("/Users");
+      expect(response.body).not.toContain("private");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("denies an invalid principal binding without starting a session", async () => {
+    // Break caught: an invalid binding reaches session issuance and leaks an internal validation error.
+    const invalidOwner = { ...owner, principalId: " owner " } satisfies PrincipalBinding;
+    const startLocalSession = vi.fn(() => {
+      throw new Error("session issuance must not be attempted");
+    });
+    const sessions = {
+      startLocalSession,
+      verify() {
+        return { kind: "denied" as const };
+      }
+    } satisfies LocalSessionService;
+    const app = createHttpApp({
+      bindings: [invalidOwner],
+      resolver: new IdentityResolver({ bindings: [invalidOwner], allowedSlackWorkspaceIds: ["T123"] }),
+      sessions,
+      peerAddress: () => "127.0.0.1"
+    });
+    try {
+      const response = await app.inject({ method: "POST", url: "/auth/session", headers: trustedHeaders });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: "unauthorized" });
+      expect(startLocalSession).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns a generic not-found response before authentication", async () => {
+    // Break caught: an unauthenticated caller learns Fastify's route candidate for an unregistered endpoint.
+    const app = createApp();
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/private-projects" });
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({ error: "not_found" });
+      expect(response.body).not.toContain("Route GET");
+      expect(response.body).not.toContain("private-projects");
     } finally {
       await app.close();
     }

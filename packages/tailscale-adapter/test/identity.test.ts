@@ -67,6 +67,34 @@ describe("Tailscale Serve identity", () => {
     expect(resolveTailnetLogin(localRequest("owner@example.test"), [owner, duplicateLogin]))
       .toEqual({ kind: "denied" });
   });
+
+  it("denies a login that appears multiple times in one binding and another principal", () => {
+    // Break caught: a malformed lower-privilege binding is discarded so the shared login gains another principal's role.
+    const repeatedViewer = {
+      ...owner,
+      principalId: "viewer",
+      roles: ["viewer"],
+      tailscaleLoginNames: ["shared@example.test", "shared@example.test"]
+    } satisfies PrincipalBinding;
+    const sharedOwner = {
+      ...owner,
+      tailscaleLoginNames: ["shared@example.test"]
+    } satisfies PrincipalBinding;
+
+    expect(resolveTailnetLogin(localRequest("shared@example.test"), [repeatedViewer, sharedOwner]))
+      .toEqual({ kind: "denied" });
+  });
+
+  it("denies a login that appears more than once in its only binding", () => {
+    // Break caught: a duplicated operator configuration is treated as an unambiguous trusted identity.
+    const repeatedOwner = {
+      ...owner,
+      tailscaleLoginNames: ["owner@example.test", "owner@example.test"]
+    } satisfies PrincipalBinding;
+
+    expect(resolveTailnetLogin(localRequest("owner@example.test"), [repeatedOwner]))
+      .toEqual({ kind: "denied" });
+  });
 });
 
 describe("signed local sessions", () => {

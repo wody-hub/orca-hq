@@ -22,6 +22,8 @@ function unauthorized(reply: { code(statusCode: number): { send(body: { error: s
 
 export function createHttpApp(options: GatewayHttpOptions): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: false });
+  app.setErrorHandler((_error, _request, reply) => reply.code(500).send({ error: "internal_error" }));
+  app.setNotFoundHandler((_request, reply) => reply.code(404).send({ error: "not_found" }));
   const peerAddress = options.peerAddress ?? ((request: FastifyRequest) => request.raw.socket.remoteAddress ?? "");
   const inputFor = (request: FastifyRequest) => ({
     remoteAddress: peerAddress(request),

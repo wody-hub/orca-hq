@@ -44,7 +44,15 @@ function loginHeader(headers: RequestHeaders): string | undefined {
 }
 
 function matchingBindings(loginName: string, bindings: readonly PrincipalBinding[]): readonly PrincipalBinding[] {
-  return bindings.filter((binding) => binding.tailscaleLoginNames.filter((login) => login === loginName).length === 1);
+  return bindings.filter((binding) => Array.isArray(binding.tailscaleLoginNames) &&
+    binding.tailscaleLoginNames.includes(loginName));
+}
+
+function isSafeTailnetLogin(binding: PrincipalBinding, loginName: string): boolean {
+  return typeof binding.principalId === "string" && binding.principalId.trim().length > 0 &&
+    binding.principalId === binding.principalId.trim() && loginName.trim().length > 0 &&
+    loginName === loginName.trim() && Array.isArray(binding.roles) &&
+    binding.roles.every((role) => role === "owner" || role === "operator" || role === "viewer");
 }
 
 export function resolveTailnetLogin(
@@ -57,6 +65,8 @@ export function resolveTailnetLogin(
   const matches = matchingBindings(loginName, bindings);
   const binding = matches[0];
   if (matches.length !== 1 || binding === undefined) return denied;
+  if (binding.tailscaleLoginNames.filter((login) => login === loginName).length !== 1 ||
+    !isSafeTailnetLogin(binding, loginName)) return denied;
   return Object.freeze({
     principalId: binding.principalId,
     roles: Object.freeze([...binding.roles]),
