@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 
 import {
   ApprovalService,
+  approvalOperationDigest,
+  proposalDigest,
   type AuthenticatedPrincipal,
   type CommandEnvelope,
   type ExecutionProposal,
+  type PersistedApproval,
   type PrincipalBinding
 } from "@orca-hq/core";
 import { HqResultSchema, type HqResult } from "@orca-hq/codex-hq";
@@ -224,6 +227,8 @@ function commandDigest(command: CommandEnvelope): string {
   return createHash("sha256").update(JSON.stringify(command)).digest("hex");
 }
 
+const APPROVAL_WINDOW_MS = 15 * 60_000;
+
 function approvalOperation(proposal: ExecutionProposal): Readonly<{
   operation: "commit_changes" | "deploy_production";
   targetEnvironment?: "production";
@@ -347,22 +352,79 @@ function productionCommandFlow(
     const started = await execution.start({ authorization: "authorized", proposal, project });
     return { state: started.kind === "started" ? "active" : started.kind };
   };
+  const recoverConsumedApproval = (
+    persisted: PersistedApproval,
+    proposal: ExecutionProposal,
+    command: CommandEnvelope
+  ): "authorized" | "changed" | "denied" => {
+    if (
+      persisted.state !== "consumed"
+      || persisted.approval === undefined
+      || runState(proposal.proposalId) !== "waiting_approval"
+    ) {
+      return "denied";
+    }
+    const current = approvalValidation(proposal, command);
+    const currentProposalDigest = proposalDigest(proposal);
+    const currentOperationDigest = approvalOperationDigest({
+      proposalDigest: currentProposalDigest,
+      operation: current.operation,
+      commandDigest: current.commandDigest,
+      ...(current.targetEnvironment === undefined
+        ? {}
+        : { targetEnvironment: current.targetEnvironment })
+    });
+    if (
+      persisted.request.proposalDigest !== currentProposalDigest
+      || persisted.request.digest !== currentOperationDigest
+      || persisted.request.operation !== current.operation
+      || persisted.request.commandDigest !== current.commandDigest
+      || persisted.request.targetEnvironment !== current.targetEnvironment
+      || persisted.approval.proposalDigest !== currentProposalDigest
+      || persisted.approval.operationDigest !== currentOperationDigest
+      || persisted.approval.channel !== persisted.request.channel
+    ) {
+      return "changed";
+    }
+    const approvedAt = Date.parse(persisted.approval.approvedAt);
+    const expiresAt = Date.parse(persisted.approval.expiresAt);
+    const currentTime = now().getTime();
+    if (
+      !Number.isFinite(currentTime)
+      || !Number.isFinite(approvedAt)
+      || !Number.isFinite(expiresAt)
+      || expiresAt - approvedAt !== APPROVAL_WINDOW_MS
+      || currentTime < approvedAt
+      || currentTime >= expiresAt
+    ) {
+      return "denied";
+    }
+    return "authorized";
+  };
   const resumeApproval = async (approvalId: string): Promise<ApprovalResumeResult> => {
     const persisted = store.findApproval(approvalId);
-    if (persisted === undefined || persisted.state !== "approved") return { kind: "denied" };
+    if (persisted === undefined || (persisted.state !== "approved" && persisted.state !== "consumed")) {
+      return { kind: "denied" };
+    }
     const proposal = store.findExecutionProposal(persisted.request.proposal.proposalId);
     if (proposal === undefined) return { kind: "denied" };
     const command = store.listCommands().find((candidate) => candidate.commandId === proposal.commandId);
     if (command === undefined) return { kind: "denied" };
     const project = projectFor(proposal);
     if (project === undefined) return { kind: "denied" };
-    const validation = approvals.validate(
-      approvalId,
-      approvalValidation(proposal, command),
-      now()
-    );
-    if (validation.kind === "changed") return { kind: "changed" };
-    if (validation.kind !== "approved") return { kind: "denied" };
+    if (persisted.state === "approved") {
+      const validation = approvals.validate(
+        approvalId,
+        approvalValidation(proposal, command),
+        now()
+      );
+      if (validation.kind === "changed") return { kind: "changed" };
+      if (validation.kind !== "approved") return { kind: "denied" };
+    } else {
+      const recovery = recoverConsumedApproval(persisted, proposal, command);
+      if (recovery === "changed") return { kind: "changed" };
+      if (recovery !== "authorized") return { kind: "denied" };
+    }
     const started = await startAuthorized(proposal, project, {
       kind: "durable_approval",
       approvalId
@@ -404,6 +466,10 @@ function productionCommandFlow(
           return { state: resumed.kind === "started" ? "active" : "review_required" };
         }
         if (existing?.state === "consumed") {
+          if (runState(proposal.proposalId) === "waiting_approval") {
+            const resumed = await resumeApproval(approvalId);
+            return { state: resumed.kind === "started" ? "active" : "review_required" };
+          }
           return { state: runState(proposal.proposalId) ?? "review_required" };
         }
         if (existing?.state === "invalidated" || existing?.state === "expired") {
@@ -569,7 +635,7 @@ export async function createProductionGateway(
       store.recoverExpiredOutboxClaims(reconciledAt, runtimeConfig.outboxClaimTtlMs);
       if (commandFlow !== undefined) {
         for (const approval of store.listApprovals()) {
-          if (approval.state === "approved") {
+          if (approval.state === "approved" || approval.state === "consumed") {
             try {
               await commandFlow.resumeApproval(approval.request.approvalId);
             } catch {
@@ -584,8 +650,7 @@ export async function createProductionGateway(
         return typeof state !== "string" || ![
           "verified_success",
           "investigation_complete",
-          "intervention_required",
-          "waiting_approval"
+          "intervention_required"
         ].includes(state);
       }).length;
       const activeDispatches = store.listTasks().flatMap((task) =>
@@ -593,11 +658,10 @@ export async function createProductionGateway(
       ).filter((dispatch) => {
         if (typeof dispatch !== "object" || dispatch === null || Array.isArray(dispatch)) return true;
         const state = dispatch.state;
-        return typeof state !== "string" || [
-          "planned",
-          "launching",
-          "running",
-          "launch_failure_reserved"
+        return typeof state !== "string" || ![
+          "worker_done",
+          "launch_failed",
+          "intervention_required"
         ].includes(state);
       }).length;
       if (activeRuns === 0 && activeDispatches === 0) return [];

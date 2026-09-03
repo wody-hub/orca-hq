@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  ApprovalService,
   IdentityResolver,
   type ExecutionProposal,
   type PersistedApproval,
@@ -527,6 +528,49 @@ describe("Gateway production state machine E2E", () => {
       expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
     } finally {
       await composition?.gateway.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers the same approved proposal after a crash between approval consumption and execution", async () => {
+    // Break caught: a consumed approval with a still-waiting durable Run is skipped forever on restart.
+    const directory = await mkdtemp(join(tmpdir(), "orca-production-e2e-approval-recovery-"));
+    const firstOrca = new FakeOrcaBoundary();
+    let first: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    let restarted: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
+    try {
+      const firstHost = await createGatewayHost(async () => boundaries(directory, firstOrca, [], "L2"));
+      first = await createProductionGateway(firstHost.config, firstHost.dependencies);
+      await first.gateway.start();
+      const { approval } = await approvalRequest(first, "L2");
+      const service = new ApprovalService(first.services.store);
+      expect(service.confirm(
+        approval.request,
+        owner,
+        new Date("2026-09-03T00:00:00.000Z")
+      ).kind).toBe("approved");
+      expect(service.validate(
+        approval.request.approvalId,
+        approval.request.digest,
+        new Date("2026-09-03T00:00:00.000Z")
+      )).toEqual({ kind: "approved" });
+      expect(first.services.store.findApproval(approval.request.approvalId)?.state).toBe("consumed");
+      expect(first.services.store.listTasks()).toEqual([]);
+      await first.gateway.stop();
+
+      const restartedOrca = new FakeOrcaBoundary();
+      const restartedHost = await createGatewayHost(async () => boundaries(directory, restartedOrca, [], "L2"));
+      restarted = await createProductionGateway(restartedHost.config, restartedHost.dependencies);
+      await restarted.gateway.start();
+
+      expect(restarted.services.store.listRunRecords()).toEqual([
+        expect.objectContaining({ commandId: "command-l2", state: "active" })
+      ]);
+      expect(restartedOrca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+      expect(restarted.services.store.findApproval(approval.request.approvalId)?.state).toBe("consumed");
+    } finally {
+      await restarted?.gateway.stop();
+      await first?.gateway.stop();
       await rm(directory, { recursive: true, force: true });
     }
   });
