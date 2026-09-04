@@ -1,3 +1,4 @@
+export * from "./backup.js";
 export * from "./cli.js";
 export * from "./config-files.js";
 export * from "./doctor.js";
@@ -6,3 +7,5 @@ export * from "./keychain.js";
 export * from "./launchd.js";
 export * from "./prompt.js";
 export * from "./setup.js";
+export * from "./uninstall.js";
+export * from "./update.js";
