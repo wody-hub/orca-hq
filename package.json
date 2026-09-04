@@ -6,7 +6,7 @@
   "engines": { "node": ">=22.20 <23" },
   "scripts": {
     "build": "pnpm -r build",
-    "hq": "pnpm --silent --filter @orca-hq/observability build && pnpm --silent --filter @orca-hq/installer build && node packages/installer/dist/cli.js",
+    "hq": "pnpm --silent --filter @orca-hq/installer build && node packages/installer/dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

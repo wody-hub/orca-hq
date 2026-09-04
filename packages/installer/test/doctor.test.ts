@@ -22,6 +22,15 @@ function ports(): DoctorPorts & { mutations: string[] } {
   };
 }
 
+class ReadOnlyMachine {
+  readonly mutations: string[] = [];
+
+  attemptMutation(operation: string): never {
+    this.mutations.push(operation);
+    throw new Error(`doctor attempted mutation: ${operation}`);
+  }
+}
+
 describe("read-only private-pilot doctor", () => {
   it("does not mutate machine state and emits a validated JSON report", async () => {
     // Break caught: a diagnostic run must never install services, alter credentials, or create files.
@@ -56,5 +65,17 @@ describe("read-only private-pilot doctor", () => {
 
     expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("fail");
     await expect(doctorExitCode(result)).resolves.toBe(1);
+  });
+
+  it("records a forbidden machine mutation so the read-only assertion is not vacuous", async () => {
+    // Break caught: a future doctor adapter that reaches a write-capable operation must fail the read-only fixture.
+    const machine = new ReadOnlyMachine();
+    const fixture = ports();
+    fixture.checks.keychain = async () => machine.attemptMutation("security add-generic-password");
+
+    const result = await createDoctor(fixture).run({ format: "json" });
+
+    expect(machine.mutations).toEqual(["security add-generic-password"]);
+    expect(result.checks.find((check) => check.id === "keychain.access")?.status).toBe("fail");
   });
 });

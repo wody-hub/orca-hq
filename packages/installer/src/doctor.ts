@@ -1,4 +1,3 @@
-import { redactDeep } from "@orca-hq/observability";
 import { z } from "zod";
 
 export const DoctorCheckSchema = z.object({
@@ -104,9 +103,8 @@ export function createDoctor(ports: DoctorPorts): Readonly<{
         ...pilotCheckDefinitions.map((definition) => runCheck(definition, ports)),
         registryCheck(ports.registry)
       ]);
-      const raw = { ok: !checks.some((check) => check.status === "fail"), checks };
-      // Dynamic adapter data is deliberately not included; this is a second privacy boundary for the report.
-      return DoctorResultSchema.parse(redactDeep(raw));
+      // Reports contain only fixed text, status and counts-derived status. Adapter output is never emitted.
+      return DoctorResultSchema.parse({ ok: !checks.some((check) => check.status === "fail"), checks });
     }
   });
 }

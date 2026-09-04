@@ -33,6 +33,7 @@ function ports(): SetupPorts & { keychain: RecordingKeychain; configFile: Record
     keychain,
     configFile,
     output,
+    confirm: async () => true,
     checks: {
       macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
       claudeAuthentication: pass, tailscaleTailnet: pass, slackSocketMode: pass,
@@ -77,5 +78,21 @@ describe("guided private-pilot setup", () => {
     expect(result.ok).toBe(false);
     expect(fixture.keychain.entries).toEqual([]);
     expect(fixture.configFile.writes).toEqual([]);
+  });
+
+  it("leaves Keychain and config untouched when the explicit confirmation is declined", async () => {
+    // Break caught: a displayed plan must not silently become a machine mutation when the user declines it.
+    const fixture = ports();
+    fixture.confirm = async () => false;
+
+    const result = await createSetup(fixture).run({
+      credentials: { "slack-app-token": "xapp-secret" },
+      registryPath: "/private/pilot/projects.yaml"
+    });
+
+    expect(result.ok).toBe(false);
+    expect(fixture.keychain.entries).toEqual([]);
+    expect(fixture.configFile.writes).toEqual([]);
+    expect(fixture.output.lines.join("\n")).toContain("Setup cancelled");
   });
 });

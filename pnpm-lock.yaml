@@ -108,9 +108,9 @@ importers:
 
   packages/installer:
     dependencies:
-      '@orca-hq/observability':
-        specifier: workspace:*
-        version: link:../observability
+      yaml:
+        specifier: ^2.8.1
+        version: 2.9.0
       zod:
         specifier: ^3.24.2
         version: 3.25.76

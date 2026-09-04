@@ -16,6 +16,8 @@ export interface SetupPorts extends DoctorPorts {
   readonly keychain: KeychainPort;
   readonly configFile: ConfigFilePort;
   readonly output: SetupOutputPort;
+  /** Called only after the non-secret plan and config destination were displayed. */
+  confirm(): Promise<boolean>;
 }
 
 export interface SetupAnswers {
@@ -57,6 +59,11 @@ export function createSetup(ports: SetupPorts): Readonly<{
       ports.output.write(`Planned configuration: ${ports.configFile.path}`);
       ports.output.write("Planned changes: save non-secret pilot configuration and store selected credentials in Keychain.");
       await ports.configFile.preview(config);
+
+      if (!await ports.confirm()) {
+        ports.output.write("Setup cancelled; configuration unchanged.");
+        return Object.freeze({ ok: false, checks: preflight.checks });
+      }
 
       for (const account of accounts) {
         const value = answers.credentials[account];
