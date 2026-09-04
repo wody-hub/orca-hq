@@ -75,7 +75,7 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
     try {
       if (selected === "start") {
         await launchd.install();
-        await launchd.start();
+        if ((await launchd.status()).state !== "running") await launchd.start();
         write(output, "Orca HQ gateway started.");
         return 0;
       }

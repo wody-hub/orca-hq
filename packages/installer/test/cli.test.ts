@@ -162,15 +162,25 @@ describe("hq command-line contract", () => {
     await expect(runCli(["logs"], { stdout })).resolves.toBe(1);
   });
 
-  it("installs and starts the LaunchAgent through the reserved start surface", async () => {
-    // Break caught: `pnpm hq start` remains a placeholder and never installs the user LaunchAgent.
+  it("does not restart an already running LaunchAgent through the start surface", async () => {
+    // Break caught: a repeated `hq start` interrupts healthy gateway work with a forced restart.
     const stdout = output();
     const service = launchd();
 
     await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(0);
 
-    expect(service.calls).toEqual(["install", "start"]);
+    expect(service.calls).toEqual(["install", "status"]);
     expect(stdout.lines).toEqual(["Orca HQ gateway started.\n"]);
+  });
+
+  it("starts an installed but non-running LaunchAgent", async () => {
+    // Break caught: avoiding a destructive restart must not leave a loaded, stopped service idle.
+    const stdout = output();
+    const service = launchd({ state: "loaded" });
+
+    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(0);
+
+    expect(service.calls).toEqual(["install", "status", "start"]);
   });
 
   it("stops and reports status through the exact LaunchAgent operations", async () => {
@@ -190,7 +200,7 @@ describe("hq command-line contract", () => {
   it("returns a redacted failure when a launchd operation rejects", async () => {
     // Break caught: launchctl stderr or command details can leak through the CLI service boundary.
     const stdout = output();
-    const service = launchd();
+    const service = launchd({ state: "loaded" });
     service.start = async () => { throw new Error("TOKEN=launchd-secret"); };
 
     await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(1);

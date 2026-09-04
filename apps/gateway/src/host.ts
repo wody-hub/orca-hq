@@ -58,6 +58,7 @@ export interface GatewayExternalBoundaries {
   readonly secrets: GatewayConfigPort;
   readonly orca: Pick<OrcaClient, "health" | "execute">;
   readonly proposalModel: GatewayProposalModelPort;
+  readonly channelRecovery: Readonly<{ resumeCursors(): Promise<void> }>;
   readonly git: GitWorktreePort;
   readonly verificationEvidence: VerificationEvidencePort;
   readonly providerRegistry?: WorkerProviderRegistryPort | undefined;
@@ -149,6 +150,7 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
     requireMethods(candidate.secrets, ["validate"]);
     requireMethods(candidate.orca, ["health", "execute"]);
     requireMethods(candidate.proposalModel, ["plan"]);
+    requireMethods(candidate.channelRecovery, ["resumeCursors"]);
     requireMethods(candidate.git, [
       "repositoryStatus",
       "resolveRevision",
@@ -214,6 +216,7 @@ export function assembleGatewayHost(boundariesValue: unknown): GatewayHost {
     orca: boundaries.orca,
     proposalModel: boundaries.proposalModel,
     projects,
+    channelRecovery: boundaries.channelRecovery,
     execution: {
       placements: new GitWorktreePlacementService(boundaries.git),
       assignmentArtifacts: new FileAssignmentArtifactStore({

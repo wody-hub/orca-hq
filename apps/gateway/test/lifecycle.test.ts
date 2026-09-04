@@ -117,7 +117,7 @@ describe("Gateway lifecycle", () => {
         async recoverOutboxClaims() { events.push("claims.recovered"); },
         async listNonterminalDispatches() {
           events.push("dispatches.listed");
-          return [{ dispatchId: "dispatch-1", receipt: { id: "start-1" } }];
+          return [{ dispatchId: "dispatch-1", receiptId: "start-1", receipt: { id: "start-1" } }];
         }
       },
       channels: { async resumeCursors() { events.push("cursors.resumed"); } },
@@ -125,7 +125,8 @@ describe("Gateway lifecycle", () => {
         async inspectDispatch() { events.push("orca.inspected"); return { kind: "running" as const }; }
       },
       locks: { async reviewExpired() { events.push("locks.reviewed"); } },
-      outbox: { async drain() { events.push("outbox.drained"); } }
+      outbox: { async drain() { events.push("outbox.drained"); } },
+      audit: { async record() { events.push("reconciliation.audited"); } }
     } };
     const gateway = await createGateway(config, adapters);
 
@@ -139,6 +140,7 @@ describe("Gateway lifecycle", () => {
       "cursors.resumed",
       "dispatches.listed",
       "orca.inspected",
+      "reconciliation.audited",
       "locks.reviewed",
       "outbox.drained",
       "http.started",
@@ -146,6 +148,41 @@ describe("Gateway lifecycle", () => {
       "slack.started",
       "telegram.started"
     ]);
+  });
+
+  it("reports only review-required dispatches without inventing an active Run count", async () => {
+    // Break caught: normal resumable work is collapsed with uncertainty and an unmeasured activeRuns: 0 is recorded.
+    const events: string[] = [];
+    const adapters: RuntimeAdapters = { ...runtime(events), reconcile: {
+      store: {
+        async recoverOutboxClaims() {},
+        async listNonterminalDispatches() {
+          return [
+            { dispatchId: "dispatch-resumable", receiptId: "receipt-resumable", receipt: "receipt-resumable" },
+            { dispatchId: "dispatch-review", receiptId: "receipt-review", receipt: "receipt-review" }
+          ];
+        }
+      },
+      channels: { async resumeCursors() {} },
+      orca: {
+        async inspectMany() { return [{ kind: "running" as const }, { kind: "unknown" as const }]; }
+      },
+      locks: { async reviewExpired() {} },
+      outbox: { async drain() {} },
+      audit: { async record() {} }
+    } };
+    const gateway = await createGateway(config, adapters);
+
+    await gateway.start();
+
+    expect(gateway.diagnostics).toEqual([{
+      component: "reconciliation",
+      code: "reconciliation_review_required",
+      dispatchIds: ["dispatch-review"],
+      receiptIds: ["receipt-review"]
+    }]);
+    expect(JSON.stringify(gateway.diagnostics)).not.toContain("activeRuns");
+    expect(JSON.stringify(gateway.diagnostics)).not.toContain("dispatch-resumable");
   });
 
   it("continues in degraded mode when one channel fails after durable recovery", async () => {

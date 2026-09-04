@@ -62,6 +62,7 @@ function dependencies(events: string[], valid = true): GatewayProductionDependen
     execution: {} as never,
     proposalModel: { async plan() { return { kind: "failure", reason: "invalid_command" }; } },
     projects: [],
+    channelRecovery: { async resumeCursors() { events.push("channels.resumed"); } },
     http: ingress("http"), slack: ingress("slack"), telegram: ingress("telegram"),
     transactions: { async drain() { events.push("transactions.drained"); } },
     outbox: { workerId: "test", providers: {} },
@@ -99,6 +100,7 @@ describe("production gateway composition", () => {
           "tailscale-web": {
             async deliver(message) {
               deliveries.push((message.payload as { text: string }).text);
+              events.push("outbox.recovered-delivered");
               return { providerMessageId: "recovered-1" };
             }
           }
@@ -119,6 +121,7 @@ describe("production gateway composition", () => {
       });
 
       expect(deliveries).toEqual(["recovered"]);
+      expect(events.indexOf("outbox.recovered-delivered")).toBeLessThan(events.indexOf("http.started"));
       expect(composition.services.store.listAuditEvents()).toContainEqual(
         expect.objectContaining({ eventType: "outbox.claim_recovered" })
       );
@@ -128,8 +131,8 @@ describe("production gateway composition", () => {
     }
   });
 
-  it("surfaces nonterminal durable work as reconciliation_incomplete", async () => {
-    // Break caught: startup reports reconciled after discarding nonterminal Run and Dispatch observations.
+  it("runs structured production reconciliation and durably identifies uncertain dispatches", async () => {
+    // Break caught: production keeps the legacy count-only hook and never inspects the exact durable Orca Dispatch.
     const directory = await mkdtemp(join(tmpdir(), "orca-production-reconcile-run-"));
     const path = join(directory, "control.sqlite");
     const database = openDatabase(path);
@@ -150,28 +153,90 @@ describe("production gateway composition", () => {
       objective: "active work",
       state: "active"
     });
+    store.saveTask({
+      id: "task-active",
+      runId: "active-run",
+      title: "active task",
+      role: "implement",
+      preferredAgent: "codex",
+      dependsOn: [],
+      state: "running"
+    });
+    store.saveDispatch({
+      id: "dispatch-active",
+      taskId: "task-active",
+      state: "running",
+      orcaDispatchId: "orca-dispatch-active"
+    });
+    expect(store.acquireWorktreeLock({
+      lockKey: "sandbox",
+      commandId: "active-command",
+      taskId: "task-active",
+      projectKey: "sandbox",
+      worktreePath: "/srv/sandbox",
+      branch: "main",
+      dispatchId: "dispatch-active",
+      acquiredAt: "2026-09-03T00:00:00.000Z",
+      heartbeatAt: "2026-09-03T00:00:00.000Z",
+      expiresAt: "2026-09-03T00:01:00.000Z"
+    })).toMatchObject({ kind: "acquired" });
     database.close();
     const events: string[] = [];
     let composition: Awaited<ReturnType<typeof createProductionGateway>> | undefined;
     try {
       composition = await createProductionGateway(
         { databasePath: path, shutdownDrainMs: 1_000 },
-        { ...dependencies(events), now: () => new Date("2026-09-03T00:02:00.000Z") }
+        {
+          ...dependencies(events),
+          projects: [sandboxProject],
+          now: () => new Date("2026-09-03T00:02:00.000Z"),
+          orca: {
+            async health() { events.push("orca.checked"); return {} as never; },
+            async execute(operation) {
+              events.push(`orca.${operation.kind}`);
+              return {
+                id: "show-receipt",
+                ok: true,
+                result: {
+                  dispatch: { id: "orca-dispatch-active", task_id: "task-active", run_id: "active-run", status: "dispatched" },
+                  worker: { dispatch_id: "orca-dispatch-active", state: "outcome_unknown", stage: "running", agent_terminal_handle: null },
+                  terminal: null,
+                  observation: { status: "unknown", exactWorker: true },
+                  terminalResource: { id: "resource-active", ownershipState: "owned", releaseState: "unknown" }
+                }
+              };
+            }
+          }
+        }
       );
       await composition.gateway.start();
 
       expect(composition.gateway.diagnostics).toContainEqual({
         component: "reconciliation",
-        code: "reconciliation_incomplete",
-        activeRuns: 1,
-        activeDispatches: 0
+        code: "reconciliation_review_required",
+        dispatchIds: ["dispatch-active"],
+        receiptIds: ["orca-dispatch-active"]
       });
       expect(composition.services.store.listAuditEvents()).toContainEqual(
         expect.objectContaining({
-          eventType: "gateway.reconciliation_incomplete",
-          data: { activeRuns: 1, activeDispatches: 0 }
+          subjectId: "dispatch-active",
+          eventType: "gateway.reconciliation_classified",
+          data: {
+            receiptId: "orca-dispatch-active",
+            state: "review_required"
+          }
         })
       );
+      expect(composition.services.store.listAuditEvents()).toContainEqual(
+        expect.objectContaining({
+          subjectId: "dispatch-active",
+          eventType: "worktree_lock.reconciliation_reviewed",
+          data: { lockKey: "sandbox", state: "review_required" }
+        })
+      );
+      expect(events.indexOf("channels.resumed")).toBeLessThan(events.indexOf("orca.show_worker"));
+      expect(events.indexOf("orca.show_worker")).toBeLessThan(events.indexOf("http.started"));
+      expect(events).not.toContain("orca.release_worker");
     } finally {
       await composition?.gateway.stop();
       await rm(directory, { recursive: true, force: true });
@@ -354,7 +419,7 @@ describe("production gateway composition", () => {
       await composition.gateway.start();
       await composition.gateway.stop();
       expect(events).toEqual([
-        "config.valid", "orca.checked", "http.started", "slack.started", "telegram.started",
+        "config.valid", "orca.checked", "channels.resumed", "http.started", "slack.started", "telegram.started",
         "telegram.stopped", "slack.stopped", "http.stopped", "transactions.drained"
       ]);
     } finally {

@@ -48,6 +48,11 @@ import { createCommandDashboard, createProjectDashboard } from "./dashboard.js";
 import { createHttpApp, type ApprovalConfirmationPort, type DispatchActionPort, type GatewayHttpOptions } from "./http.js";
 import { validateGatewayConfig } from "./config.js";
 import { GatewayOutboxDriver } from "./outbox-driver.js";
+import type {
+  OrcaDispatchInspection,
+  ReconcileDispatch,
+  ReconcilePorts
+} from "./reconcile.js";
 
 export interface GatewayDispatchControlPort {
   stop(input: Readonly<{ dispatchId: string; idempotencyKey: string }>): Promise<boolean>;
@@ -84,6 +89,8 @@ export interface GatewayProductionDependencies {
   readonly proposalModel: GatewayProposalModelPort;
   /** Host-validated local registry snapshot. */
   readonly projects: readonly ProjectRegistryEntry[];
+  /** Provider-backed cursor recovery that completes before any ingress opens. */
+  readonly channelRecovery: Readonly<{ resumeCursors(): Promise<void> }>;
   /** Legacy externally-hosted ingress. New hosts should supply httpOptions so production owns createHttpApp. */
   readonly http?: GatewayIngressPort;
   /** Keychain/session/identity-backed external boundary; production creates the HTTP app and loopback listener itself. */
@@ -114,6 +121,57 @@ export interface GatewayProductionServices {
   readonly outbox: OutboxDispatcher;
   /** Present only when production owns the HTTP app from httpOptions. */
   readonly httpApp?: ReturnType<typeof createHttpApp>;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function nonterminalDispatches(store: ControlStore): readonly ReconcileDispatch[] {
+  const terminalStates = new Set(["worker_done", "launch_failed", "intervention_required"]);
+  return Object.freeze(store.listTasks().flatMap((task) =>
+    store.loadDispatchesForTask(task.id)
+  ).flatMap((value) => {
+    const dispatch = objectRecord(value);
+    if (dispatch === undefined || typeof dispatch.id !== "string") return [];
+    if (typeof dispatch.state === "string" && terminalStates.has(dispatch.state)) return [];
+    const orcaDispatchId = typeof dispatch.orcaDispatchId === "string"
+      ? dispatch.orcaDispatchId
+      : undefined;
+    return [Object.freeze({
+      dispatchId: dispatch.id,
+      receiptId: orcaDispatchId ?? dispatch.id,
+      receipt: Object.freeze({ dispatchId: orcaDispatchId })
+    })];
+  }));
+}
+
+async function inspectOrcaDispatch(
+  orca: Pick<OrcaClient, "execute">,
+  receiptValue: unknown
+): Promise<OrcaDispatchInspection> {
+  const durableDispatchId = objectRecord(receiptValue)?.dispatchId;
+  if (typeof durableDispatchId !== "string") return Object.freeze({ kind: "missing" });
+  const receipt = await orca.execute({ kind: "show_worker", dispatchId: durableDispatchId });
+  const result = objectRecord(receipt.result);
+  const dispatch = objectRecord(result?.dispatch);
+  const worker = objectRecord(result?.worker);
+  const observation = objectRecord(result?.observation);
+  if (
+    dispatch?.id !== durableDispatchId
+    || worker?.dispatch_id !== durableDispatchId
+    || observation?.exactWorker !== true
+  ) return Object.freeze({ kind: "inconsistent" });
+  const state = typeof worker.state === "string" ? worker.state : "unknown";
+  if (["ready", "starting", "running", "active", "working"].includes(state)) {
+    return Object.freeze({ kind: "running" });
+  }
+  if (["worker_done", "completed", "released", "stopped"].includes(state)) {
+    return Object.freeze({ kind: "completed" });
+  }
+  return Object.freeze({ kind: "unknown" });
 }
 
 function approvalPrincipal(principal: AuthenticatedPrincipal): PrincipalBinding {
@@ -523,11 +581,13 @@ export async function createProductionGateway(
   let services: GatewayProductionServices | undefined;
   let commandFlow: ReturnType<typeof productionCommandFlow> | undefined;
   let outboxDriver: GatewayOutboxDriver | undefined;
+  let reconciliationTimestamp: string | undefined;
   let http: GatewayIngressPort | undefined = dependencies.http;
   const requireServices = (): GatewayProductionServices => {
     if (services === undefined) throw new Error("production services are unavailable before configuration validation");
     return services;
   };
+  const reconciledAt = (): string => reconciliationTimestamp ??= now().toISOString();
   const orca = "execute" in dependencies.orca
     ? dependencies.orca
     : new OrcaClient(dependencies.orca);
@@ -629,54 +689,74 @@ export async function createProductionGateway(
       }
     },
     orca: { async check() { await orca.health(); } },
-    reconcile: async () => {
-      const store = requireServices().store;
-      const reconciledAt = now().toISOString();
-      store.recoverExpiredOutboxClaims(reconciledAt, runtimeConfig.outboxClaimTtlMs);
-      if (commandFlow !== undefined) {
-        for (const approval of store.listApprovals()) {
-          if (approval.state === "approved" || approval.state === "consumed") {
+    reconcile: {
+      store: {
+        async recoverOutboxClaims() {
+          const store = requireServices().store;
+          store.recoverExpiredOutboxClaims(reconciledAt(), runtimeConfig.outboxClaimTtlMs);
+          if (commandFlow === undefined) return;
+          for (const approval of store.listApprovals()) {
+            if (approval.state !== "approved" && approval.state !== "consumed") continue;
             try {
               await commandFlow.resumeApproval(approval.request.approvalId);
             } catch {
-              // Durable state remains authoritative; unresolved work is diagnosed below.
+              // Durable approval and reconciliation audit remain authoritative.
             }
           }
+        },
+        listNonterminalDispatches() {
+          return nonterminalDispatches(requireServices().store);
+        }
+      },
+      channels: dependencies.channelRecovery,
+      orca: {
+        inspectDispatch: (receipt) => inspectOrcaDispatch(orca, receipt)
+      },
+      locks: {
+        reviewExpired(report) {
+          const { locks, store } = requireServices();
+          const timestamp = reconciledAt();
+          for (const project of dependencies.projects) {
+            const lease = locks.get(project.lockKey);
+            if (lease === undefined || lease.expiresAt > timestamp) continue;
+            const classification = report.find((result) =>
+              result.dispatchId === lease.dispatchId || result.receiptId === lease.dispatchId
+            );
+            store.appendAudit({
+              subjectId: lease.dispatchId,
+              eventType: "worktree_lock.reconciliation_reviewed",
+              data: {
+                lockKey: project.lockKey,
+                state: classification?.state ?? "review_required"
+              }
+            });
+          }
+        }
+      },
+      outbox: {
+        async drain() {
+          const { outbox, store } = requireServices();
+          const timestamp = reconciledAt();
+          const dueCount = store.listOutbox().filter((message) =>
+            message.state === "pending" && message.nextAttemptAt <= timestamp
+          ).length;
+          for (let index = 0; index < dueCount; index += 1) await outbox.tick(timestamp);
+        }
+      },
+      audit: {
+        record(event) {
+          requireServices().store.appendAudit({
+            subjectId: event.dispatchId,
+            eventType: event.kind === "classified"
+              ? "gateway.reconciliation_classified"
+              : `gateway.reconciliation_${event.kind}`,
+            data: event.kind === "classified"
+              ? { receiptId: event.receiptId, state: event.state }
+              : { receiptId: event.receiptId }
+          });
         }
       }
-      const activeRuns = store.listRunRecords().filter((run) => {
-        if (typeof run !== "object" || run === null || Array.isArray(run)) return true;
-        const state = run.state;
-        return typeof state !== "string" || ![
-          "verified_success",
-          "investigation_complete",
-          "intervention_required"
-        ].includes(state);
-      }).length;
-      const activeDispatches = store.listTasks().flatMap((task) =>
-        store.loadDispatchesForTask(task.id)
-      ).filter((dispatch) => {
-        if (typeof dispatch !== "object" || dispatch === null || Array.isArray(dispatch)) return true;
-        const state = dispatch.state;
-        return typeof state !== "string" || ![
-          "worker_done",
-          "launch_failed",
-          "intervention_required"
-        ].includes(state);
-      }).length;
-      if (activeRuns === 0 && activeDispatches === 0) return [];
-      store.appendAudit({
-        subjectId: "gateway",
-        eventType: "gateway.reconciliation_incomplete",
-        data: { activeRuns, activeDispatches }
-      });
-      return [Object.freeze({
-        component: "reconciliation",
-        code: "reconciliation_incomplete",
-        activeRuns,
-        activeDispatches
-      }) satisfies GatewayDiagnostic];
-    },
+    } satisfies ReconcilePorts,
     http: {
       async start() {
         if (http === undefined) throw new Error("production HTTP security configuration is required");

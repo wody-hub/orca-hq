@@ -27,8 +27,14 @@ export type GatewayDiagnostic = Readonly<
   | {
       component: "reconciliation";
       code: "reconciliation_incomplete";
-      activeRuns: number;
+      activeRuns?: number;
       activeDispatches: number;
+    }
+  | {
+      component: "reconciliation";
+      code: "reconciliation_review_required";
+      dispatchIds: readonly string[];
+      receiptIds: readonly string[];
     }
   | {
       component: "tailscale-serve";
@@ -312,14 +318,14 @@ export class Gateway {
       return this.#adapters.reconcile();
     }
     const report = await reconcileStartup(this.#adapters.reconcile);
-    const activeDispatches = report.filter(({ state }) => state !== "completed").length;
-    return activeDispatches === 0
+    const reviewRequired = report.filter(({ state }) => state === "review_required");
+    return reviewRequired.length === 0
       ? []
       : [Object.freeze({
           component: "reconciliation" as const,
-          code: "reconciliation_incomplete" as const,
-          activeRuns: 0,
-          activeDispatches
+          code: "reconciliation_review_required" as const,
+          dispatchIds: Object.freeze(reviewRequired.map(({ dispatchId }) => dispatchId)),
+          receiptIds: Object.freeze(reviewRequired.map(({ receiptId }) => receiptId))
         })];
   }
 
@@ -328,6 +334,12 @@ export class Gateway {
       ...diagnostic,
       ...("reasons" in diagnostic
         ? { reasons: Object.freeze([...diagnostic.reasons]) }
+        : {}),
+      ...("dispatchIds" in diagnostic
+        ? {
+            dispatchIds: Object.freeze([...diagnostic.dispatchIds]),
+            receiptIds: Object.freeze([...diagnostic.receiptIds])
+          }
         : {})
     }) as GatewayDiagnostic;
     const key = JSON.stringify(frozen);

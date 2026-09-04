@@ -285,6 +285,7 @@ function boundaries(
         return { kind: "proposal", proposal: executionProposal(command.commandId, riskLevel) };
       }
     },
+    channelRecovery: { async resumeCursors() {} },
     git: {
       async repositoryStatus() { return { dirty: false, head, branch: "main" }; },
       async resolveRevision() { return head; },

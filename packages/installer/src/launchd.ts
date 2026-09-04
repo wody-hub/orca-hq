@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { constants, readFileSync } from "node:fs";
+import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,12 @@ export type LaunchdStatus = Readonly<
 export interface LaunchdPort {
   createDirectory(path: string): Promise<void>;
   writeText(path: string, text: string, mode: number): Promise<void>;
+  inspectPath(path: string): Promise<Readonly<{
+    exists: boolean;
+    file: boolean;
+    readable: boolean;
+    executable: boolean;
+  }>>;
   command(
     executable: string,
     arguments_: readonly string[]
@@ -98,6 +104,28 @@ function operationError(operation: string): Error {
   });
 }
 
+function pathUnavailableError(): Error {
+  return Object.assign(new Error("A required Orca HQ gateway service path is unavailable."), {
+    code: "launchd_path_unavailable"
+  });
+}
+
+function definitionMismatchError(): Error {
+  return Object.assign(new Error("The loaded Orca HQ gateway service definition differs from the requested definition."), {
+    code: "launchd_definition_mismatch"
+  });
+}
+
+function loadedDefinitionMatches(stdout: string, paths: LaunchdPaths): boolean {
+  const program = /^\s*program\s*=\s*(.+?)\s*$/m.exec(stdout)?.[1];
+  const block = /^\s*arguments\s*=\s*\{\s*$([\s\S]*?)^\s*\}\s*$/m.exec(stdout)?.[1];
+  const arguments_ = block?.split("\n").map((line) => line.trim()).filter(Boolean);
+  return program === paths.nodePath
+    && arguments_?.length === 2
+    && arguments_[0] === paths.nodePath
+    && arguments_[1] === paths.gatewayEntryPath;
+}
+
 /** Provides exact-label launchctl operations; no shell, PID kill, or broad domain cleanup is used. */
 export function createLaunchdOperations(
   paths: LaunchdPaths,
@@ -110,6 +138,14 @@ export function createLaunchdOperations(
   };
   return Object.freeze({
     async install() {
+      const [node, gateway] = await Promise.all([
+        port.inspectPath(paths.nodePath),
+        port.inspectPath(paths.gatewayEntryPath)
+      ]);
+      if (!node.exists || !node.file || !node.readable || !node.executable
+        || !gateway.exists || !gateway.file || !gateway.readable) {
+        throw pathUnavailableError();
+      }
       await Promise.all([
         port.createDirectory(dirname(paths.plistPath)),
         port.createDirectory(dirname(paths.standardOutPath)),
@@ -120,10 +156,11 @@ export function createLaunchdOperations(
       if (result.exitCode !== 0) {
         const existing = await port.command("launchctl", ["print", target(paths)]);
         if (existing.exitCode !== 0) throw operationError("install");
+        if (!loadedDefinitionMatches(existing.stdout, paths)) throw definitionMismatchError();
       }
     },
     async start() {
-      await run("start", ["kickstart", "-k", target(paths)]);
+      await run("start", ["kickstart", target(paths)]);
     },
     async stop() {
       await run("stop", ["bootout", target(paths)]);
@@ -149,6 +186,18 @@ export function createNodeLaunchdPort(): LaunchdPort {
     },
     async writeText(path, text, mode) {
       await writeFile(path, text, { encoding: "utf8", mode });
+    },
+    async inspectPath(path) {
+      try {
+        const information = await stat(path);
+        const [readable, executable] = await Promise.all([
+          access(path, constants.R_OK).then(() => true, () => false),
+          access(path, constants.X_OK).then(() => true, () => false)
+        ]);
+        return { exists: true, file: information.isFile(), readable, executable };
+      } catch {
+        return { exists: false, file: false, readable: false, executable: false };
+      }
     },
     async command(executable, arguments_) {
       try {

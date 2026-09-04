@@ -8,17 +8,17 @@ import {
 } from "../src/reconcile.js";
 
 const dispatches: readonly ReconcileDispatch[] = [
-  { dispatchId: "dispatch-running", receipt: { id: "receipt-running" } },
-  { dispatchId: "dispatch-complete", receipt: { id: "receipt-complete" } },
-  { dispatchId: "dispatch-uncertain", receipt: { id: "receipt-uncertain" } }
+  { dispatchId: "dispatch-running", receiptId: "receipt-running", receipt: { id: "receipt-running" } },
+  { dispatchId: "dispatch-complete", receiptId: "receipt-complete", receipt: { id: "receipt-complete" } },
+  { dispatchId: "dispatch-uncertain", receiptId: "receipt-uncertain", receipt: { id: "receipt-uncertain" } }
 ];
 
-type InspectMany = NonNullable<ReconcilePorts["orca"]["inspectMany"]>;
+type InspectMany = (receipts: readonly unknown[]) => Promise<readonly import("../src/reconcile.js").OrcaDispatchInspection[]>;
 type FakePorts = Omit<ReconcilePorts, "orca"> & {
   orca: {
     inspectMany: InspectMany;
-    releaseWorker: ReturnType<typeof vi.fn<(dispatchId: string) => Promise<void>>>;
   };
+  releaseWorker: ReturnType<typeof vi.fn<(dispatchId: string) => Promise<void>>>;
 };
 
 function ports(events: string[], inspectMany?: InspectMany): FakePorts {
@@ -36,11 +36,12 @@ function ports(events: string[], inspectMany?: InspectMany): FakePorts {
           { kind: "completed" as const, receipt: { id: "exact-completion" } },
           { kind: "unknown" as const }
         ];
-      }),
-      releaseWorker: vi.fn<(dispatchId: string) => Promise<void>>()
+      })
     },
+    releaseWorker: vi.fn<(dispatchId: string) => Promise<void>>(),
     locks: { async reviewExpired(report) { events.push(`locks.reviewed:${report.length}`); } },
-    outbox: { async drain() { events.push("outbox.drained"); } }
+    outbox: { async drain() { events.push("outbox.drained"); } },
+    audit: { async record(event) { events.push(`audit.${event.kind}:${event.dispatchId}`); } }
   };
 }
 
@@ -56,6 +57,9 @@ describe("gateway startup reconciliation", () => {
       "cursors.resumed",
       "dispatches.listed",
       "orca.inspected:3",
+      "audit.classified:dispatch-running",
+      "audit.classified:dispatch-complete",
+      "audit.classified:dispatch-uncertain",
       "locks.reviewed:3",
       "outbox.drained"
     ]);
@@ -72,7 +76,7 @@ describe("gateway startup reconciliation", () => {
       dispatchId: "dispatch-uncertain",
       state: "review_required"
     }));
-    expect(fake.orca.releaseWorker).not.toHaveBeenCalled();
+    expect(fake.releaseWorker).not.toHaveBeenCalled();
   });
 
   it("keeps an exact completion receipt and does not duplicate worker work", async () => {
@@ -83,7 +87,55 @@ describe("gateway startup reconciliation", () => {
     expect(report).toContainEqual({
       dispatchId: "dispatch-complete",
       state: "completed",
-      receipt: { id: "exact-completion" }
+      receiptId: "receipt-complete"
     });
+  });
+
+  it("records a redacted durable failure for every dispatch when batch inspection rejects", async () => {
+    // Break caught: a rejected batch inspection is swallowed, leaving no durable reason for review.
+    const events: string[] = [];
+    const report = await reconcileStartup(ports(events, async () => {
+      throw new Error("provider-token=must-not-escape");
+    }));
+
+    expect(report.every(({ state }) => state === "review_required")).toBe(true);
+    expect(events.filter((event) => event.startsWith("audit.inspection_failed:"))).toEqual([
+      "audit.inspection_failed:dispatch-running",
+      "audit.inspection_failed:dispatch-complete",
+      "audit.inspection_failed:dispatch-uncertain"
+    ]);
+    expect(events.join("\n")).not.toContain("provider-token");
+  });
+
+  it("records only the rejected dispatch when per-dispatch inspection partially fails", async () => {
+    // Break caught: one rejected exact inspection can either fail the whole startup or disappear without an audit.
+    const events: string[] = [];
+    const fake: ReconcilePorts = {
+      ...ports(events),
+      orca: {
+        async inspectDispatch(receipt) {
+          if ((receipt as { id: string }).id === "receipt-complete") throw new Error("secret");
+          return { kind: "running" };
+        }
+      }
+    };
+
+    const report = await reconcileStartup(fake);
+
+    expect(report.map(({ state }) => state)).toEqual(["resumable", "review_required", "resumable"]);
+    expect(events).toContain("audit.inspection_failed:dispatch-complete");
+    expect(events).not.toContain("audit.inspection_failed:dispatch-running");
+  });
+
+  it("records missing batch entries instead of silently treating a short result as an Orca observation", async () => {
+    // Break caught: a short batch response creates review state without evidence that inspection data was missing.
+    const events: string[] = [];
+    const report = await reconcileStartup(ports(events, async () => [{ kind: "running" }]));
+
+    expect(report.map(({ state }) => state)).toEqual(["resumable", "review_required", "review_required"]);
+    expect(events.filter((event) => event.startsWith("audit.inspection_missing:"))).toEqual([
+      "audit.inspection_missing:dispatch-complete",
+      "audit.inspection_missing:dispatch-uncertain"
+    ]);
   });
 });

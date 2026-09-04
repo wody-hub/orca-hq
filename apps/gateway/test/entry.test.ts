@@ -73,6 +73,7 @@ function externalBoundaries(directory: string, events: string[]): GatewayExterna
       async execute() { throw new Error("not used"); }
     },
     proposalModel: { async plan() { return { kind: "failure", reason: "invalid_command" }; } },
+    channelRecovery: { async resumeCursors() { events.push("channels.resumed"); } },
     git: {
       async repositoryStatus() { return { dirty: false, head: "a".repeat(40), branch: "main" }; },
       async resolveRevision() { return "a".repeat(40); },
@@ -123,7 +124,7 @@ describe("gateway production entry", () => {
       expect(composition.gateway.status.kind).toBe("running");
       expect(composition.services.execution).toBeInstanceOf(ExecutionService);
       expect(composition.services.outbox).toBeInstanceOf(OutboxDispatcher);
-      expect(events).toEqual(["config.valid", "orca.checked", "slack.started", "telegram.started"]);
+      expect(events).toEqual(["config.valid", "orca.checked", "channels.resumed", "slack.started", "telegram.started"]);
       await composition.gateway.stop();
       expect(events.slice(-3)).toEqual(["telegram.stopped", "slack.stopped", "transactions.drained"]);
     } finally {

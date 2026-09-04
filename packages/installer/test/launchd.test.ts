@@ -24,6 +24,15 @@ class FakeLaunchd implements LaunchdPort {
   readonly writes: Array<Readonly<{ path: string; text: string; mode: number }>> = [];
   printResult: Readonly<{ exitCode: number; stdout: string }> = { exitCode: 0, stdout: "state = running\n\tpid = 428" };
   bootstrapExitCode = 0;
+  readonly pathInspections = new Map<string, Readonly<{
+    exists: boolean;
+    file: boolean;
+    readable: boolean;
+    executable: boolean;
+  }>>([
+    [paths.nodePath, { exists: true, file: true, readable: true, executable: true }],
+    [paths.gatewayEntryPath, { exists: true, file: true, readable: true, executable: false }]
+  ]);
 
   async createDirectory(path: string): Promise<void> {
     this.directories.push(path);
@@ -31,6 +40,11 @@ class FakeLaunchd implements LaunchdPort {
 
   async writeText(path: string, text: string, mode: number): Promise<void> {
     this.writes.push({ path, text, mode });
+  }
+
+  async inspectPath(path: string) {
+    return this.pathInspections.get(path)
+      ?? { exists: false, file: false, readable: false, executable: false };
   }
 
   async command(executable: string, arguments_: readonly string[]) {
@@ -47,6 +61,8 @@ describe("launchd supervision", () => {
     const plist = renderLaunchAgent(paths);
 
     expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain("<key>Crashed</key>");
+    expect(plist).toContain("<key>ThrottleInterval</key>");
     expect(plist).toContain("<key>RunAtLoad</key>");
     expect(plist).toContain("<string>/opt/homebrew/bin/node</string>");
     expect(plist).toContain("<string>/Users/pilot/orca-hq/apps/gateway/dist/entry.js</string>");
@@ -70,7 +86,7 @@ describe("launchd supervision", () => {
     }]);
     expect(fake.calls).toEqual([
       { executable: "launchctl", arguments: ["bootstrap", "gui/501", paths.plistPath] },
-      { executable: "launchctl", arguments: ["kickstart", "-k", "gui/501/com.orcahq.gateway"] },
+      { executable: "launchctl", arguments: ["kickstart", "gui/501/com.orcahq.gateway"] },
       { executable: "launchctl", arguments: ["bootout", "gui/501/com.orcahq.gateway"] }
     ]);
   });
@@ -89,6 +105,10 @@ describe("launchd supervision", () => {
     // Break caught: a second `hq start` fails only because bootstrap reports that this exact label is already loaded.
     const fake = new FakeLaunchd();
     fake.bootstrapExitCode = 5;
+    fake.printResult = {
+      exitCode: 0,
+      stdout: `program = ${paths.nodePath}\narguments = {\n\t${paths.nodePath}\n\t${paths.gatewayEntryPath}\n}\n`
+    };
     const launchd = createLaunchdOperations(paths, fake);
 
     await expect(launchd.install()).resolves.toBeUndefined();
@@ -97,5 +117,51 @@ describe("launchd supervision", () => {
       { executable: "launchctl", arguments: ["bootstrap", "gui/501", paths.plistPath] },
       { executable: "launchctl", arguments: ["print", "gui/501/com.orcahq.gateway"] }
     ]);
+  });
+
+  it("rejects an already loaded LaunchAgent whose executable definition differs", async () => {
+    // Break caught: install can report success while launchd still holds an older node/entry definition.
+    const fake = new FakeLaunchd();
+    fake.bootstrapExitCode = 5;
+    fake.printResult = {
+      exitCode: 0,
+      stdout: `program = /old/node\narguments = {\n\t/old/node\n\t/old/gateway.js\n}\n`
+    };
+
+    await expect(createLaunchdOperations(paths, fake).install()).rejects.toMatchObject({
+      code: "launchd_definition_mismatch"
+    });
+  });
+
+  it("refuses installation before writing a plist when the gateway entry is unavailable", async () => {
+    // Break caught: a missing source-build entry can be installed under KeepAlive and crash-loop forever.
+    const fake = new FakeLaunchd();
+    fake.pathInspections.set(paths.gatewayEntryPath, {
+      exists: false,
+      file: false,
+      readable: false,
+      executable: false
+    });
+
+    await expect(createLaunchdOperations(paths, fake).install()).rejects.toMatchObject({
+      code: "launchd_path_unavailable"
+    });
+    expect(fake.writes).toEqual([]);
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("refuses installation when the pinned Node executable is not executable", async () => {
+    // Break caught: an obsolete version-manager Node path can be persisted into a crash-only LaunchAgent.
+    const fake = new FakeLaunchd();
+    fake.pathInspections.set(paths.nodePath, {
+      exists: true,
+      file: true,
+      readable: true,
+      executable: false
+    });
+
+    await expect(createLaunchdOperations(paths, fake).install()).rejects.toMatchObject({
+      code: "launchd_path_unavailable"
+    });
   });
 });
