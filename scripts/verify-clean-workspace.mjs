@@ -5,10 +5,11 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync
+  rmSync,
+  rmdirSync
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -71,18 +72,69 @@ const testOutputs = new Set([
   ...workspaceDependencyOutputs("@orca-hq/test-support")
 ]);
 
-function run(command, args) {
-  const result = spawnSync(command, args, {
-    cwd: workspaceRoot,
-    env: process.env,
-    stdio: "inherit"
+const stagingRoot = join(workspaceRoot, ".clean-workspace-staging");
+const lockDirectory = join(stagingRoot, "active.lock");
+const signalExitCodes = new Map([
+  ["SIGINT", 130],
+  ["SIGTERM", 143]
+]);
+
+class VerificationSignalError extends Error {
+  constructor(signal) {
+    super(`clean-workspace verification interrupted by ${signal}`);
+    this.name = "VerificationSignalError";
+    this.signal = signal;
+  }
+}
+
+let activeChild;
+let receivedSignal;
+
+function handleSignal(signal) {
+  receivedSignal ??= signal;
+  if (activeChild !== undefined) {
+    activeChild.kill(signal);
+  }
+}
+
+const handleSigint = () => handleSignal("SIGINT");
+const handleSigterm = () => handleSignal("SIGTERM");
+process.on("SIGINT", handleSigint);
+process.on("SIGTERM", handleSigterm);
+
+async function run(command, args) {
+  if (receivedSignal !== undefined) {
+    throw new VerificationSignalError(receivedSignal);
+  }
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: workspaceRoot,
+      env: process.env,
+      stdio: "inherit"
+    });
+    activeChild = child;
+    let settled = false;
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      activeChild = undefined;
+      callback();
+    };
+    child.once("error", (error) => settle(() => reject(error)));
+    child.once("close", (status, signal) => settle(() => {
+      if (receivedSignal !== undefined) {
+        reject(new VerificationSignalError(receivedSignal));
+        return;
+      }
+      if (status !== 0) {
+        const outcome = signal === null ? `exit code ${status}` : `signal ${signal}`;
+        reject(new Error(`${command} ${args.join(" ")} failed with ${outcome}`));
+        return;
+      }
+      resolve();
+    }));
   });
-  if (result.error !== undefined) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}`);
-  }
 }
 
 function assertNoWorkspaceDist() {
@@ -112,10 +164,32 @@ let backupComplete = false;
 let backupDirectory;
 let originalOutputsDirectory;
 let generatedOutputsDirectory;
+let lockAcquired = false;
 
 try {
-  const stagingRoot = join(workspaceRoot, ".clean-workspace-staging");
   mkdirSync(stagingRoot, { recursive: true });
+  try {
+    mkdirSync(lockDirectory);
+    lockAcquired = true;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    throw new Error(
+      `clean-workspace verifier lock exists at ${lockDirectory}; ` +
+      "another verifier may be active or a previous run may have crashed; " +
+      "manual review is required before retrying"
+    );
+  }
+
+  const staleRuns = readdirSync(stagingRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run-"))
+    .map((entry) => join(stagingRoot, entry.name));
+  if (staleRuns.length > 0) {
+    throw new Error(
+      `clean-workspace staging contains stale run data at ${staleRuns.join(", ")}; ` +
+      "manual review is required before retrying"
+    );
+  }
+
   backupDirectory = mkdtempSync(join(stagingRoot, "run-"));
   originalOutputsDirectory = join(backupDirectory, "original");
   generatedOutputsDirectory = join(backupDirectory, "generated");
@@ -133,11 +207,11 @@ try {
 
   backupComplete = true;
   assertNoWorkspaceDist();
-  run("pnpm", ["prepare"]);
+  await run("pnpm", ["prepare"]);
   assertExactWorkspaceDist(prepareOutputs, "clean prepare");
-  run("pnpm", ["typecheck"]);
+  await run("pnpm", ["typecheck"]);
   assertExactWorkspaceDist(prepareOutputs, "clean typecheck");
-  run("pnpm", ["test"]);
+  await run("pnpm", ["test"]);
   assertExactWorkspaceDist(testOutputs, "clean test");
 } catch (error) {
   verificationError = error;
@@ -174,12 +248,33 @@ try {
       restorationErrors.push(error);
     }
   }
+  if (lockAcquired) {
+    try {
+      rmdirSync(lockDirectory);
+      lockAcquired = false;
+    } catch (error) {
+      restorationErrors.push(error);
+    }
+  }
 }
 
+process.off("SIGINT", handleSigint);
+process.off("SIGTERM", handleSigterm);
+
 if (restorationErrors.length > 0) {
-  const retentionLocation = backupDirectory === undefined
-    ? "before a backup directory was created"
-    : `backup retained at ${backupDirectory}`;
+  const recoveryLocations = [];
+  if (backupDirectory !== undefined && existsSync(backupDirectory)) {
+    recoveryLocations.push(`backup retained at ${backupDirectory}`);
+  }
+  if (existsSync(lockDirectory)) {
+    recoveryLocations.push(`lock retained at ${lockDirectory}`);
+  }
+  const retentionLocation = recoveryLocations.length === 0
+    ? "no recovery directory was created"
+    : recoveryLocations.join("; ");
+  if (receivedSignal !== undefined) {
+    process.exitCode = signalExitCodes.get(receivedSignal);
+  }
   throw new AggregateError(
     verificationError === undefined
       ? restorationErrors
@@ -187,6 +282,9 @@ if (restorationErrors.length > 0) {
     `clean-workspace verification could not restore dist outputs; ${retentionLocation}`
   );
 }
-if (verificationError !== undefined) {
+if (receivedSignal !== undefined) {
+  console.error(`clean-workspace verification interrupted by ${receivedSignal} after cleanup`);
+  process.exitCode = signalExitCodes.get(receivedSignal);
+} else if (verificationError !== undefined) {
   throw verificationError;
 }

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -35,6 +36,11 @@ interface VerificationResult {
   readonly commands: readonly string[];
 }
 
+interface RunningVerification {
+  readonly pid: number;
+  readonly completion: Promise<VerificationResult>;
+}
+
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(value)}\n`, "utf8");
@@ -48,10 +54,10 @@ function writeDist(root: string, relativePath: string, marker: string): void {
 }
 
 function createFixture(): Fixture {
-  const root = mkdtempSync(join(tmpdir(), "orca-hq-clean-verifier-workspace-"));
-  const externalTemporaryDirectory = mkdtempSync(
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "orca-hq-clean-verifier-workspace-")));
+  const externalTemporaryDirectory = realpathSync(mkdtempSync(
     join(tmpdir(), "orca-hq-clean-verifier-external-")
-  );
+  ));
   const verifierPath = join(root, "scripts", "verify-clean-workspace.mjs");
   const preloadPath = join(root, "test-support", "fail-backup-rename.mjs");
   const binDirectory = join(root, "test-support", "bin");
@@ -107,12 +113,36 @@ fs.mkdirSync = function mkdirSync(path, options) {
   return realMkdirSync(path, options);
 };
 fs.renameSync = function renameSync(source, destination) {
+  if (process.env.CLEAN_VERIFY_RENAME_LOG !== undefined) {
+    fs.appendFileSync(
+      process.env.CLEAN_VERIFY_RENAME_LOG,
+      \`${"${String(source)}"}->${"${String(destination)}"}\\n\`
+    );
+  }
   if (
     process.env.CLEAN_VERIFY_FAIL_BACKUP_SOURCE !== undefined &&
     String(source).endsWith(process.env.CLEAN_VERIFY_FAIL_BACKUP_SOURCE) &&
     String(destination).includes(\`${"${sep}"}original${"${sep}"}\`)
   ) {
     const error = new Error("synthetic partial backup failure");
+    error.code = "EIO";
+    throw error;
+  }
+  if (
+    process.env.CLEAN_VERIFY_FAIL_GENERATED_SOURCE !== undefined &&
+    String(source).endsWith(process.env.CLEAN_VERIFY_FAIL_GENERATED_SOURCE) &&
+    String(destination).includes(\`${"${sep}"}generated${"${sep}"}\`)
+  ) {
+    const error = new Error("synthetic generated sweep failure");
+    error.code = "EIO";
+    throw error;
+  }
+  if (
+    process.env.CLEAN_VERIFY_FAIL_RESTORE_DESTINATION !== undefined &&
+    String(source).includes(\`${"${sep}"}original${"${sep}"}\`) &&
+    String(destination).endsWith(process.env.CLEAN_VERIFY_FAIL_RESTORE_DESTINATION)
+  ) {
+    const error = new Error("synthetic original restore failure");
     error.code = "EIO";
     throw error;
   }
@@ -128,6 +158,7 @@ syncBuiltinESMExports();
     fakePnpmPath,
     `#!/usr/bin/env node
 import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 const command = process.argv[2] ?? "missing";
@@ -150,6 +181,12 @@ if (command === "prepare") {
   generate("packages/installer");
 }
 if (command === "test") generate("packages/test-support");
+if (process.env.CLEAN_VERIFY_HOLD_COMMAND === command) {
+  writeFileSync(process.env.CLEAN_VERIFY_READY_PATH, "ready\\n", "utf8");
+  while (!existsSync(process.env.CLEAN_VERIFY_RELEASE_PATH)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 `,
     "utf8"
   );
@@ -194,6 +231,8 @@ function runVerifier(
   options: Readonly<{
     failBackupPath?: string;
     failCommand?: string;
+    failGeneratedPath?: string;
+    failRestorePath?: string;
     failStagingMkdirSuffix?: string;
   }> = {}
 ): VerificationResult {
@@ -208,6 +247,8 @@ function runVerifier(
         CLEAN_VERIFY_COMMAND_LOG: fixture.commandLogPath,
         CLEAN_VERIFY_FAIL_BACKUP_SOURCE: options.failBackupPath,
         CLEAN_VERIFY_FAIL_COMMAND: options.failCommand,
+        CLEAN_VERIFY_FAIL_GENERATED_SOURCE: options.failGeneratedPath,
+        CLEAN_VERIFY_FAIL_RESTORE_DESTINATION: options.failRestorePath,
         CLEAN_VERIFY_FAIL_STAGING_MKDIR_SUFFIX: options.failStagingMkdirSuffix,
         PATH: `${join(fixture.root, "test-support", "bin")}${delimiter}${process.env.PATH ?? ""}`,
         TMPDIR: fixture.externalTemporaryDirectory
@@ -218,6 +259,72 @@ function runVerifier(
     ? readFileSync(fixture.commandLogPath, "utf8").trim().split("\n").filter(Boolean)
     : [];
   return { status: result.status, stderr: result.stderr, commands };
+}
+
+function startVerifier(
+  fixture: Fixture,
+  options: Readonly<{
+    commandLogPath?: string;
+    holdCommand?: string;
+    readyPath?: string;
+    releasePath?: string;
+    renameLogPath?: string;
+  }> = {}
+): RunningVerification {
+  const commandLogPath = options.commandLogPath ?? fixture.commandLogPath;
+  const child = spawn(
+    process.execPath,
+    ["--import", fixture.preloadPath, fixture.verifierPath],
+    {
+      cwd: fixture.root,
+      env: {
+        ...process.env,
+        CLEAN_VERIFY_COMMAND_LOG: commandLogPath,
+        CLEAN_VERIFY_HOLD_COMMAND: options.holdCommand,
+        CLEAN_VERIFY_READY_PATH: options.readyPath,
+        CLEAN_VERIFY_RELEASE_PATH: options.releasePath,
+        CLEAN_VERIFY_RENAME_LOG: options.renameLogPath,
+        PATH: `${join(fixture.root, "test-support", "bin")}${delimiter}${process.env.PATH ?? ""}`,
+        TMPDIR: fixture.externalTemporaryDirectory
+      },
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+  if (child.pid === undefined) throw new Error("verifier subprocess has no pid");
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const completion = new Promise<VerificationResult>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status) => {
+      const commands = existsSync(commandLogPath)
+        ? readFileSync(commandLogPath, "utf8").trim().split("\n").filter(Boolean)
+        : [];
+      resolve({ status, stderr, commands });
+    });
+  });
+  return { pid: child.pid, completion };
+}
+
+async function waitForPath(path: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function signalVerifier(pid: number, signal: "SIGINT" | "SIGTERM"): void {
+  process.kill(process.platform === "win32" ? pid : -pid, signal);
+}
+
+function retainedRuns(fixture: Fixture): string[] {
+  return readdirSync(join(fixture.root, stagingDirectoryName), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run-"))
+    .map((entry) => join(fixture.root, stagingDirectoryName, entry.name));
 }
 
 function expectOnlySiblingRemains(fixture: Fixture): void {
@@ -314,6 +421,181 @@ describe("clean workspace verifier dist preservation", () => {
       ]);
       expect(distSnapshot(fixture.root)).toEqual(original);
       expectOnlySiblingRemains(fixture);
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGTERM", 143]
+  ] as const)("restores every original dist after %s", async (signal, expectedStatus) => {
+    // Break caught: a handled termination signal can strand originals in staging.
+    const fixture = createFixture();
+    const original = distSnapshot(fixture.root);
+    const readyPath = join(fixture.root, "test-support", "ready");
+    const releasePath = join(fixture.root, "test-support", "release");
+    const running = startVerifier(fixture, {
+      holdCommand: "prepare",
+      readyPath,
+      releasePath
+    });
+    try {
+      await waitForPath(readyPath);
+      signalVerifier(running.pid, signal);
+      const result = await running.completion;
+
+      expect(result.status, result.stderr).toBe(expectedStatus);
+      expect(result.commands.map((entry) => entry.split(":", 1)[0])).toEqual(["prepare"]);
+      expect(distSnapshot(fixture.root)).toEqual(original);
+      expectOnlySiblingRemains(fixture);
+    } finally {
+      if (existsSync(fixture.root)) writeFileSync(releasePath, "release\n", "utf8");
+      await running.completion;
+      removeFixture(fixture);
+    }
+  });
+
+  it("rejects a concurrent verifier before it moves or generates any dist", async () => {
+    // Break caught: an overlapping verifier can mistake the active run's output for originals.
+    const fixture = createFixture();
+    const original = distSnapshot(fixture.root);
+    const readyPath = join(fixture.root, "test-support", "ready");
+    const releasePath = join(fixture.root, "test-support", "release");
+    const secondCommandLogPath = join(fixture.root, "test-support", "commands-second.log");
+    const secondRenameLogPath = join(fixture.root, "test-support", "renames-second.log");
+    const first = startVerifier(fixture, {
+      holdCommand: "prepare",
+      readyPath,
+      releasePath
+    });
+    try {
+      await waitForPath(readyPath);
+      const activeOutput = distSnapshot(fixture.root);
+      const second = startVerifier(fixture, {
+        commandLogPath: secondCommandLogPath,
+        renameLogPath: secondRenameLogPath
+      });
+      const secondResult = await second.completion;
+
+      expect(secondResult.status).not.toBe(0);
+      expect(secondResult.stderr).toContain(
+        join(fixture.root, stagingDirectoryName, "active.lock")
+      );
+      expect(secondResult.stderr).toContain("manual review");
+      expect(secondResult.commands).toEqual([]);
+      expect(existsSync(secondRenameLogPath)).toBe(false);
+      expect(distSnapshot(fixture.root)).toEqual(activeOutput);
+
+      writeFileSync(releasePath, "release\n", "utf8");
+      const firstResult = await first.completion;
+      expect(firstResult.status, firstResult.stderr).toBe(0);
+      expect(distSnapshot(fixture.root)).toEqual(original);
+      expectOnlySiblingRemains(fixture);
+    } finally {
+      if (existsSync(fixture.root)) writeFileSync(releasePath, "release\n", "utf8");
+      await first.completion;
+      removeFixture(fixture);
+    }
+  });
+
+  it("fails closed on an active lock without touching workspace outputs", () => {
+    // Break caught: a post-crash lock can be ignored and the next run can move originals.
+    const fixture = createFixture();
+    const original = distSnapshot(fixture.root);
+    const lockPath = join(fixture.root, stagingDirectoryName, "active.lock");
+    mkdirSync(lockPath);
+    try {
+      const result = runVerifier(fixture);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(lockPath);
+      expect(result.stderr).toContain("manual review");
+      expect(result.commands).toEqual([]);
+      expect(distSnapshot(fixture.root)).toEqual(original);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it("fails closed on a stale run and reports its exact recovery path", () => {
+    // Break caught: crash debris can be guessed to be generated output and deleted automatically.
+    const fixture = createFixture();
+    const original = distSnapshot(fixture.root);
+    const staleRunPath = join(fixture.root, stagingDirectoryName, "run-crashed");
+    mkdirSync(join(staleRunPath, "original"), { recursive: true });
+    writeFileSync(join(staleRunPath, "original", "inspect-me.txt"), "retained\n", "utf8");
+    try {
+      const result = runVerifier(fixture);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(staleRunPath);
+      expect(result.stderr).toContain("manual review");
+      expect(result.commands).toEqual([]);
+      expect(distSnapshot(fixture.root)).toEqual(original);
+      expect(readFileSync(join(staleRunPath, "original", "inspect-me.txt"), "utf8"))
+        .toBe("retained\n");
+      expect(existsSync(join(fixture.root, stagingDirectoryName, "active.lock"))).toBe(false);
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it("continues restoring other originals and retains recovery data after generated sweep fails", () => {
+    // Break caught: one generated-output move failure can abort all remaining original restores.
+    const fixture = createFixture();
+    try {
+      const result = runVerifier(fixture, {
+        failGeneratedPath: join("packages", "core", "dist")
+      });
+      const runs = retainedRuns(fixture);
+      const run = runs[0];
+
+      expect(result.status).not.toBe(0);
+      expect(runs).toHaveLength(1);
+      expect(run).toBeDefined();
+      if (run === undefined) throw new Error("expected one retained verifier run");
+      expect(result.stderr).toContain(`backup retained at ${run}`);
+      expect(readFileSync(join(fixture.root, "packages/core/dist/generated.txt"), "utf8"))
+        .toBe("prepare\n");
+      expect(readFileSync(join(run, "original/packages/core/marker.txt"), "utf8"))
+        .toBe("original-core\n");
+      expect(readFileSync(join(fixture.root, "packages/installer/dist/marker.txt"), "utf8"))
+        .toBe("original-installer\n");
+      expect(readFileSync(join(fixture.root, "packages/test-support/dist/marker.txt"), "utf8"))
+        .toBe("original-test-support\n");
+      expect(readFileSync(join(fixture.root, stagingDirectoryName, "user-sibling/keep.txt"), "utf8"))
+        .toBe("do-not-delete\n");
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it("continues restoring other originals and retains a backup after one restore fails", () => {
+    // Break caught: one original restore error can prevent later originals from being restored.
+    const fixture = createFixture();
+    try {
+      const result = runVerifier(fixture, {
+        failRestorePath: join("packages", "core", "dist")
+      });
+      const runs = retainedRuns(fixture);
+      const run = runs[0];
+
+      expect(result.status).not.toBe(0);
+      expect(runs).toHaveLength(1);
+      expect(run).toBeDefined();
+      if (run === undefined) throw new Error("expected one retained verifier run");
+      expect(result.stderr).toContain(`backup retained at ${run}`);
+      expect(existsSync(join(fixture.root, "packages/core/dist"))).toBe(false);
+      expect(readFileSync(join(run, "original/packages/core/marker.txt"), "utf8"))
+        .toBe("original-core\n");
+      expect(readFileSync(join(fixture.root, "packages/installer/dist/marker.txt"), "utf8"))
+        .toBe("original-installer\n");
+      expect(readFileSync(join(fixture.root, "packages/test-support/dist/marker.txt"), "utf8"))
+        .toBe("original-test-support\n");
+      expect(readFileSync(join(fixture.root, stagingDirectoryName, "user-sibling/keep.txt"), "utf8"))
+        .toBe("do-not-delete\n");
     } finally {
       removeFixture(fixture);
     }
