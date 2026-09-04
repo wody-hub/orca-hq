@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { expect, it } from "vitest";
 
+import { preservedCorepackHome } from "./corepack-home.js";
+
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function cleanPath(): string {
@@ -94,6 +96,7 @@ async function createIsolatedHost(fixture: string): Promise<NodeJS.ProcessEnv> {
   }
   return {
     ...process.env,
+    COREPACK_HOME: preservedCorepackHome,
     HOME: home,
     XDG_CONFIG_HOME: configHome,
     PATH: `${bin}${delimiter}${cleanPath()}`
@@ -121,6 +124,7 @@ it("runs exact pnpm hq after the first offline install of a clean source workspa
       env: {
         ...process.env,
         CI: "true",
+        COREPACK_HOME: preservedCorepackHome,
         HOME: installHome,
         XDG_CONFIG_HOME: join(installHome, ".config"),
         NPM_CONFIG_USERCONFIG: join(installHome, ".npmrc"),

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { preservedCorepackHome } from "./corepack-home.js";
+
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const cliPath = join(repositoryRoot, "packages", "installer", "dist", "cli.js");
 
@@ -66,6 +68,7 @@ async function createHostFixture(): Promise<Readonly<{
     registryPath,
     env: {
       ...process.env,
+      COREPACK_HOME: preservedCorepackHome,
       HOME: home,
       XDG_CONFIG_HOME: configHome,
       PATH: `${bin}:${process.env.PATH ?? ""}`
