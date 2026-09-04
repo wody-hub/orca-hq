@@ -35,7 +35,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm typecheck
 pnpm build
-node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/private-pilot-acceptance.json
+PILOT_REPORT_DIR=$(mktemp -d)
+node scripts/run-pilot-acceptance.mjs --runs 20 --output "$PILOT_REPORT_DIR/private-pilot-acceptance.json"
 ```
 
 위 acceptance report의 `evidenceMode`는 `deterministic_simulation`, `pilotReady`는 `false`입니다. 실제 동료 Mac에서의 설치·채널 연결·2주 운영 gate를 대신하지 않습니다.

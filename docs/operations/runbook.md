@@ -18,7 +18,7 @@ pnpm hq start
 pnpm hq stop
 ```
 
-`status`는 `running`, `loaded`, `stopped` 중 하나를 JSON으로 반환합니다. `stopped`는 exit 1입니다. `start`는 정확한 `com.orcahq.gateway` user LaunchAgent를 설치/시작하고, `stop`은 그 exact label만 bootout합니다.
+`status`는 `running`, `loaded`, `stopped` 중 하나를 JSON으로 반환합니다. `stopped`는 exit 1입니다. `start`는 정확한 `com.orcahq.gateway` user LaunchAgent를 설치/시작합니다. 이 job이 loaded된 동안 launchd는 crash와 정상 non-zero 종료를 포함해 gateway가 끝나면 30초 throttle을 두고 다시 시작합니다. `stop`은 그 exact label을 bootout하므로 명시적으로 중지한 뒤에는 재기동하지 않습니다.
 
 별도 `restart` subcommand는 없습니다. graceful stop은 ingress를 닫고 local transaction을 drain하고 Outbox를 멈춘 뒤 SQLite checkpoint/close를 시도합니다.
 

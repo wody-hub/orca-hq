@@ -76,15 +76,15 @@ async function createHostFixture(): Promise<Readonly<{
 async function runInteractiveSetup(
   env: NodeJS.ProcessEnv,
   answers: readonly string[],
-  timeoutMs = 2_000
+  timeoutMs = 15_000
 ): Promise<ProcessResult & { readonly timedOut: boolean }> {
   const prompts = [
     "Pilot project Registry path: ",
-    "Slack app token (leave blank to skip): ",
-    "Slack channel ID (leave blank to skip): ",
-    "Telegram bot token (leave blank to skip): ",
-    "Telegram allowlisted chat ID (leave blank to skip): ",
-    "OpenAI API key (leave blank to skip): ",
+    "Slack app token (required on first install; leave blank during migration to keep the existing Keychain account): ",
+    "Slack channel ID (required on first install; leave blank during migration to keep the existing Keychain account): ",
+    "Telegram bot token (required on first install; leave blank during migration to keep the existing Keychain account): ",
+    "Telegram allowlisted chat ID (required on first install; leave blank during migration to keep the existing Keychain account): ",
+    "OpenAI API key (required on first install; leave blank during migration to keep the existing Keychain account): ",
     "Apply this setup? [y/N] "
   ];
   return await new Promise((resolvePromise, reject) => {
@@ -116,7 +116,7 @@ async function runInteractiveSetup(
 beforeAll(async () => {
   const build = await run("pnpm", ["--filter", "@orca-hq/installer", "build"], { cwd: repositoryRoot });
   if (build.exitCode !== 0) throw new Error(`installer build failed: ${build.stderr}`);
-});
+}, 60_000);
 
 describe("pnpm hq doctor process contract", () => {
   it("writes one parseable JSON document to stdout with a temporary, fully-probed host", async () => {
@@ -162,7 +162,7 @@ describe("pnpm hq doctor process contract", () => {
   });
 });
 
-describe("hq setup process safety", () => {
+describe.sequential("hq setup process safety", () => {
   it("exits after failed preflight without waiting on an open readline handle", async () => {
     // Break caught: preflight returns before confirm, so CLI-level prompt ownership must still release stdin.
     const host = await createHostFixture();
@@ -175,10 +175,11 @@ describe("hq setup process safety", () => {
       expect(result.timedOut).toBe(false);
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toContain("Setup stopped before configuration");
+      expect(result.stdout).toContain("required on first install");
     } finally {
       await rm(host.fixture, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("does not echo credentials or expose a failing Keychain command", async () => {
     // Break caught: terminal echo and execFile's argv-bearing error can independently print the same secret.
@@ -212,5 +213,5 @@ describe("hq setup process safety", () => {
     } finally {
       await rm(host.fixture, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

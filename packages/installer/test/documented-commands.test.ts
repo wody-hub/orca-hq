@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,5 +180,19 @@ it("rejects misspelled or trailing flags with usage and exit 2", async () => {
     expect(result.exitCode, input.join(" ")).toBe(2);
     expect(result.output, input.join(" ")).toMatch(/^Usage: hq /);
     expect(result.calls, input.join(" ")).toEqual([]);
+  }
+});
+
+it("keeps generated acceptance and browser-test output outside the public repository index", () => {
+  // Break caught: a standard acceptance or Playwright run can leave publishable output that `git add -A` stages.
+  for (const generatedPath of [
+    ".artifacts/private-pilot-acceptance.json",
+    "apps/web/test-results/private-pilot/trace.zip"
+  ]) {
+    expect(() => execFileSync(
+      "git",
+      ["check-ignore", "--quiet", "--no-index", generatedPath],
+      { cwd: repositoryRoot, stdio: "ignore" }
+    ), generatedPath).not.toThrow();
   }
 });

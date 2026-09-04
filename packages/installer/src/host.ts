@@ -3,7 +3,6 @@ import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { arch, homedir, platform } from "node:os";
 import { dirname } from "node:path";
-import { promisify } from "node:util";
 
 import {
   defaultPilotDatabasePath,
@@ -18,13 +17,28 @@ import type { DoctorPorts, CheckStatus } from "./doctor.js";
 import { ORCA_HQ_KEYCHAIN_SERVICE, type KeychainPort } from "./keychain.js";
 import type { SetupAnswers, SetupOutputPort, SetupPorts } from "./setup.js";
 
-const execFileAsync = promisify(execFile);
-
 export type HostCommandRunner = (
   executable: string,
   arguments_: readonly string[],
-  options: Readonly<{ timeout?: number; maxBuffer: number }>
+  options: Readonly<{ timeout?: number; maxBuffer: number; stdin?: string }>
 ) => Promise<Readonly<{ stdout: string }>>;
+
+const runHostCommand: HostCommandRunner = async (executable, arguments_, options) => await new Promise(
+  (resolvePromise, reject) => {
+    const child = execFile(executable, [...arguments_], {
+      ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
+      maxBuffer: options.maxBuffer
+    }, (error, stdout) => {
+      if (error !== null) {
+        reject(new Error("Host command failed."));
+        return;
+      }
+      resolvePromise({ stdout });
+    });
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(options.stdin);
+  }
+);
 
 export interface HostReadPort {
   platform(): string;
@@ -196,10 +210,7 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
 }
 
 export function createNodeMachine(
-  runCommand: HostCommandRunner = async (executable, arguments_, options) => {
-    const result = await execFileAsync(executable, [...arguments_], options);
-    return { stdout: result.stdout };
-  }
+  runCommand: HostCommandRunner = runHostCommand
 ): HostMachinePort {
   return {
     platform,
@@ -225,7 +236,11 @@ export function createNodeMachine(
     async writeText(path, text) { await writeFile(path, text, { encoding: "utf8", mode: 0o600 }); },
     async storeKeychainSecret(service, account, value) {
       try {
-        await runCommand("security", ["add-generic-password", "-U", "-s", service, "-a", account, "-w", value], { maxBuffer: 64 * 1024 });
+        await runCommand(
+          "security",
+          ["add-generic-password", "-U", "-s", service, "-a", account, "-w"],
+          { maxBuffer: 64 * 1024, stdin: `${value}\n` }
+        );
       } catch {
         throw new Error("Unable to store credential in macOS Keychain.");
       }

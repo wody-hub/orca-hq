@@ -62,11 +62,11 @@ class FakeLaunchd implements LaunchdPort {
 
 describe("launchd supervision", () => {
   it("renders a user LaunchAgent with explicit paths and restart policy", () => {
-    // Break caught: a login-started gateway can depend on shell expansion or leak a credential into its plist.
+    // Break caught: crash-only supervision leaves the central gateway stopped after a normal non-zero exit.
     const plist = renderLaunchAgent(paths);
 
-    expect(plist).toContain("<key>KeepAlive</key>");
-    expect(plist).toContain("<key>Crashed</key>");
+    expect(plist).toContain("<key>KeepAlive</key>\n  <true/>");
+    expect(plist).not.toContain("<key>Crashed</key>");
     expect(plist).toContain("<key>ThrottleInterval</key>");
     expect(plist).toContain("<key>RunAtLoad</key>");
     expect(plist).toContain("<string>/opt/homebrew/bin/node</string>");

@@ -71,9 +71,9 @@ class FakeLoginLaunchd implements LaunchdPort {
     this.#startAtLoad();
   }
 
-  killProcess(): void {
+  exitProcess(_kind: "crash" | "nonzero"): void {
     this.running = false;
-    if (this.plist.includes("<key>Crashed</key>")) this.#start();
+    if (this.loaded && this.plist.includes("<key>KeepAlive</key>\n  <true/>")) this.#start();
   }
 
   logout(): void {
@@ -92,8 +92,8 @@ class FakeLoginLaunchd implements LaunchdPort {
 }
 
 describe("deterministic private-pilot restart fixture", () => {
-  it("bootstraps at Mac login and reconciles a killed process without duplicate dispatch or release", async () => {
-    // Break caught: login/restart recovery can omit bootstrap, duplicate uncertain work, or release its worker.
+  it("keeps a loaded gateway alive until exact bootout and reconciles without duplicate dispatch or release", async () => {
+    // Break caught: login/exit recovery can omit restart, duplicate uncertain work, release its worker, or ignore exact bootout.
     const launchctl = new FakeLoginLaunchd();
     const operations = createLaunchdOperations(paths, launchctl);
     await operations.install();
@@ -103,8 +103,15 @@ describe("deterministic private-pilot restart fixture", () => {
     launchctl.login();
     expect(launchctl.processStarts).toBe(2);
 
-    launchctl.killProcess();
+    launchctl.exitProcess("crash");
     expect(launchctl.processStarts).toBe(3);
+
+    launchctl.exitProcess("nonzero");
+    expect(launchctl.processStarts).toBe(4);
+
+    await operations.stop();
+    launchctl.exitProcess("nonzero");
+    expect(launchctl.processStarts).toBe(4);
 
     const fakeOrca = {
       duplicateDispatches: 0,

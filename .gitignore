@@ -1,5 +1,7 @@
 .worktrees/
 .superpowers/
+.artifacts/
+apps/web/test-results/
 node_modules/
 dist/
 coverage/

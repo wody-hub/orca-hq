@@ -82,6 +82,9 @@ describe("guided private-pilot setup", () => {
     expect(result.ok).toBe(false);
     expect(fixture.keychain.entries).toEqual([]);
     expect(fixture.configFile.writes).toEqual([]);
+    expect(fixture.output.lines).toEqual([
+      "Setup stopped before configuration; failed checks: host.macos-cpu. Resolve them with hq doctor."
+    ]);
   });
 
   it("leaves Keychain and config untouched when the explicit confirmation is declined", async () => {

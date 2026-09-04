@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, resolve } from "node:path";
+import { lstat, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -37,17 +37,28 @@ function parseArguments(argv) {
 }
 
 async function boundedOutputPath(value) {
-  const artifactRoot = resolve(process.cwd(), ".artifacts");
-  const outputPath = resolve(process.cwd(), value);
+  if (!isAbsolute(value)) throw new TypeError(INVALID);
+  const requestedPath = resolve(value);
   if (
-    dirname(outputPath) !== artifactRoot
-    || extname(outputPath) !== ".json"
-    || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(basename(outputPath))
+    extname(requestedPath) !== ".json"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(basename(requestedPath))
   ) {
     throw new TypeError(INVALID);
   }
-  await mkdir(artifactRoot, { recursive: true });
-  if (await realpath(artifactRoot) !== artifactRoot) throw new TypeError(INVALID);
+  const [repositoryRoot, outputDirectory] = await Promise.all([
+    realpath(process.cwd()),
+    realpath(dirname(requestedPath))
+  ]);
+  const relativeDirectory = relative(repositoryRoot, outputDirectory);
+  if (
+    relativeDirectory === ""
+    || (relativeDirectory !== ".."
+      && !relativeDirectory.startsWith(`..${sep}`)
+      && !isAbsolute(relativeDirectory))
+  ) {
+    throw new TypeError(INVALID);
+  }
+  const outputPath = join(outputDirectory, basename(requestedPath));
   try {
     const existing = await lstat(outputPath);
     if (existing.isSymbolicLink() || !existing.isFile()) throw new TypeError(INVALID);

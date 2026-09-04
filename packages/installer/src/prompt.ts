@@ -16,11 +16,11 @@ export interface TerminalPromptOptions {
 }
 
 const credentialPrompts = Object.freeze([
-  ["slack-app-token", "Slack app token (leave blank to skip): "],
-  ["slack-channel-id", "Slack channel ID (leave blank to skip): "],
-  ["telegram-bot-token", "Telegram bot token (leave blank to skip): "],
-  ["telegram-allowed-chat-id", "Telegram allowlisted chat ID (leave blank to skip): "],
-  ["openai-api-key", "OpenAI API key (leave blank to skip): "]
+  ["slack-app-token", "Slack app token (required on first install; leave blank during migration to keep the existing Keychain account): "],
+  ["slack-channel-id", "Slack channel ID (required on first install; leave blank during migration to keep the existing Keychain account): "],
+  ["telegram-bot-token", "Telegram bot token (required on first install; leave blank during migration to keep the existing Keychain account): "],
+  ["telegram-allowed-chat-id", "Telegram allowlisted chat ID (required on first install; leave blank during migration to keep the existing Keychain account): "],
+  ["openai-api-key", "OpenAI API key (required on first install; leave blank during migration to keep the existing Keychain account): "]
 ] as const);
 
 /** Terminal-only input boundary. Values are passed straight to Keychain and are never echoed. */

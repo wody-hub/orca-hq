@@ -141,4 +141,4 @@ jobs:
           echo "Keychain and launchd remain read-only adapter probes; this file snapshot does not claim to observe those services."
 
       - name: Run deterministic pilot acceptance
-        run: node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/private-ci-acceptance.json
+        run: node scripts/run-pilot-acceptance.mjs --runs 20 --output "$RUNNER_TEMP/private-ci-acceptance.json"

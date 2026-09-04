@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
@@ -119,10 +121,10 @@ describe("deterministic private-pilot acceptance", () => {
     expect(passesGate(report)).toBe(false);
   });
 
-  it("writes one bounded machine-readable report and rejects unsafe arguments", async () => {
-    // Break caught: the runner accepts unbounded paths or writes a report that can be mistaken for live evidence.
-    const output = `.artifacts/pilot-script-test-${process.pid}.json`;
-    await rm(output, { force: true });
+  it("writes one repository-external machine-readable report and rejects unsafe arguments", async () => {
+    // Break caught: the runner can force generated evidence into the public checkout or accept an unbounded output path.
+    const outputDirectory = await mkdtemp(join(tmpdir(), "orca-hq-pilot-script-"));
+    const output = join(outputDirectory, "report.json");
     try {
       await execFileAsync(process.execPath, [
         "scripts/run-pilot-acceptance.mjs",
@@ -146,13 +148,13 @@ describe("deterministic private-pilot acceptance", () => {
         "--runs",
         "0",
         "--output",
-        "../pilot-report.json"
+        resolve("pilot-report.json")
       ], { encoding: "utf8" })).rejects.toMatchObject({
         code: 2,
         stderr: "pilot_acceptance_invalid_arguments\n"
       });
     } finally {
-      await rm(output, { force: true });
+      await rm(outputDirectory, { recursive: true, force: true });
     }
   }, 20_000);
 });

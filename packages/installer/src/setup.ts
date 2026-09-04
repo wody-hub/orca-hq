@@ -56,7 +56,12 @@ export function createSetup(ports: SetupPorts): Readonly<{
     async run(answers: SetupAnswers): Promise<SetupResult> {
       const preflight = await createDoctor({ checks: ports.checks, registry: ports.registry }).run({ format: "json" });
       if (!preflight.ok) {
-        ports.output.write("Setup stopped before configuration; resolve failed checks with hq doctor.");
+        const failedCheckIds = preflight.checks
+          .filter((check) => check.status === "fail")
+          .map((check) => check.id);
+        ports.output.write(
+          `Setup stopped before configuration; failed checks: ${failedCheckIds.join(", ")}. Resolve them with hq doctor.`
+        );
         return Object.freeze({ ok: false, checks: preflight.checks });
       }
 

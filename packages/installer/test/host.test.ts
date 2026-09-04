@@ -56,10 +56,20 @@ class RecordingMachine implements HostMachinePort {
 }
 
 describe("macOS host adapters", () => {
-  it("replaces Keychain command failures with a fixed secret-free error", async () => {
-    // Break caught: Node's execFile error contains every argv value, including the credential passed after -w.
+  it("passes Keychain secrets only through stdin and redacts command failures", async () => {
+    // Break caught: putting the credential after `-w` exposes it in process argv and command-failure diagnostics.
     const secret = "xapp-SUPERSECRET";
-    const machine = createNodeMachine(async (_executable, arguments_) => {
+    let invocation: Readonly<{
+      executable: string;
+      arguments: readonly string[];
+      stdin?: string;
+    }> | undefined;
+    const machine = createNodeMachine(async (executable, arguments_, options) => {
+      invocation = {
+        executable,
+        arguments: [...arguments_],
+        stdin: (options as { stdin?: string }).stdin
+      };
       throw new Error(`Command failed: security ${arguments_.join(" ")}`);
     });
 
@@ -73,6 +83,17 @@ describe("macOS host adapters", () => {
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toBe("Unable to store credential in macOS Keychain.");
     expect((thrown as Error).message).not.toContain(secret);
+    expect(invocation).toEqual({
+      executable: "security",
+      arguments: [
+        "add-generic-password", "-U",
+        "-s", "orca-hq",
+        "-a", "slack-app-token",
+        "-w"
+      ],
+      stdin: `${secret}\n`
+    });
+    expect(JSON.stringify(invocation?.arguments)).not.toContain(secret);
   });
 
   it("runs every doctor probe through a recording read-only machine boundary", async () => {
@@ -159,6 +180,22 @@ describe("macOS host adapters", () => {
 
     expect(result.ok).toBe(true);
     expect(machine.mutations).toContain("write:/temporary/config/orca-hq/pilot.json");
+  });
+
+  it("fails a fresh setup with blank credentials and names every missing credential check", async () => {
+    // Break caught: first-install blank input can be described as skippable and then fail with no actionable check IDs.
+    const machine = new RecordingMachine({ config: "missing" });
+    const adapters = createMacosHostAdapters(machine);
+    const output = { lines: [] as string[], write(text: string) { this.lines.push(text); } };
+    const answers = { credentials: {}, registryPath: "/temporary/projects.yaml" };
+
+    const result = await createSetup(adapters.setup(output, async () => true, answers)).run(answers);
+
+    expect(result.ok).toBe(false);
+    expect(machine.mutations).toEqual([]);
+    expect(output.lines).toEqual([
+      "Setup stopped before configuration; failed checks: slack.socket-mode, telegram.allowlisted-chat, openai.voice. Resolve them with hq doctor."
+    ]);
   });
 
   it.each(["malformed", "arbitrary"] as const)(
