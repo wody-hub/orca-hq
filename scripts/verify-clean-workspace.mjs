@@ -93,7 +93,17 @@ let receivedSignal;
 function handleSignal(signal) {
   receivedSignal ??= signal;
   if (activeChild !== undefined) {
-    activeChild.kill(signal);
+    if (process.platform === "win32" || activeChild.pid === undefined) {
+      activeChild.kill(signal);
+      return;
+    }
+    try {
+      process.kill(-activeChild.pid, signal);
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        activeChild.kill(signal);
+      }
+    }
   }
 }
 
@@ -110,6 +120,7 @@ async function run(command, args) {
   await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: workspaceRoot,
+      detached: process.platform !== "win32",
       env: process.env,
       stdio: "inherit"
     });
@@ -160,6 +171,8 @@ function assertExactWorkspaceDist(expectedOutputs, phase) {
 
 let verificationError;
 const restorationErrors = [];
+const backupCleanupErrors = [];
+const lockCleanupErrors = [];
 let backupComplete = false;
 let backupDirectory;
 let originalOutputsDirectory;
@@ -173,9 +186,18 @@ try {
     lockAcquired = true;
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
+    const recoveryOriginals = readdirSync(stagingRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith("run-"))
+      .map((entry) => join(stagingRoot, entry.name, "original"))
+      .filter((path) => existsSync(path));
+    const recoveryGuidance = recoveryOriginals.length === 0
+      ? "no recovery original directories were found"
+      : `recovery originals found at ${recoveryOriginals.join(", ")}`;
     throw new Error(
       `clean-workspace verifier lock exists at ${lockDirectory}; ` +
       "another verifier may be active or a previous run may have crashed; " +
+      `${recoveryGuidance}; ` +
+      "do not remove the lock until you have confirmed no verifier process is still running; " +
       "manual review is required before retrying"
     );
   }
@@ -245,7 +267,7 @@ try {
     try {
       rmSync(backupDirectory, { recursive: true });
     } catch (error) {
-      restorationErrors.push(error);
+      backupCleanupErrors.push(error);
     }
   }
   if (lockAcquired) {
@@ -253,7 +275,7 @@ try {
       rmdirSync(lockDirectory);
       lockAcquired = false;
     } catch (error) {
-      restorationErrors.push(error);
+      lockCleanupErrors.push(error);
     }
   }
 }
@@ -261,7 +283,12 @@ try {
 process.off("SIGINT", handleSigint);
 process.off("SIGTERM", handleSigterm);
 
-if (restorationErrors.length > 0) {
+const recoveryErrors = [
+  ...restorationErrors,
+  ...backupCleanupErrors,
+  ...lockCleanupErrors
+];
+if (recoveryErrors.length > 0) {
   const recoveryLocations = [];
   if (backupDirectory !== undefined && existsSync(backupDirectory)) {
     recoveryLocations.push(`backup retained at ${backupDirectory}`);
@@ -272,14 +299,21 @@ if (restorationErrors.length > 0) {
   const retentionLocation = recoveryLocations.length === 0
     ? "no recovery directory was created"
     : recoveryLocations.join("; ");
-  if (receivedSignal !== undefined) {
-    process.exitCode = signalExitCodes.get(receivedSignal);
-  }
+  const failureReasons = [];
+  if (restorationErrors.length > 0) failureReasons.push("restore dist outputs");
+  if (backupCleanupErrors.length > 0) failureReasons.push("clean up verifier backup");
+  if (lockCleanupErrors.length > 0) failureReasons.push("clean up verifier lock");
+  const failureSummary = failureReasons.join(" or ");
+  const failureMessage = receivedSignal === undefined
+    ? `clean-workspace verification could not ${failureSummary}; ${retentionLocation}`
+    : `clean-workspace verification interrupted by ${receivedSignal} and could not ` +
+      `${failureSummary}; recovery failure takes precedence with exit code 1; ` +
+      retentionLocation;
   throw new AggregateError(
     verificationError === undefined
-      ? restorationErrors
-      : [verificationError, ...restorationErrors],
-    `clean-workspace verification could not restore dist outputs; ${retentionLocation}`
+      ? recoveryErrors
+      : [verificationError, ...recoveryErrors],
+    failureMessage
   );
 }
 if (receivedSignal !== undefined) {

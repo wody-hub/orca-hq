@@ -101,6 +101,7 @@ import { syncBuiltinESMExports } from "node:module";
 
 const realRenameSync = fs.renameSync;
 const realMkdirSync = fs.mkdirSync;
+const realRmdirSync = fs.rmdirSync;
 fs.mkdirSync = function mkdirSync(path, options) {
   if (
     process.env.CLEAN_VERIFY_FAIL_STAGING_MKDIR_SUFFIX !== undefined &&
@@ -148,6 +149,17 @@ fs.renameSync = function renameSync(source, destination) {
   }
   return realRenameSync(source, destination);
 };
+fs.rmdirSync = function rmdirSync(path, options) {
+  if (
+    process.env.CLEAN_VERIFY_FAIL_LOCK_CLEANUP_SUFFIX !== undefined &&
+    String(path).endsWith(process.env.CLEAN_VERIFY_FAIL_LOCK_CLEANUP_SUFFIX)
+  ) {
+    const error = new Error("synthetic lock cleanup failure");
+    error.code = "EIO";
+    throw error;
+  }
+  return realRmdirSync(path, options);
+};
 syncBuiltinESMExports();
 `,
     "utf8"
@@ -157,6 +169,7 @@ syncBuiltinESMExports();
   writeFileSync(
     fakePnpmPath,
     `#!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -181,6 +194,22 @@ if (command === "prepare") {
   generate("packages/installer");
 }
 if (command === "test") generate("packages/test-support");
+if (process.env.CLEAN_VERIFY_GRANDCHILD_COMMAND === command) {
+  spawn(
+    process.execPath,
+    [
+      "-e",
+      \`const { mkdirSync, writeFileSync } = require("node:fs");
+const { dirname } = require("node:path");
+writeFileSync(process.env.CLEAN_VERIFY_GRANDCHILD_READY_PATH, "ready\\\\n", "utf8");
+setTimeout(() => {
+  mkdirSync(dirname(process.env.CLEAN_VERIFY_LATE_WRITE_PATH), { recursive: true });
+  writeFileSync(process.env.CLEAN_VERIFY_LATE_WRITE_PATH, "late-grandchild\\\\n", "utf8");
+}, Number(process.env.CLEAN_VERIFY_LATE_WRITE_DELAY_MS));\`
+    ],
+    { env: process.env, stdio: "inherit" }
+  );
+}
 if (process.env.CLEAN_VERIFY_HOLD_COMMAND === command) {
   writeFileSync(process.env.CLEAN_VERIFY_READY_PATH, "ready\\n", "utf8");
   while (!existsSync(process.env.CLEAN_VERIFY_RELEASE_PATH)) {
@@ -232,6 +261,7 @@ function runVerifier(
     failBackupPath?: string;
     failCommand?: string;
     failGeneratedPath?: string;
+    failLockCleanup?: boolean;
     failRestorePath?: string;
     failStagingMkdirSuffix?: string;
   }> = {}
@@ -248,6 +278,9 @@ function runVerifier(
         CLEAN_VERIFY_FAIL_BACKUP_SOURCE: options.failBackupPath,
         CLEAN_VERIFY_FAIL_COMMAND: options.failCommand,
         CLEAN_VERIFY_FAIL_GENERATED_SOURCE: options.failGeneratedPath,
+        CLEAN_VERIFY_FAIL_LOCK_CLEANUP_SUFFIX: options.failLockCleanup
+          ? join(stagingDirectoryName, "active.lock")
+          : undefined,
         CLEAN_VERIFY_FAIL_RESTORE_DESTINATION: options.failRestorePath,
         CLEAN_VERIFY_FAIL_STAGING_MKDIR_SUFFIX: options.failStagingMkdirSuffix,
         PATH: `${join(fixture.root, "test-support", "bin")}${delimiter}${process.env.PATH ?? ""}`,
@@ -266,6 +299,11 @@ function startVerifier(
   options: Readonly<{
     commandLogPath?: string;
     holdCommand?: string;
+    failRestorePath?: string;
+    grandchildCommand?: string;
+    grandchildReadyPath?: string;
+    lateWriteDelayMs?: number;
+    lateWritePath?: string;
     readyPath?: string;
     releasePath?: string;
     renameLogPath?: string;
@@ -280,7 +318,12 @@ function startVerifier(
       env: {
         ...process.env,
         CLEAN_VERIFY_COMMAND_LOG: commandLogPath,
+        CLEAN_VERIFY_FAIL_RESTORE_DESTINATION: options.failRestorePath,
+        CLEAN_VERIFY_GRANDCHILD_COMMAND: options.grandchildCommand,
+        CLEAN_VERIFY_GRANDCHILD_READY_PATH: options.grandchildReadyPath,
         CLEAN_VERIFY_HOLD_COMMAND: options.holdCommand,
+        CLEAN_VERIFY_LATE_WRITE_DELAY_MS: options.lateWriteDelayMs?.toString(),
+        CLEAN_VERIFY_LATE_WRITE_PATH: options.lateWritePath,
         CLEAN_VERIFY_READY_PATH: options.readyPath,
         CLEAN_VERIFY_RELEASE_PATH: options.releasePath,
         CLEAN_VERIFY_RENAME_LOG: options.renameLogPath,
@@ -477,14 +520,20 @@ describe("clean workspace verifier dist preservation", () => {
         renameLogPath: secondRenameLogPath
       });
       const secondResult = await second.completion;
+      const activeRun = retainedRuns(fixture)[0];
 
       expect(secondResult.status).not.toBe(0);
       expect(secondResult.stderr).toContain(
         join(fixture.root, stagingDirectoryName, "active.lock")
       );
       expect(secondResult.stderr).toContain("manual review");
+      expect(secondResult.stderr).toContain("do not remove the lock until");
+      expect(activeRun).toBeDefined();
+      if (activeRun === undefined) throw new Error("expected one active verifier run");
+      expect(secondResult.stderr).toContain(join(activeRun, "original"));
       expect(secondResult.commands).toEqual([]);
       expect(existsSync(secondRenameLogPath)).toBe(false);
+      expect(existsSync(join(fixture.root, stagingDirectoryName, "active.lock"))).toBe(true);
       expect(distSnapshot(fixture.root)).toEqual(activeOutput);
 
       writeFileSync(releasePath, "release\n", "utf8");
@@ -504,16 +553,28 @@ describe("clean workspace verifier dist preservation", () => {
     const fixture = createFixture();
     const original = distSnapshot(fixture.root);
     const lockPath = join(fixture.root, stagingDirectoryName, "active.lock");
+    const recoveryPath = join(
+      fixture.root,
+      stagingDirectoryName,
+      "run-crashed",
+      "original"
+    );
     mkdirSync(lockPath);
+    mkdirSync(recoveryPath, { recursive: true });
+    writeFileSync(join(recoveryPath, "inspect-me.txt"), "retained\n", "utf8");
     try {
       const result = runVerifier(fixture);
 
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(lockPath);
+      expect(result.stderr).toContain(recoveryPath);
+      expect(result.stderr).toContain("do not remove the lock until");
       expect(result.stderr).toContain("manual review");
       expect(result.commands).toEqual([]);
       expect(distSnapshot(fixture.root)).toEqual(original);
       expect(existsSync(lockPath)).toBe(true);
+      expect(readFileSync(join(recoveryPath, "inspect-me.txt"), "utf8"))
+        .toBe("retained\n");
     } finally {
       removeFixture(fixture);
     }
@@ -600,6 +661,99 @@ describe("clean workspace verifier dist preservation", () => {
       removeFixture(fixture);
     }
   });
+
+  it("uses exit 1 and retains recovery data when SIGTERM cleanup cannot restore", async () => {
+    // Break caught: a signal exit code can misrepresent a higher-priority recovery failure.
+    const fixture = createFixture();
+    const readyPath = join(fixture.root, "test-support", "ready");
+    const releasePath = join(fixture.root, "test-support", "release");
+    const running = startVerifier(fixture, {
+      failRestorePath: join("packages", "core", "dist"),
+      holdCommand: "prepare",
+      readyPath,
+      releasePath
+    });
+    try {
+      await waitForPath(readyPath);
+      signalVerifier(running.pid, "SIGTERM");
+      const result = await running.completion;
+      const run = retainedRuns(fixture)[0];
+
+      expect(result.status).toBe(1);
+      expect(run).toBeDefined();
+      if (run === undefined) throw new Error("expected one retained verifier run");
+      expect(result.stderr).toContain("AggregateError");
+      expect(result.stderr).toContain("interrupted by SIGTERM");
+      expect(result.stderr).toContain("recovery failure takes precedence with exit code 1");
+      expect(result.stderr).toContain(`backup retained at ${run}`);
+      expect(readFileSync(join(run, "original/packages/core/marker.txt"), "utf8"))
+        .toBe("original-core\n");
+    } finally {
+      if (existsSync(fixture.root)) writeFileSync(releasePath, "release\n", "utf8");
+      await running.completion;
+      removeFixture(fixture);
+    }
+  });
+
+  it("classifies an isolated active lock cleanup failure without misreporting restore", () => {
+    // Break caught: rmdir(active.lock) failure can be mislabeled as a dist restoration failure.
+    const fixture = createFixture();
+    const original = distSnapshot(fixture.root);
+    const lockPath = join(fixture.root, stagingDirectoryName, "active.lock");
+    try {
+      const result = runVerifier(fixture, { failLockCleanup: true });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("synthetic lock cleanup failure");
+      expect(result.stderr).toContain("could not clean up verifier lock");
+      expect(result.stderr).not.toContain("could not restore dist outputs");
+      expect(result.stderr).toContain(`lock retained at ${lockPath}`);
+      expect(distSnapshot(fixture.root)).toEqual(original);
+      expect(retainedRuns(fixture)).toEqual([]);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "terminates a pnpm grandchild before restoring after parent-only SIGTERM",
+    async () => {
+      // Break caught: signaling only pnpm can leave an orphan that writes into restored dist.
+      const fixture = createFixture();
+      const original = distSnapshot(fixture.root);
+      const readyPath = join(fixture.root, "test-support", "ready");
+      const releasePath = join(fixture.root, "test-support", "release");
+      const grandchildReadyPath = join(fixture.root, "test-support", "grandchild-ready");
+      const lateWritePath = join(fixture.root, "packages", "core", "dist", "late.txt");
+      const running = startVerifier(fixture, {
+        grandchildCommand: "prepare",
+        grandchildReadyPath,
+        holdCommand: "prepare",
+        lateWriteDelayMs: 400,
+        lateWritePath,
+        readyPath,
+        releasePath
+      });
+      try {
+        await waitForPath(readyPath);
+        await waitForPath(grandchildReadyPath);
+        process.kill(running.pid, "SIGTERM");
+        const result = await running.completion;
+        await new Promise((resolve) => setTimeout(resolve, 650));
+
+        expect(result.status, result.stderr).toBe(143);
+        expect(result.commands.map((entry) => entry.split(":", 1)[0])).toEqual(["prepare"]);
+        expect(existsSync(lateWritePath)).toBe(false);
+        expect(distSnapshot(fixture.root)).toEqual(original);
+        expectOnlySiblingRemains(fixture);
+      } finally {
+        if (existsSync(fixture.root)) writeFileSync(releasePath, "release\n", "utf8");
+        await running.completion;
+        removeFixture(fixture);
+      }
+    }
+  );
 
   it("keeps verifier staging inside the repository's ignored boundary", () => {
     // Break caught: a future staging path can cross filesystems or become visible to git.
