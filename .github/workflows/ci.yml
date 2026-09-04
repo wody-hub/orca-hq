@@ -1,0 +1,82 @@
+name: Private macOS CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-macos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Test source-installed private pilot
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.5
+          run_install: false
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: pnpm
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verify read-only doctor JSON contract
+        shell: bash
+        run: |
+          before_status=$(git status --porcelain)
+          set +e
+          pnpm hq doctor --format json > "$RUNNER_TEMP/doctor.json"
+          doctor_exit=$?
+          set -e
+          if [[ "$doctor_exit" -ne 0 && "$doctor_exit" -ne 1 ]]; then
+            echo "doctor returned unexpected exit code: $doctor_exit" >&2
+            exit 1
+          fi
+          node --input-type=module - "$RUNNER_TEMP/doctor.json" <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const report = JSON.parse(await readFile(process.argv[2], "utf8"));
+          const statuses = new Set(["pass", "warn", "fail"]);
+          if (typeof report.ok !== "boolean" || !Array.isArray(report.checks)) process.exit(1);
+          for (const check of report.checks) {
+            if (typeof check?.id !== "string" || !statuses.has(check?.status) || typeof check?.message !== "string") {
+              process.exit(1);
+            }
+          }
+          NODE
+          after_status=$(git status --porcelain)
+          if [[ "$before_status" != "$after_status" ]]; then
+            echo "doctor changed the repository working tree" >&2
+            exit 1
+          fi
+          echo "doctor JSON valid (environment exit: $doctor_exit)"
+
+      - name: Run deterministic pilot acceptance
+        run: node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/private-ci-acceptance.json

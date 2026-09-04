@@ -117,7 +117,7 @@ All externally initiated connections are outbound:
 
 ## 7. Repository and Package Boundaries
 
-The dedicated repository is `/Users/j.jaeyo/Project/ETC/orca-hq` during local development.
+The dedicated repository is `/tmp/orca-hq-synthetic` during synthetic local-development examples.
 
 ```text
 apps/
