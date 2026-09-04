@@ -1,0 +1,22 @@
+{
+  "name": "@orca-hq/installer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "hq": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noImplicitOverride --verbatimModuleSyntax --esModuleInterop --skipLibCheck --declaration --declarationMap --sourceMap --rootDir src --outDir dist src/index.ts src/cli.ts src/config-files.ts src/doctor.ts src/keychain.ts src/setup.ts",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@orca-hq/observability": "workspace:*",
+    "zod": "^3.24.2"
+  }
+}
