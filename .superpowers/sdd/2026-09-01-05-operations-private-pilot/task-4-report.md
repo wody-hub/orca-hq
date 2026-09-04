@@ -226,3 +226,48 @@ setup은 legacy snapshot의 non-secret account 이름과 Registry 경로를 pref
 실제 Slack·Telegram·Tailscale·Keychain·launchd·운영 SQLite·Orca credential/config는 변경하지 않았다. 테스트의 credential 확인과 저장은 recording machine 경계만 사용했고 secret 원문은 config/CLI 출력에 포함되지 않았다. `B2`, `B4`, `B5`와 이전 deferred Minor는 계약대로 이번 범위에서 재설계하지 않았다.
 
 원자 커밋 메시지: `fix(installer): support safe config migration`.
+
+## Fix round 4/5
+
+### 결과
+
+신규 Important `N1-new`와 같은 redaction 경계의 Minor `N2-new`만 수정했다. doctor는 missing·invalid config를 계속 `fail`로 보고하고 lifecycle current-only parser도 mutation 전에 `lifecycle_config_invalid`로 fail-closed하지만, 명시적 복구 명령인 setup의 schema preflight만 missing·invalid를 `warn`으로 처리한다. invalid 내용은 legacy/current metadata로 재사용하지 않으며, 새 5개 credential과 유효 Registry 경로를 받은 뒤 non-secret plan을 보여 주고 명시적 confirm을 통과한 경우에만 current config와 신규 Keychain 항목을 기록한다.
+
+CLI lifecycle catch는 `error !== null && typeof error === "object"` 경계 안에서만 exact `lifecycle_config_invalid` code를 비교한다. 따라서 factory가 `null`, `undefined`, 문자열을 throw해도 update/uninstall은 reject하지 않고 고정 일반 문구와 exit 1을 반환하며, 정확한 stable config error object만 setup 안내를 받는다. raw thrown value, 경로, credential은 출력하지 않는다.
+
+### TDD RED 증거
+
+- 명령: `pnpm test packages/installer/test/host.test.ts packages/installer/test/cli.test.ts`
+- 결과: exit 1, 2 files에서 신규 4건 실패·기존 27건 통과.
+- `N1-new`: malformed JSON과 arbitrary invalid shape의 완전한 복구 입력 테스트가 모두 `result.ok` expected `true`, received `false`로 실패했다. setup schema override가 invalid를 기존 `fail` 상태로 유지해 confirmation/config/Keychain 경계에 도달하지 못한 것이 핵심 실패였다.
+- `N2-new`: update와 uninstall의 non-Error throw 테스트가 모두 `Cannot read properties of null (reading 'code')`로 reject했다. catch 내부의 무조건적 `.code` 접근이 redacted exit 1 계약 자체를 깨는 것이 핵심 실패였다.
+
+### GREEN 및 안전 경계
+
+- focused: `pnpm test packages/installer/test/host.test.ts packages/installer/test/cli.test.ts packages/installer/test/lifecycle-host.test.ts` — 3 files, 37 tests 통과.
+- malformed/arbitrary 각각에서 신규 5개 credential만 Keychain에 기록되고 current config에는 신규 account와 `/temporary/projects.yaml`만 기록된다. arbitrary invalid 안의 `stale-account`와 `/private/stale/projects.yaml`은 config에 포함되거나 읽기 대상으로 선택되지 않는다.
+- confirm callback은 mutation 0 상태와 non-secret plan 출력 뒤 정확히 한 번 호출된다. blank credential 또는 blank Registry 입력 fixture는 setup 실패, config write 0, Keychain write 0을 단언한다.
+- 기존 doctor missing/malformed/arbitrary config는 `config.pilot-schema=fail`과 mutation 0을 유지한다. 기존 lifecycle missing/malformed/out-of-data config 테스트는 composition 단계에서 `lifecycle_config_invalid`와 mutation 0을 유지한다.
+- update/uninstall 양쪽은 `null`, `undefined`, secret/path 문자열 throw를 고정 `Lifecycle operation failed.` 한 줄과 exit 1로 흡수한다. stable config error object의 setup 안내 및 일반 Error redaction 회귀 테스트도 통과한다.
+
+### 변경 파일
+
+- 구현: `packages/installer/src/host.ts`, `packages/installer/src/cli.ts`.
+- 테스트: `packages/installer/test/host.test.ts`, `packages/installer/test/cli.test.ts`.
+- 운영 문서/보고: `docs/operations/update-and-rollback.md`, 이 보고서.
+
+### 전체 검증
+
+- `pnpm test packages/installer` — 9 files, 92 tests 통과.
+- `pnpm --filter @orca-hq/installer typecheck` — 통과.
+- `pnpm --filter @orca-hq/installer typecheck:test` — 통과.
+- `pnpm typecheck` — 통과.
+- `pnpm test` — 42 files, 647 tests 통과.
+- `pnpm build` — exit 0, root 실행 주체를 제외한 15개 workspace project 모두 `Done`.
+- `git diff --check` — 보호 경로를 제외하고 허용 변경 파일에 한정해 통과.
+
+### 남은 우려
+
+`N3-new`의 stale credential account 제거 정책은 사용자의 삭제 의도와 실제 credential lifecycle 계약이 정해지지 않아 deferred Minor로 유지했다. 기존 `B2`, `B4`, `B5`와 이전 deferred Minor도 이번 범위에서 변경하지 않았다. 실제 Slack·Telegram·Tailscale·Keychain·launchd·운영 SQLite·Orca credential/config는 변경하지 않았고, 보호 경로의 기존 사용자 변경도 읽기·수정·stage·restore하지 않았다.
+
+원자 커밋 메시지: `fix(installer): keep config recovery actionable`.

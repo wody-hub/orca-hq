@@ -230,6 +230,22 @@ describe("hq command-line contract", () => {
     }
   });
 
+  it.each([
+    ["update", "--revision", "a".repeat(40)],
+    ["uninstall"]
+  ])("redacts non-Error values thrown by the %s lifecycle provider", async (...input) => {
+    // Break caught: reading `.code` directly from nullish thrown values can make the CLI catch reject and bypass its redaction contract.
+    for (const thrown of [null, undefined, "secret=/tmp/private/pilot.json"]) {
+      const stdout = output();
+      const lifecycleFactory = async (): Promise<LifecycleComposition> => {
+        throw thrown;
+      };
+
+      await expect(runCli(input, { stdout, lifecycleFactory })).resolves.toBe(1);
+      expect(stdout.lines).toEqual(["Lifecycle operation failed.\n"]);
+    }
+  });
+
   it("rejects impossible lifecycle syntax before creating the lifecycle host", async () => {
     // Break caught: a typo can invoke config loading first and be misreported as a configuration failure.
     let factoryCalls = 0;

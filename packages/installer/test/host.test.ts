@@ -31,8 +31,10 @@ class RecordingMachine implements HostMachinePort {
       if (config === "malformed") return "{not-json";
       const snapshot: Record<string, unknown> = {
         schema: "orca-hq.private-pilot.v1",
-        projectRegistryPath: "/temporary/projects.yaml",
-        credentialAccounts: this.options.legacyAccounts ?? ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
+        projectRegistryPath: config === "arbitrary" ? "/private/stale/projects.yaml" : "/temporary/projects.yaml",
+        credentialAccounts: config === "arbitrary"
+          ? ["stale-account"]
+          : this.options.legacyAccounts ?? ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
       };
       if (config === "arbitrary") snapshot.unexpected = "not-a-legacy-config";
       if (config === "current") {
@@ -40,7 +42,9 @@ class RecordingMachine implements HostMachinePort {
       }
       return JSON.stringify(snapshot);
     }
-    return "projects:\n  - one\n  - two\n  - three\n  - four\n  - five\n";
+    return path === "/temporary/projects.yaml"
+      ? "projects:\n  - one\n  - two\n  - three\n  - four\n  - five\n"
+      : undefined;
   }
   async directoryWritable(path: string): Promise<boolean> { this.requests.push(`access:${path}`); return true; }
   async createDirectory(path: string): Promise<void> { this.mutations.push(`mkdir:${path}`); }
@@ -155,6 +159,84 @@ describe("macOS host adapters", () => {
 
     expect(result.ok).toBe(true);
     expect(machine.mutations).toContain("write:/temporary/config/orca-hq/pilot.json");
+  });
+
+  it.each(["malformed", "arbitrary"] as const)(
+    "replaces %s config only from complete new inputs after confirmation",
+    async (config) => {
+      // Break caught: setup can keep treating an invalid on-disk config as a failed prerequisite or reuse its untrusted metadata.
+      const machine = new RecordingMachine({ config });
+      const adapters = createMacosHostAdapters(machine);
+      const preview = { lines: [] as string[], write(text: string) { this.lines.push(text); } };
+      let confirmations = 0;
+      const answers = {
+        credentials: {
+          "slack-app-token": "new-slack-secret", "slack-channel-id": "C456",
+          "telegram-bot-token": "new-telegram-secret", "telegram-allowed-chat-id": "456",
+          "openai-api-key": "new-openai-secret"
+        },
+        registryPath: "/temporary/projects.yaml"
+      };
+
+      const result = await createSetup(adapters.setup(preview, async () => {
+        confirmations += 1;
+        expect(machine.mutations).toEqual([]);
+        return true;
+      }, answers)).run(answers);
+
+      expect(result.ok).toBe(true);
+      expect(confirmations).toBe(1);
+      expect(preview.lines).toEqual([
+        "Planned configuration: /temporary/config/orca-hq/pilot.json",
+        "Planned changes: save non-secret pilot configuration and store selected credentials in Keychain.",
+        "Configuration written: /temporary/config/orca-hq/pilot.json"
+      ]);
+      expect(preview.lines.join("\n")).not.toContain("new-slack-secret");
+      expect(machine.mutations.filter((mutation) => mutation.startsWith("keychain:"))).toEqual([
+        "keychain:openai-api-key",
+        "keychain:slack-app-token",
+        "keychain:slack-channel-id",
+        "keychain:telegram-allowed-chat-id",
+        "keychain:telegram-bot-token"
+      ]);
+      expect(JSON.parse(machine.writtenConfig ?? "{}")).toEqual({
+        schema: "orca-hq.private-pilot.v1",
+        databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
+        projectRegistryPath: "/temporary/projects.yaml",
+        credentialAccounts: [
+          "openai-api-key",
+          "slack-app-token",
+          "slack-channel-id",
+          "telegram-allowed-chat-id",
+          "telegram-bot-token"
+        ]
+      });
+      expect(machine.requests).not.toContain("read:/private/stale/projects.yaml");
+    }
+  );
+
+  it.each([
+    { config: "malformed" as const, credentials: {}, registryPath: "/temporary/projects.yaml" },
+    {
+      config: "arbitrary" as const,
+      credentials: {
+        "slack-app-token": "new-slack-secret", "slack-channel-id": "C456",
+        "telegram-bot-token": "new-telegram-secret", "telegram-allowed-chat-id": "456",
+        "openai-api-key": "new-openai-secret"
+      },
+      registryPath: ""
+    }
+  ])("does not mutate $config config when required recovery input is missing", async ({ config, credentials, registryPath }) => {
+    // Break caught: lowering only the schema check could let an incomplete recovery plan overwrite config or Keychain state.
+    const machine = new RecordingMachine({ config });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials, registryPath };
+
+    const result = await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers);
+
+    expect(result.ok).toBe(false);
+    expect(machine.mutations).toEqual([]);
+    expect(machine.writtenConfig).toBeUndefined();
   });
 
   it("migrates a legacy config with blank inputs without reading or rewriting Keychain secrets", async () => {

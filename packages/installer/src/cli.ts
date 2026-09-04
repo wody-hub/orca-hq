@@ -148,7 +148,9 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       write(output, "Orca HQ lifecycle uninstall completed.");
       return 0;
     } catch (error) {
-      write(output, (error as { code?: unknown }).code === "lifecycle_config_invalid"
+      write(output, error !== null
+        && typeof error === "object"
+        && (error as { code?: unknown }).code === "lifecycle_config_invalid"
         ? "Lifecycle configuration is missing or invalid; run hq setup to create or migrate it."
         : "Lifecycle operation failed.");
       return 1;

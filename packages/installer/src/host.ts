@@ -168,7 +168,9 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
           ...doctor.checks,
           pilotConfiguration: async () => {
             const snapshot = await inspected;
-            return snapshot.status === "missing" ? "warn" : configurationStatus(snapshot);
+            return snapshot.status === "missing" || snapshot.status === "invalid"
+              ? "warn"
+              : configurationStatus(snapshot);
           },
           slackSocketMode: async () => pendingCredentialReady(machine, pending, ["slack-app-token", "slack-channel-id"], await inspected),
           telegramAllowlistedChat: async () => pendingCredentialReady(machine, pending, ["telegram-bot-token", "telegram-allowed-chat-id"], await inspected),
