@@ -710,6 +710,11 @@ describe("Gateway production state machine E2E", () => {
         }),
         expect.objectContaining({
           subjectId: command.commandId,
+          eventType: "command.policy_approval_not_required",
+          data: { proposalId: "proposal-command-501", riskLevel: "L1" }
+        }),
+        expect.objectContaining({
+          subjectId: command.commandId,
           eventType: "outbox.delivered",
           data: { messageId: "report-command-501:success", channel: "telegram" }
         })

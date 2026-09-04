@@ -75,6 +75,9 @@ export interface RunPilotAcceptanceOptions {
     | "complete"
     | "missing_codex_to_claude"
     | "missing_claude_to_codex";
+  readonly approvalAuditEvidenceMode?:
+    | "complete"
+    | "missing_approval_specific_event";
 }
 
 type EventKind =
@@ -341,6 +344,7 @@ class SimulationRun {
   readonly #nextId: (kind: string) => string;
   readonly #now: Date;
   readonly #verifierEvidenceMode: NonNullable<RunPilotAcceptanceOptions["verifierEvidenceMode"]>;
+  readonly #approvalAuditEvidenceMode: NonNullable<RunPilotAcceptanceOptions["approvalAuditEvidenceMode"]>;
   #slack!: FakeSlack;
   #telegram!: FakeTelegram;
   #sandbox!: Awaited<ReturnType<typeof createSandboxRepo>>;
@@ -349,11 +353,13 @@ class SimulationRun {
   constructor(
     runId: string,
     now: Date,
-    verifierEvidenceMode: NonNullable<RunPilotAcceptanceOptions["verifierEvidenceMode"]>
+    verifierEvidenceMode: NonNullable<RunPilotAcceptanceOptions["verifierEvidenceMode"]>,
+    approvalAuditEvidenceMode: NonNullable<RunPilotAcceptanceOptions["approvalAuditEvidenceMode"]>
   ) {
     this.#runId = runId;
     this.#now = new Date(now);
     this.#verifierEvidenceMode = verifierEvidenceMode;
+    this.#approvalAuditEvidenceMode = approvalAuditEvidenceMode;
     this.#database = openDatabase(":memory:");
     this.#store = new ControlStore(this.#database);
     this.#identities = new IdentityResolver({
@@ -468,7 +474,8 @@ class SimulationRun {
       sandbox: this.#sandbox,
       command,
       runIdentity: `${this.#runId}-voice-l1`,
-      now: this.#now
+      now: this.#now,
+      approvalAuditEvidenceMode: this.#approvalAuditEvidenceMode
     });
     assertCondition(
       production.proposal?.selectedProjectKey === "sandbox-web"
@@ -496,6 +503,9 @@ class SimulationRun {
     }
     assertCondition(emittedEvidence, "verified_success_missing_evidence");
     this.#evidence(scenarioId, "final_state:verified_success");
+    if (production.approvalAuditEventType !== undefined) {
+      this.#evidence(scenarioId, `approval_evidence:${production.approvalAuditEventType}`);
+    }
     assertCondition(
       ["route", "policy", "approval", "Dispatch", "worker", "verifier", "delivery"]
         .every((part) => production.linkedParts.includes(part)),
@@ -865,9 +875,15 @@ export async function runPilotAcceptance(
   if (!Number.isFinite(now.getTime())) throw new TypeError("pilot clock must return a valid Date");
   const prefix = options.runIdPrefix?.trim() || "pilot";
   const verifierEvidenceMode = options.verifierEvidenceMode ?? "complete";
+  const approvalAuditEvidenceMode = options.approvalAuditEvidenceMode ?? "complete";
   const events: PilotEvent[] = [];
   for (let index = 1; index <= options.runs; index += 1) {
-    const run = new SimulationRun(`${prefix}-${index}`, now, verifierEvidenceMode);
+    const run = new SimulationRun(
+      `${prefix}-${index}`,
+      now,
+      verifierEvidenceMode,
+      approvalAuditEvidenceMode
+    );
     events.push(...await run.execute());
   }
   const scenarios = scenarioReport(events, options.runs);

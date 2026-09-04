@@ -113,6 +113,7 @@ export async function runProductionPilotFlow(input: Readonly<{
   command: CommandEnvelope;
   runIdentity: string;
   now: Date;
+  approvalAuditEvidenceMode?: "complete" | "missing_approval_specific_event";
 }>) {
   const project = pilotProject(input.sandbox.repositoryPath);
   const proposalId = `proposal-${input.runIdentity}`;
@@ -268,10 +269,12 @@ export async function runProductionPilotFlow(input: Readonly<{
     if (audit.some((event) => event.subjectId === input.command.commandId
       && event.eventType === "command.route_selected")) linkedParts.add("route");
     if (audit.some((event) => event.subjectId === input.command.commandId
-      && event.eventType === "command.policy_authorized")) {
-      linkedParts.add("policy");
-      linkedParts.add("approval");
-    }
+      && event.eventType === "command.policy_authorized")) linkedParts.add("policy");
+    const approvalAuditEvent = input.approvalAuditEvidenceMode === "missing_approval_specific_event"
+      ? undefined
+      : audit.find((event) => event.subjectId === input.command.commandId
+        && event.eventType === "command.policy_approval_not_required");
+    if (approvalAuditEvent !== undefined) linkedParts.add("approval");
     if (audit.some((event) => event.eventType === "lifecycle.transition"
       && dispatchIds.has(event.subjectId))) linkedParts.add("Dispatch");
     if (audit.some((event) => event.eventType === "worker.worker_done"
@@ -284,6 +287,7 @@ export async function runProductionPilotFlow(input: Readonly<{
     return Object.freeze({
       decision,
       linkedParts: Object.freeze([...linkedParts]),
+      approvalAuditEventType: approvalAuditEvent?.eventType,
       implementationProvider: implementation.preferredAgent,
       verifierProvider: verifier.preferredAgent,
       worktreeKind: implementationDispatch.assignment.worktree.kind,

@@ -42,9 +42,24 @@ describe("deterministic private-pilot acceptance", () => {
       "worktree:isolated",
       "worker_pair:codex->claude",
       "final_state:verified_success",
+      "approval_evidence:command.policy_approval_not_required",
       "audit_linkage:route,policy,approval,Dispatch,worker,verifier,delivery"
     ]));
     expect(report.verifiedSuccessCoverage).toBe(1);
+  });
+
+  it("does not derive approval linkage from policy authorization alone", async () => {
+    // Break caught: command.policy_authorized is counted as approval evidence when the approval-specific event is absent.
+    const report = await runPilotAcceptance({
+      runs: 1,
+      runIdPrefix: "e2e-approval-linkage",
+      approvalAuditEvidenceMode: "missing_approval_specific_event"
+    });
+    const scenario = report.scenarios.find(({ id }) => id === "korean_voice_verified_l1");
+
+    expect(scenario).toMatchObject({ status: "fail" });
+    expect(scenario?.evidence.some((item) => item.includes("audit_linkage_incomplete"))).toBe(true);
+    expect(scenario?.evidence).not.toContain("approval_evidence:command.policy_authorized");
   });
 
   it("proves both model-family directions and blocks failed verification success", async () => {

@@ -574,6 +574,11 @@ function productionCommandFlow(
       }
       store.appendAudit({
         subjectId: durable.commandId,
+        eventType: "command.policy_approval_not_required",
+        data: { proposalId: proposal.proposalId, riskLevel: proposal.riskLevel }
+      });
+      store.appendAudit({
+        subjectId: durable.commandId,
         eventType: "command.policy_authorized",
         data: { proposalId: proposal.proposalId, riskLevel: proposal.riskLevel }
       });

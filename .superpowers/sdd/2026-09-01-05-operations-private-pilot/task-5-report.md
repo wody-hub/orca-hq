@@ -181,3 +181,58 @@ fake의 clock, run/command ID, transcript, agent receipt, provider response, res
 - production 변경은 승인된 최소 audit producer와 cursor persistence seam, gateway `./production` export에 한정했다. 외부 network/credential/config를 읽거나 변경하지 않았고 모든 provider 동작은 deterministic fake와 sandbox Git에서 수행했다.
 - 기존 dirty 보호 경로는 stage·restore·삭제하지 않는다. 요구된 acceptance runner의 `.artifacts/pilot-report.json`만 생성 검증했으며 `.artifacts/**`, `apps/web/test-results/**`, roadmap 보호 파일은 커밋 대상에서 제외한다.
 - 남은 범위는 실제 clean pilot Mac에서의 실채널·실계정·실재부팅 검증이며 이 deterministic 수정 라운드의 완료 조건에는 포함되지 않는다.
+
+---
+
+## 수정 라운드 2 — N1
+
+### 원인과 변경 이유
+
+`packages/test-support/src/production-pilot.ts`가 하나의 `command.policy_authorized` audit을 보고 `policy`와 `approval` 두 축을 모두 추가해, L1에서 실제 승인 관측이 없어도 전체 linkage가 통과했다. L1은 승인이 필요하지 않다는 실제 production 정책 결정을 안전하게 관측할 수 있도록 승인받은 최소 production seam `command.policy_approval_not_required`를 추가하고, `policy_authorized`는 `policy`만, 새 approval-specific event는 `approval`만 충족하도록 분리했다. event subject는 동일 command ID이고 data는 `proposalId`와 `riskLevel`만 포함하므로 prompt, transcript, credential, provider payload, 회사 경로를 기록하지 않으며 실행·승인·전달 제어 흐름은 바꾸지 않는다.
+
+### TDD RED 원문
+
+`pnpm test tests/e2e/private-pilot.spec.ts`의 기존 코드 실행은 9개 중 2개가 다음과 같이 실패했다.
+
+```text
+FAIL ... drives Korean Telegram voice through the public boundaries to verified L1 evidence
+-   "approval_evidence:command.policy_approval_not_required",
+
+FAIL ... does not derive approval linkage from policy authorization alone
+-   "status": "fail",
++   "status": "pass",
+Test Files  1 failed (1)
+Tests  2 failed | 7 passed (9)
+```
+
+가장 가까운 production gateway test에도 같은 producer 계약을 먼저 추가했다. `pnpm test apps/gateway/test/end-to-end.test.ts`는 다음처럼 실제 audit 부재로 실패했다.
+
+```text
+FAIL ... moves Telegram message 501 through worker, verifier and a delivered verified-success Outbox
+-     "eventType": "command.policy_approval_not_required",
+Test Files  1 failed (1)
+Tests  1 failed | 9 passed (10)
+```
+
+production 변경 전 Orca `ask`로 `apps/gateway/src/production.ts`의 정확한 seam, 대안, data 경계, 동작 영향 없음을 보고했고 승인을 받은 뒤 구현했다.
+
+### GREEN 및 회귀 검증
+
+- `pnpm --filter @orca-hq/gateway build && pnpm test tests/e2e/private-pilot.spec.ts`: 새 fault-injection이 의도대로 시나리오를 fail로 전환했고, failure evidence의 기존 prefix를 반영한 뒤 통과했다.
+- `pnpm test tests/e2e/private-pilot.spec.ts apps/gateway/test/end-to-end.test.ts`: 2개 파일, 19개 테스트 통과.
+- `pnpm test packages/persistence/test/store.test.ts packages/persistence/test/outbox-dispatcher.test.ts apps/gateway/test/end-to-end.test.ts tests/e2e/private-pilot.spec.ts tests/chaos/restart.spec.ts tests/chaos/provider-failures.spec.ts`: 6개 파일, 63개 테스트 통과.
+- `pnpm --filter @orca-hq/test-support typecheck`: 통과.
+- 최초 두 번의 `pnpm test`: 각각 installer process test 한 건이 병렬 부하에서 2초 timeout으로 실패하고 나머지 665개는 통과했다. 변경 범위 밖 동일 파일을 단독 실행한 `pnpm test packages/installer/test/cli-process.test.ts`는 5개 모두 통과했고, stale test-support 산출물이 runner 내부 build를 유발하는 기존 경합 조건을 제거하도록 전체 build 후 재실행했다.
+- `pnpm typecheck`: root 및 `tests/tsconfig.json` 통과.
+- `pnpm build`: 15개 workspace project 통과.
+- 산출물 최신화 후 새 `pnpm test`: 45개 파일, 666개 테스트 통과.
+- `node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/pilot-report.json`: exit 0.
+- 생성 JSON 검증: schema true, criterion 12개/unique 12, scenario 11개 전부 pass, `approval_evidence:command.policy_approval_not_required` 존재, `restartRecoveryRate=1`, `duplicateExecutions=0`, `approvalBypasses=0`, `verifiedSuccessCoverage=1`.
+- `git diff --check` (허용 파일 범위): 통과.
+
+### 실제 audit 근거와 자체 리뷰
+
+- 정상 L1 production flow는 동일 command subject로 `command.policy_approval_not_required`와 `command.policy_authorized`를 각각 생성한다. gateway E2E가 새 event의 data를 `{ proposalId, riskLevel }` 정확값으로 검증한다.
+- test-support는 `command.policy_authorized`에서 `policy`만 수집하고, 동일 command의 `command.policy_approval_not_required`를 실제로 찾았을 때만 `approval`과 `approval_evidence:command.policy_approval_not_required`를 추가한다.
+- `missing_approval_specific_event` fault-injection은 approval-specific 관측만 제거한다. 이때 `policy_authorized`가 남아 있어도 `korean_voice_verified_l1`이 `audit_linkage_incomplete`로 fail하므로 기존 N1 mutation을 잡는다.
+- C1~C3/I1~I3 회귀 묶음은 모두 통과했고 N2~N4 및 M1~M7은 변경하지 않았다. `.artifacts/**`는 stage하지 않으며 보호 경로와 실제 Slack·Telegram·Tailscale·Keychain·launchd·Orca credential/config를 읽거나 변경하지 않았다.
