@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
@@ -13,6 +14,8 @@ import {
 } from "../../packages/test-support/src/index.js";
 
 const execFileAsync = promisify(execFile);
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const acceptanceRunner = join(repositoryRoot, "scripts/run-pilot-acceptance.mjs");
 
 describe("deterministic private-pilot acceptance", () => {
   it("maps every scripted criterion exactly once without claiming live readiness", async () => {
@@ -121,18 +124,19 @@ describe("deterministic private-pilot acceptance", () => {
     expect(passesGate(report)).toBe(false);
   });
 
-  it("writes one repository-external machine-readable report and rejects unsafe arguments", async () => {
-    // Break caught: the runner can force generated evidence into the public checkout or accept an unbounded output path.
+  it("anchors repository boundaries to the runner when invoked from a subdirectory", async () => {
+    // Break caught: treating cwd as the repository root permits a subdirectory invocation to write into the checkout.
     const outputDirectory = await mkdtemp(join(tmpdir(), "orca-hq-pilot-script-"));
     const output = join(outputDirectory, "report.json");
+    const repositoryOutput = join(repositoryRoot, `pilot-script-test-${process.pid}.json`);
     try {
       await execFileAsync(process.execPath, [
-        "scripts/run-pilot-acceptance.mjs",
+        acceptanceRunner,
         "--runs",
         "1",
         "--output",
         output
-      ], { encoding: "utf8" });
+      ], { cwd: join(repositoryRoot, "apps"), encoding: "utf8" });
       const report = JSON.parse(await readFile(output, "utf8")) as Record<string, unknown>;
       expect(report).toMatchObject({
         evidenceMode: "deterministic_simulation",
@@ -144,17 +148,29 @@ describe("deterministic private-pilot acceptance", () => {
       });
 
       await expect(execFileAsync(process.execPath, [
-        "scripts/run-pilot-acceptance.mjs",
+        acceptanceRunner,
+        "--runs",
+        "1",
+        "--output",
+        repositoryOutput
+      ], { cwd: join(repositoryRoot, "apps"), encoding: "utf8" })).rejects.toMatchObject({
+        code: 2,
+        stderr: "pilot_acceptance_invalid_arguments\n"
+      });
+
+      await expect(execFileAsync(process.execPath, [
+        acceptanceRunner,
         "--runs",
         "0",
         "--output",
-        resolve("pilot-report.json")
+        resolve(repositoryRoot, "pilot-report.json")
       ], { encoding: "utf8" })).rejects.toMatchObject({
         code: 2,
         stderr: "pilot_acceptance_invalid_arguments\n"
       });
     } finally {
       await rm(outputDirectory, { recursive: true, force: true });
+      await rm(repositoryOutput, { force: true });
     }
   }, 20_000);
 });

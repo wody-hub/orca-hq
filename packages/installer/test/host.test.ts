@@ -56,21 +56,25 @@ class RecordingMachine implements HostMachinePort {
 }
 
 describe("macOS host adapters", () => {
-  it("passes Keychain secrets only through stdin and redacts command failures", async () => {
-    // Break caught: putting the credential after `-w` exposes it in process argv and command-failure diagnostics.
-    const secret = "xapp-SUPERSECRET";
+  it("stores exact Keychain bytes through one bounded security batch command", async () => {
+    // Break caught: using `-w` re-enters getpass, exposes plaintext, or lets a hung security process wait forever.
+    const secret = "quote:'\ncontrol:\t\u0000한글😀";
     let invocation: Readonly<{
       executable: string;
       arguments: readonly string[];
       stdin?: string;
+      timeout?: number;
+      maxBuffer: number;
     }> | undefined;
     const machine = createNodeMachine(async (executable, arguments_, options) => {
       invocation = {
         executable,
         arguments: [...arguments_],
-        stdin: (options as { stdin?: string }).stdin
+        stdin: options.stdin,
+        timeout: options.timeout,
+        maxBuffer: options.maxBuffer
       };
-      throw new Error(`Command failed: security ${arguments_.join(" ")}`);
+      throw new Error(`Command failed with secret ${secret}: security ${arguments_.join(" ")}`);
     });
 
     let thrown: unknown;
@@ -85,15 +89,31 @@ describe("macOS host adapters", () => {
     expect((thrown as Error).message).not.toContain(secret);
     expect(invocation).toEqual({
       executable: "security",
-      arguments: [
-        "add-generic-password", "-U",
-        "-s", "orca-hq",
-        "-a", "slack-app-token",
-        "-w"
-      ],
-      stdin: `${secret}\n`
+      arguments: ["-i"],
+      stdin: "add-generic-password -U -s orca-hq -a slack-app-token -X 71756f74653a270a636f6e74726f6c3a0900ed959ceab880f09f9880\n",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024
     });
     expect(JSON.stringify(invocation?.arguments)).not.toContain(secret);
+    expect(invocation?.stdin).not.toContain(secret);
+    expect(invocation?.stdin).not.toContain(" -w");
+    expect(invocation?.stdin?.trimEnd().split("\n")).toHaveLength(1);
+    expect(invocation?.stdin).not.toMatch(/(?:^|\n)exit(?:\s|$)/);
+  });
+
+  it("rejects unsafe Keychain service and account tokens before spawning security", async () => {
+    // Break caught: interpolating unvalidated tokens into batch stdin permits an extra security command.
+    let commandCalls = 0;
+    const machine = createNodeMachine(async () => {
+      commandCalls += 1;
+      return { stdout: "" };
+    });
+
+    await expect(machine.storeKeychainSecret("orca-hq\nhelp", "slack-app-token", "synthetic"))
+      .rejects.toThrow("Unable to store credential in macOS Keychain.");
+    await expect(machine.storeKeychainSecret("orca-hq", "slack app token", "synthetic"))
+      .rejects.toThrow("Unable to store credential in macOS Keychain.");
+    expect(commandCalls).toBe(0);
   });
 
   it("runs every doctor probe through a recording read-only machine boundary", async () => {

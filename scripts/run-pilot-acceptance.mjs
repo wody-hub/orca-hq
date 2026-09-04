@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
 import { lstat, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const INVALID = "pilot_acceptance_invalid_arguments";
 const BUILD_FAILED = "pilot_acceptance_build_failed";
 const GATE_FAILED = "pilot_acceptance_gate_failed";
-const supportRoot = resolve(process.cwd(), "packages/test-support");
+const repositoryRoot = await realpath(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
+const supportRoot = resolve(repositoryRoot, "packages/test-support");
 
 function fail(message, exitCode) {
   process.stderr.write(`${message}\n`);
@@ -45,10 +47,7 @@ async function boundedOutputPath(value) {
   ) {
     throw new TypeError(INVALID);
   }
-  const [repositoryRoot, outputDirectory] = await Promise.all([
-    realpath(process.cwd()),
-    realpath(dirname(requestedPath))
-  ]);
+  const outputDirectory = await realpath(dirname(requestedPath));
   const relativeDirectory = relative(repositoryRoot, outputDirectory);
   if (
     relativeDirectory === ""
@@ -98,7 +97,7 @@ if (parsed !== undefined && outputPath !== undefined) {
   try {
     if (await harnessNeedsBuild()) {
       await execFileAsync("pnpm", ["--filter", "@orca-hq/test-support...", "build"], {
-        cwd: process.cwd(),
+        cwd: repositoryRoot,
         encoding: "utf8",
         maxBuffer: 1024 * 1024
       });

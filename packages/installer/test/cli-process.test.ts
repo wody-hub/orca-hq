@@ -182,7 +182,7 @@ describe.sequential("hq setup process safety", () => {
   }, 30_000);
 
   it("does not echo credentials or expose a failing Keychain command", async () => {
-    // Break caught: terminal echo and execFile's argv-bearing error can independently print the same secret.
+    // Break caught: terminal echo or raw batch-process output can expose the credential material.
     const credentials = [
       "xapp-SUPERSECRET",
       "C-SUPERSECRET",
@@ -192,8 +192,10 @@ describe.sequential("hq setup process safety", () => {
     ] as const;
     const host = await createHostFixture();
     await writeCommand(host.bin, "security", [
-      "if [ \"$1\" = \"add-generic-password\" ]; then",
-      "  printf '%s\\n' \"$*\" >&2",
+      "if [ \"$1\" = \"-i\" ]; then",
+      "  IFS= read -r command",
+      "  printf 'simulated-child-stdout:%s\\n' \"$command\"",
+      "  printf 'simulated-child-stderr:%s\\n' \"$command\" >&2",
       "  exit 42",
       "fi",
       "exit 0"
@@ -208,6 +210,8 @@ describe.sequential("hq setup process safety", () => {
       for (const credential of credentials) {
         expect(`${result.stdout}\n${result.stderr}`).not.toContain(credential);
       }
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("simulated-child-stdout");
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("simulated-child-stderr");
       expect(result.stdout).toContain("Setup failed while applying configuration.");
       expect(result.stderr).toBe("");
     } finally {

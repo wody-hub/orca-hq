@@ -325,7 +325,7 @@ describe("Orca CLI capability adapter", { timeout: 20_000 }, () => {
     }).catch((error: unknown) => error);
 
     await expect(execution).resolves.toMatchObject({ code: "orca_timeout", timeoutMs: 2_000 });
-    const pid = await fake.waitForProcess(args);
+    const pid = await fake.waitForProcess(args, 5_000);
     expect(processExists(pid)).toBe(false);
   });
 

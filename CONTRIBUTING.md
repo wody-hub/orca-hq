@@ -23,7 +23,7 @@ pnpm build
 3. 통과에 필요한 최소 구현을 추가하고 focused test, 전체 test/typecheck/build를 실행합니다.
 4. CLI command를 문서에 추가/변경하면 `packages/installer/test/documented-commands.test.ts`와 실제 `hq` usage를 함께 검토합니다.
 5. 문서의 shell 예시는 copy/paste 가능한 synthetic command로 유지하고 README에서 두 번 이내 link로 도달하게 합니다.
-6. 변경한 파일만 이름으로 stage합니다. `.artifacts/**`, 실제 Registry, credential, transcript, provider response, 사용자/회사 path는 commit하지 않습니다.
+6. 변경한 파일만 이름으로 stage합니다. acceptance report와 browser-test 생성물은 repository 밖 임시 경로에 두고, 실제 Registry, credential, transcript, provider response, 사용자/회사 path는 commit하지 않습니다.
 
 ## Pull request 확인
 
@@ -31,7 +31,8 @@ pnpm build
 pnpm test
 pnpm typecheck
 pnpm build
-node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/private-pilot-acceptance.json
+PILOT_REPORT_DIR=$(mktemp -d)
+node scripts/run-pilot-acceptance.mjs --runs 20 --output "$PILOT_REPORT_DIR/private-pilot-acceptance.json"
 ```
 
 acceptance report는 deterministic simulation이며 live readiness 증거가 아닙니다. PR에는 test 결과, doctor의 exit code와 JSON 구조 확인, 변경된 security/data boundary, rollback 방법을 적습니다. 실제 credential이 필요한 검증을 CI나 contributor Mac에서 임의로 실행하지 않습니다.

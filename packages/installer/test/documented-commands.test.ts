@@ -195,4 +195,30 @@ it("keeps generated acceptance and browser-test output outside the public reposi
       { cwd: repositoryRoot, stdio: "ignore" }
     ), generatedPath).not.toThrow();
   }
+
+  const trackedGeneratedPaths = execFileSync(
+    "git",
+    ["ls-files", "--", ".artifacts", "apps/web/test-results"],
+    { cwd: repositoryRoot, encoding: "utf8" }
+  );
+  expect(trackedGeneratedPaths).toBe("");
+});
+
+it("keeps README, contributor, and CI acceptance commands on external absolute paths", async () => {
+  // Break caught: a documented or CI invocation writes into the checkout or uses a relative output path rejected by the runner.
+  const [readme, contributing, workflow] = await Promise.all([
+    readFile(resolve(repositoryRoot, "README.md"), "utf8"),
+    readFile(resolve(repositoryRoot, "CONTRIBUTING.md"), "utf8"),
+    readFile(resolve(repositoryRoot, ".github/workflows/ci.yml"), "utf8")
+  ]);
+
+  for (const markdown of [readme, contributing]) {
+    expect(markdown).toContain("PILOT_REPORT_DIR=$(mktemp -d)");
+    expect(markdown).toContain(
+      'node scripts/run-pilot-acceptance.mjs --runs 20 --output "$PILOT_REPORT_DIR/private-pilot-acceptance.json"'
+    );
+  }
+  expect(workflow).toContain(
+    'node scripts/run-pilot-acceptance.mjs --runs 20 --output "$RUNNER_TEMP/private-ci-acceptance.json"'
+  );
 });

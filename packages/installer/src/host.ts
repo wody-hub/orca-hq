@@ -24,21 +24,43 @@ export type HostCommandRunner = (
 ) => Promise<Readonly<{ stdout: string }>>;
 
 const runHostCommand: HostCommandRunner = async (executable, arguments_, options) => await new Promise(
-  (resolvePromise, reject) => {
-    const child = execFile(executable, [...arguments_], {
-      ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
-      maxBuffer: options.maxBuffer
-    }, (error, stdout) => {
-      if (error !== null) {
-        reject(new Error("Host command failed."));
+  (resolvePromise, rejectPromise) => {
+    let settled = false;
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(new Error("Host command failed."));
+    };
+    try {
+      const child = execFile(executable, [...arguments_], {
+        ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
+        maxBuffer: options.maxBuffer
+      }, (error, stdout) => {
+        if (error !== null) {
+          fail();
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        resolvePromise({ stdout });
+      });
+      if (options.stdin !== undefined && child.stdin === null) {
+        child.kill();
+        fail();
         return;
       }
-      resolvePromise({ stdout });
-    });
-    child.stdin?.on("error", () => undefined);
-    child.stdin?.end(options.stdin);
+      child.stdin?.once("error", () => {
+        child.kill();
+        fail();
+      });
+      child.stdin?.end(options.stdin);
+    } catch {
+      fail();
+    }
   }
 );
+
+const keychainBatchTokenPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export interface HostReadPort {
   platform(): string;
@@ -236,10 +258,18 @@ export function createNodeMachine(
     async writeText(path, text) { await writeFile(path, text, { encoding: "utf8", mode: 0o600 }); },
     async storeKeychainSecret(service, account, value) {
       try {
+        if (!keychainBatchTokenPattern.test(service) || !keychainBatchTokenPattern.test(account) || value.length === 0) {
+          throw new TypeError("Invalid Keychain credential input.");
+        }
+        const valueHex = Buffer.from(value, "utf8").toString("hex");
         await runCommand(
           "security",
-          ["add-generic-password", "-U", "-s", service, "-a", account, "-w"],
-          { maxBuffer: 64 * 1024, stdin: `${value}\n` }
+          ["-i"],
+          {
+            timeout: 5_000,
+            maxBuffer: 64 * 1024,
+            stdin: `add-generic-password -U -s ${service} -a ${account} -X ${valueHex}\n`
+          }
         );
       } catch {
         throw new Error("Unable to store credential in macOS Keychain.");
