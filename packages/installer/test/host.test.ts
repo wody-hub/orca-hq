@@ -116,6 +116,62 @@ describe("macOS host adapters", () => {
     expect(commandCalls).toBe(0);
   });
 
+  it.each([
+    ["ASCII", "a".repeat(1_024)],
+    ["multibyte", `${"한".repeat(340)}😀`]
+  ])("allows a 1,024-byte %s Keychain secret", async (_kind, secret) => {
+    // Break caught: measuring characters instead of UTF-8 bytes can reject or truncate a valid boundary value.
+    let commandCalls = 0;
+    const machine = createNodeMachine(async () => {
+      commandCalls += 1;
+      return { stdout: "" };
+    });
+
+    expect(Buffer.byteLength(secret, "utf8")).toBe(1_024);
+    await expect(machine.storeKeychainSecret("orca-hq", "slack-app-token", secret)).resolves.toBeUndefined();
+    expect(commandCalls).toBe(1);
+  });
+
+  it.each([
+    ["ASCII boundary overflow", "a".repeat(1_025), 1_025],
+    ["multibyte boundary overflow", `${"한".repeat(341)}aa`, 1_025],
+    ["larger multibyte overflow", "😀".repeat(257), 1_028]
+  ])("rejects a %s Keychain secret before spawning security", async (_kind, secret, expectedBytes) => {
+    // Break caught: an oversized hex payload can cross security -i's line buffer and mask a failed write as success.
+    let commandCalls = 0;
+    const machine = createNodeMachine(async () => {
+      commandCalls += 1;
+      return { stdout: "" };
+    });
+
+    let thrown: unknown;
+    try {
+      await machine.storeKeychainSecret("orca-hq", "slack-app-token", secret);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(Buffer.byteLength(secret, "utf8")).toBe(expectedBytes);
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("Unable to store credential in macOS Keychain.");
+    expect((thrown as Error).message).not.toContain(secret);
+    expect((thrown as Error).message).not.toContain(Buffer.from(secret, "utf8").toString("hex"));
+    expect(commandCalls).toBe(0);
+  });
+
+  it("rejects an empty Keychain secret before spawning security", async () => {
+    // Break caught: empty input must fail closed before any credential-writing process can start.
+    let commandCalls = 0;
+    const machine = createNodeMachine(async () => {
+      commandCalls += 1;
+      return { stdout: "" };
+    });
+
+    await expect(machine.storeKeychainSecret("orca-hq", "slack-app-token", ""))
+      .rejects.toThrow("Unable to store credential in macOS Keychain.");
+    expect(commandCalls).toBe(0);
+  });
+
   it("runs every doctor probe through a recording read-only machine boundary", async () => {
     // Break caught: adding a config, filesystem, process, or Keychain write to doctor must make this assertion fail.
     const machine = new RecordingMachine();

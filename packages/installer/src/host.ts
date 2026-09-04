@@ -61,6 +61,9 @@ const runHostCommand: HostCommandRunner = async (executable, arguments_, options
 );
 
 const keychainBatchTokenPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const keychainSecretMaximumUtf8Bytes = 1_024;
+// macOS `security -i` has a 4,096-byte line buffer. With the ASCII-only service/account
+// tokens capped at 128 bytes each, the largest permitted batch line is 2,340 bytes including `\n`.
 
 export interface HostReadPort {
   platform(): string;
@@ -258,7 +261,13 @@ export function createNodeMachine(
     async writeText(path, text) { await writeFile(path, text, { encoding: "utf8", mode: 0o600 }); },
     async storeKeychainSecret(service, account, value) {
       try {
-        if (!keychainBatchTokenPattern.test(service) || !keychainBatchTokenPattern.test(account) || value.length === 0) {
+        const valueBytes = Buffer.byteLength(value, "utf8");
+        if (
+          !keychainBatchTokenPattern.test(service)
+          || !keychainBatchTokenPattern.test(account)
+          || valueBytes === 0
+          || valueBytes > keychainSecretMaximumUtf8Bytes
+        ) {
           throw new TypeError("Invalid Keychain credential input.");
         }
         const valueHex = Buffer.from(value, "utf8").toString("hex");

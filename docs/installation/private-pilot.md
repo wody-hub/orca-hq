@@ -70,6 +70,20 @@ setup은 먼저 필수 조건을 검사합니다. 통과하면 non-secret plan�
 
 설정에는 `schema`, `databasePath`, `projectRegistryPath`, Keychain `credentialAccounts`만 들어갑니다. 기존 설정을 migration할 때 credential 입력을 비워 두면 기존 account 이름을 보존하며 secret 값을 읽거나 다시 출력하지 않습니다.
 
+설치 직후 아래 read-only 명령으로 `orca-hq` service의 5개 account가 모두 존재하는지만 확인합니다. `-w` 또는 `-g`를 사용하지 않고 명령 출력을 버리므로 credential 값은 읽거나 출력하지 않습니다.
+
+```bash
+for account in slack-app-token slack-channel-id telegram-bot-token telegram-allowed-chat-id openai-api-key; do
+  if security find-generic-password -s orca-hq -a "$account" >/dev/null 2>&1; then
+    printf '%s: present\n' "$account"
+  else
+    printf '%s: missing\n' "$account"
+  fi
+done
+```
+
+5개 모두 `present`여야 합니다. 하나라도 `missing`이면 credential 값을 출력하지 말고 setup을 다시 실행합니다.
+
 ## 4. read-only doctor 확인하기
 
 ```bash

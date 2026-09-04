@@ -191,6 +191,8 @@ describe.sequential("hq setup process safety", () => {
       "sk-SUPERSECRET"
     ] as const;
     const host = await createHostFixture();
+    // This PATH-injected fake checks process wiring and redaction only; it cannot validate
+    // the real macOS `security` parser or Keychain storage semantics.
     await writeCommand(host.bin, "security", [
       "if [ \"$1\" = \"-i\" ]; then",
       "  IFS= read -r command",
