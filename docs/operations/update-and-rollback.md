@@ -1,21 +1,35 @@
 # Update, rollback, and safe uninstall
 
-Orca HQ lifecycle operations fail closed around active work and preserve durable state by default. The private-pilot adapter supplies the host-specific source, SQLite, launchd, and filesystem ports; the lifecycle services never discover broader paths or read Keychain values themselves.
+Orca HQ lifecycle operations fail closed around active work and preserve durable state by default. `pnpm hq update` and `pnpm hq uninstall` are wired to the macOS private-pilot lifecycle composition; they no longer use a reserved placeholder branch. The lifecycle services and host adapter never read Keychain values.
+
+The default source-installed layout is exact and bounded:
+
+- program: the repository root containing the installed `hq` command;
+- database: `~/Library/Application Support/orca-hq/control.sqlite`;
+- backups: `~/Library/Application Support/orca-hq/backups`;
+- config: `~/.config/orca-hq/pilot.json`;
+- launchd: the single `com.orcahq.gateway` user LaunchAgent and its exact plist.
 
 ## Update safety contract
 
-An update targets one explicit source revision. The adapter must expose the currently installed revision and verify that the requested revision is the intended release before any maintenance window begins.
+Run an update with one full 40- or 64-character commit SHA:
+
+```text
+pnpm hq update --revision <full-commit-sha>
+```
+
+The adapter resolves that commit exactly before changing source state. A ref name, abbreviated SHA, missing value, or mismatched resolution is rejected.
 
 The update service performs these steps:
 
 1. Read gateway status. Any active dispatch, uncertain dispatch, malformed status, or unavailable status blocks the update with `active_work`.
-2. Record the current revision, verify the target revision, and install dependencies with the frozen lockfile option.
-3. Run preflight through the read-only port. A failed preflight stops before backup, migration, or launchd changes.
-4. Create a timestamped SQLite online backup. Configuration is included; secrets are always excluded because credentials remain in macOS Keychain.
-5. Recheck active and uncertain work, then stop only the configured gateway service.
-6. Run migrations, start the gateway, and run the machine-readable doctor check.
+2. Record the current revision, verify the exact target revision, check it out, and run `pnpm install --frozen-lockfile`.
+3. Run the no-emit `pnpm typecheck` preflight. A failed preflight restores the prior revision and frozen dependencies before returning an error.
+4. Recheck active and uncertain work. If new or uncertain work appeared, restore the prior program state without stopping launchd.
+5. Stop only the configured gateway service, then create a timestamped SQLite online backup. Configuration is included; secrets are always excluded because credentials remain in macOS Keychain.
+6. Run the newly installed persistence migration in a child process, start the exact LaunchAgent, and run the machine-readable doctor check.
 
-The second status check closes the gap between preflight and the maintenance window. A backup completed just before that check is safe to retain if new work appeared; the service remains running and migration does not begin.
+The second status check closes the gap between preflight and the maintenance window. The gateway is stopped before the online backup, so no gateway write can occur after the rollback point. If backup creation fails, the service restores the prior source/dependencies and restarts the prior gateway without attempting a database/config restore because no receipt exists.
 
 ### Backup receipt
 
@@ -30,14 +44,14 @@ Keep the receipt in the operator-visible result. It is the exact rollback refere
 
 ## Automatic rollback
 
-Any migration, restart, or doctor failure after backup triggers rollback in this order:
+Any migration, restart, or doctor failure after backup triggers full rollback in this order:
 
 1. Stop the new gateway process by its configured service boundary.
 2. Restore the prior source revision.
 3. Restore the database and configuration from the recorded backup, still excluding secrets.
 4. Restart the prior revision.
 
-Rollback attempts every step even if an earlier recovery action fails. The update error reports the backup receipt and `rollbackComplete`; a false value requires operator review before another update. Do not substitute broad process kills, parent-directory deletion, or an unrecorded backup.
+Rollback attempts every step even if an earlier recovery action fails. The internal update error retains a stable `stage`, the original `cause`, the backup receipt when one exists, and `rollbackComplete`; a false value requires operator review before another update. The CLI deliberately prints only a fixed lifecycle failure message so provider, process, or credential text cannot cross the redaction boundary. Do not substitute broad process kills, parent-directory deletion, or an unrecorded backup.
 
 For manual recovery, use only the paths and prior revision in the receipt, restore the program before its compatible database/config snapshot, then run the read-only doctor check. Retain a failed-update backup until the prior revision has restarted and doctor reports healthy.
 
@@ -47,12 +61,26 @@ Source installation and frozen-lockfile reinstall operate on the program path on
 
 ## Safe uninstall
 
-Default uninstall removes the exact launchd service and configured program path. It preserves the entire Application Support data path, including the SQLite database and configuration, and does not access Keychain credentials.
+Before any uninstall mutation, the command reads the same active-work status used by update. Active, uncertain, malformed, contradictory, or unavailable status returns `active_work` and leaves launchd, program, and data untouched.
+
+Default uninstall is:
+
+```text
+pnpm hq uninstall
+```
+
+It removes the exact launchd service/plist and configured program path. It preserves the entire Application Support data path, including the SQLite database and backups, and does not access Keychain credentials. Configuration remains at the separate config path.
 
 Data removal is a separate destructive operation. The adapter must display the generated phrase returned for the exact normalized data path and require a byte-for-byte match:
 
 ```text
 REMOVE ORCA HQ DATA AT /Users/<user>/Library/Application Support/orca-hq
+```
+
+Pass the generated phrase as one quoted argument:
+
+```text
+pnpm hq uninstall --remove-data --confirm "REMOVE ORCA HQ DATA AT /Users/<user>/Library/Application Support/orca-hq"
 ```
 
 A missing or inexact phrase fails before launchd or filesystem mutation. After a correct phrase, removal is limited to the configured data path. Configuration is rejected up front when program and data paths overlap, the database is outside the data path, or any target is relative or a filesystem root.

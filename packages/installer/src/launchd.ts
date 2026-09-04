@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants, readFileSync } from "node:fs";
-import { access, mkdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,7 @@ export type LaunchdStatus = Readonly<
 export interface LaunchdPort {
   createDirectory(path: string): Promise<void>;
   writeText(path: string, text: string, mode: number): Promise<void>;
+  removeFile(path: string): Promise<void>;
   inspectPath(path: string): Promise<Readonly<{
     exists: boolean;
     file: boolean;
@@ -46,6 +47,7 @@ export interface LaunchdOperations {
   start(): Promise<void>;
   stop(): Promise<void>;
   status(): Promise<LaunchdStatus>;
+  uninstall(): Promise<void>;
 }
 
 function xml(value: string): string {
@@ -175,6 +177,14 @@ export function createLaunchdOperations(
         return Object.freeze({ state: "running" as const, ...(pid === undefined ? {} : { pid }) });
       }
       return Object.freeze({ state: "loaded" as const });
+    },
+    async uninstall() {
+      const result = await port.command("launchctl", ["bootout", target(paths)]);
+      if (result.exitCode !== 0) {
+        const existing = await port.command("launchctl", ["print", target(paths)]);
+        if (existing.exitCode === 0) throw operationError("uninstall");
+      }
+      await port.removeFile(paths.plistPath);
     }
   });
 }
@@ -186,6 +196,9 @@ export function createNodeLaunchdPort(): LaunchdPort {
     },
     async writeText(path, text, mode) {
       await writeFile(path, text, { encoding: "utf8", mode });
+    },
+    async removeFile(path) {
+      await rm(path, { force: true });
     },
     async inspectPath(path) {
       try {

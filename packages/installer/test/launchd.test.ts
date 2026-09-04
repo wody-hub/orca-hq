@@ -21,6 +21,7 @@ const paths: LaunchdPaths = {
 class FakeLaunchd implements LaunchdPort {
   readonly calls: Array<Readonly<{ executable: string; arguments: readonly string[] }>> = [];
   readonly directories: string[] = [];
+  readonly removedFiles: string[] = [];
   readonly writes: Array<Readonly<{ path: string; text: string; mode: number }>> = [];
   printResult: Readonly<{ exitCode: number; stdout: string }> = { exitCode: 0, stdout: "state = running\n\tpid = 428" };
   bootstrapExitCode = 0;
@@ -40,6 +41,10 @@ class FakeLaunchd implements LaunchdPort {
 
   async writeText(path: string, text: string, mode: number): Promise<void> {
     this.writes.push({ path, text, mode });
+  }
+
+  async removeFile(path: string): Promise<void> {
+    this.removedFiles.push(path);
   }
 
   async inspectPath(path: string) {
@@ -99,6 +104,19 @@ describe("launchd supervision", () => {
     await expect(launchd.status()).resolves.toEqual({ state: "running", pid: 428 });
     fake.printResult = { exitCode: 3, stdout: "credential=must-not-escape" };
     await expect(launchd.status()).resolves.toEqual({ state: "stopped" });
+  });
+
+  it("uninstalls only the exact user-domain service and plist", async () => {
+    // Break caught: lifecycle uninstall can leave an auto-restarting plist or remove a broader launchd target.
+    const fake = new FakeLaunchd();
+    const launchd = createLaunchdOperations(paths, fake);
+
+    await launchd.uninstall();
+
+    expect(fake.calls).toEqual([
+      { executable: "launchctl", arguments: ["bootout", "gui/501/com.orcahq.gateway"] }
+    ]);
+    expect(fake.removedFiles).toEqual([paths.plistPath]);
   });
 
   it("treats an already loaded exact LaunchAgent as an idempotent install", async () => {

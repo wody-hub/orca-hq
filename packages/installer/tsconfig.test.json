@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "../.."
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/cli.test.ts",
+    "test/launchd.test.ts",
+    "test/lifecycle-commands.test.ts",
+    "test/lifecycle-host.test.ts"
+  ]
+}

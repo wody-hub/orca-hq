@@ -30,6 +30,10 @@ class FakeLoginLaunchd implements LaunchdPort {
     this.plist = text;
   }
 
+  async removeFile(): Promise<void> {
+    this.plist = "";
+  }
+
   async inspectPath(path: string) {
     return {
       exists: path === paths.nodePath || path === paths.gatewayEntryPath,

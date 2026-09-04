@@ -5,6 +5,7 @@ export * from "./doctor.js";
 export * from "./host.js";
 export * from "./keychain.js";
 export * from "./launchd.js";
+export * from "./lifecycle-host.js";
 export * from "./prompt.js";
 export * from "./setup.js";
 export * from "./uninstall.js";

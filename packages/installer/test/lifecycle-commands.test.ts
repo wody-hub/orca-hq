@@ -6,7 +6,12 @@ import {
   type BackupServicePorts
 } from "../src/backup.js";
 import { createUninstall, dataRemovalConfirmationPhrase } from "../src/uninstall.js";
-import { createUpdate, prepareUpdate, type UpdateContext } from "../src/update.js";
+import {
+  createUpdate,
+  prepareUpdate,
+  type GatewayUpdateStatus,
+  type UpdateContext
+} from "../src/update.js";
 
 const receipt: BackupReceipt = {
   id: "2026-09-04T01-02-03-000Z",
@@ -22,25 +27,35 @@ const receipt: BackupReceipt = {
 
 function updateFixture(): UpdateContext & {
   calls: string[];
-  status: { activeOrUncertainDispatches: number };
+  statuses: GatewayUpdateStatus[];
   doctorResult: { ok: boolean };
+  backupError?: Error;
+  restoreRevisionError?: Error;
+  statusError?: Error;
   migrationError?: Error;
 } {
   const calls: string[] = [];
-  const status = { activeOrUncertainDispatches: 0 };
+  const statuses: GatewayUpdateStatus[] = [{ activeOrUncertainDispatches: 0 }];
   const doctorResult = { ok: true };
   const fixture: UpdateContext & {
     calls: string[];
-    status: { activeOrUncertainDispatches: number };
+    statuses: GatewayUpdateStatus[];
     doctorResult: { ok: boolean };
+    backupError?: Error;
+    restoreRevisionError?: Error;
+    statusError?: Error;
     migrationError?: Error;
   } = {
     calls,
-    status,
+    statuses,
     doctorResult,
     targetRevision: "rev-after",
     gateway: {
-      async status() { calls.push("gateway:status"); return status; },
+      async status() {
+        calls.push("gateway:status");
+        if (fixture.statusError !== undefined) throw fixture.statusError;
+        return statuses.shift() ?? { activeOrUncertainDispatches: 0 };
+      },
       async stop() { calls.push("gateway:stop"); },
       async start() { calls.push("gateway:start"); }
     },
@@ -50,7 +65,10 @@ function updateFixture(): UpdateContext & {
       async installRevision(options) {
         calls.push(`source:install:${options.revision}:frozen=${String(options.frozenLockfile)}`);
       },
-      async restoreRevision(revision) { calls.push(`source:restore:${revision}`); }
+      async restoreRevision(revision) {
+        calls.push(`source:restore:${revision}`);
+        if (fixture.restoreRevisionError !== undefined) throw fixture.restoreRevisionError;
+      }
     },
     preflight: {
       async run(options) { calls.push(`preflight:readOnly=${String(options.readOnly)}`); return { ok: true }; }
@@ -58,6 +76,7 @@ function updateFixture(): UpdateContext & {
     backups: {
       async createOnlineBackup(options) {
         calls.push(`backup:create:config=${String(options.includeConfig)}:secrets=${String(options.includeSecrets)}`);
+        if (fixture.backupError !== undefined) throw fixture.backupError;
         return receipt;
       },
       async restore(backup, options) {
@@ -156,7 +175,33 @@ describe("guarded source update", () => {
   it("refuses update while worker state is active or uncertain", async () => {
     // Break caught: an update could interrupt or duplicate a live/unknown Orca worker.
     const fixture = updateFixture();
-    fixture.status.activeOrUncertainDispatches = 1;
+    fixture.statuses[0] = { activeOrUncertainDispatches: 1 };
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({ code: "active_work" });
+
+    expect(fixture.calls).toEqual(["gateway:status"]);
+  });
+
+  it.each([
+    {},
+    { activeOrUncertainDispatches: -1 },
+    { activeOrUncertainDispatches: Number.NaN },
+    { activeOrUncertainDispatches: 0, uncertainDispatches: 1 },
+    { activeOrUncertainDispatches: 0, nonterminalDispatches: 1, uncertainDispatches: 0 }
+  ] satisfies GatewayUpdateStatus[])("fails closed for malformed or contradictory gateway status %#", async (status) => {
+    // Break caught: malformed or contradictory status must never be interpreted as an idle gateway.
+    const fixture = updateFixture();
+    fixture.statuses[0] = status;
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({ code: "active_work" });
+
+    expect(fixture.calls).toEqual(["gateway:status"]);
+  });
+
+  it("normalizes gateway status rejection to active_work", async () => {
+    // Break caught: an unavailable gateway status could leak an arbitrary provider error or permit maintenance.
+    const fixture = updateFixture();
+    fixture.statusError = new Error("provider token leaked");
 
     await expect(createUpdate(fixture).run()).rejects.toMatchObject({ code: "active_work" });
 
@@ -179,10 +224,13 @@ describe("guarded source update", () => {
   it("requires explicit revision verification success", async () => {
     // Break caught: an adapter that forgets to return its verification result could install an unverified revision.
     const fixture = updateFixture();
-    fixture.source.verifyRevision = async (revision) => {
-      fixture.calls.push(`source:verify:${revision}`);
-      return undefined;
-    };
+    Object.assign(fixture.source, {
+      verifyRevision: async (revision: string): Promise<boolean> => {
+        fixture.calls.push(`source:verify:${revision}`);
+        // Intentional unsafe fixture: a broken provider can omit a value despite the declared port contract.
+        return undefined as unknown as boolean;
+      }
+    });
 
     await expect(createUpdate(fixture).run()).rejects.toMatchObject({ code: "revision_mismatch" });
 
@@ -196,19 +244,27 @@ describe("guarded source update", () => {
   it("requires explicit read-only preflight success", async () => {
     // Break caught: a missing preflight result could be mistaken for approval and enter the maintenance window.
     const fixture = updateFixture();
-    fixture.preflight.run = async (options) => {
-      fixture.calls.push(`preflight:readOnly=${String(options.readOnly)}`);
-      return undefined;
-    };
+    Object.assign(fixture.preflight, {
+      run: async (options: Readonly<{ readOnly: true }>): Promise<Readonly<{ ok: boolean }>> => {
+        fixture.calls.push(`preflight:readOnly=${String(options.readOnly)}`);
+        // Intentional unsafe fixture: runtime adapters can violate their static response contract.
+        return undefined as unknown as { ok: boolean };
+      }
+    });
 
-    await expect(createUpdate(fixture).run()).rejects.toMatchObject({ code: "preflight_failed" });
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "preflight",
+      cause: { code: "preflight_failed" }
+    });
 
     expect(fixture.calls).toEqual([
       "gateway:status",
       "source:current",
       "source:verify:rev-after",
       "source:install:rev-after:frozen=true",
-      "preflight:readOnly=true"
+      "preflight:readOnly=true",
+      "source:restore:rev-before"
     ]);
   });
 
@@ -228,12 +284,69 @@ describe("guarded source update", () => {
       "source:verify:rev-after",
       "source:install:rev-after:frozen=true",
       "preflight:readOnly=true",
-      "backup:create:config=true:secrets=false",
       "gateway:status",
       "gateway:stop",
+      "backup:create:config=true:secrets=false",
       "migrations:run",
       "gateway:start",
       "doctor:json"
+    ]);
+  });
+
+  it("restores the prior program when preflight fails before a backup exists", async () => {
+    // Break caught: a preflight failure after installation can leave the new revision on disk without a receipt.
+    const fixture = updateFixture();
+    const cause = new Error("preflight rejected");
+    Object.assign(fixture.preflight, {
+      run: async (options: Readonly<{ readOnly: true }>): Promise<Readonly<{ ok: boolean }>> => {
+        fixture.calls.push(`preflight:readOnly=${String(options.readOnly)}`);
+        throw cause;
+      }
+    });
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "preflight",
+      cause,
+      rollbackComplete: true
+    });
+
+    expect(fixture.calls.slice(-2)).toEqual(["preflight:readOnly=true", "source:restore:rev-before"]);
+  });
+
+  it("restores the prior program when the second active-work check closes the maintenance window", async () => {
+    // Break caught: work appearing after preflight can strand the newly installed revision on disk.
+    const fixture = updateFixture();
+    fixture.statuses.push({ activeOrUncertainDispatches: 1 });
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "second_active_work_check",
+      rollbackComplete: true
+    });
+
+    expect(fixture.calls.slice(-2)).toEqual(["gateway:status", "source:restore:rev-before"]);
+    expect(fixture.calls).not.toContain("gateway:stop");
+  });
+
+  it("restores and restarts the prior program when backup creation fails after stop", async () => {
+    // Break caught: stop-before-backup can leave both the new source and gateway in a failed maintenance state.
+    const fixture = updateFixture();
+    const cause = new Error("online backup failed");
+    fixture.backupError = cause;
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "backup",
+      cause,
+      rollbackComplete: true
+    });
+
+    expect(fixture.calls.slice(-4)).toEqual([
+      "gateway:stop",
+      "backup:create:config=true:secrets=false",
+      "source:restore:rev-before",
+      "gateway:start"
     ]);
   });
 
@@ -244,7 +357,30 @@ describe("guarded source update", () => {
 
     await expect(createUpdate(fixture).run()).rejects.toMatchObject({
       code: "update_failed",
-      backup: receipt
+      backup: receipt,
+      stage: "migration",
+      cause: fixture.migrationError
+    });
+
+    expect(fixture.calls.slice(-5)).toEqual([
+      "migrations:run",
+      "gateway:stop",
+      "source:restore:rev-before",
+      "backup:restore:2026-09-04T01-02-03-000Z:config=true:secrets=false",
+      "gateway:start"
+    ]);
+  });
+
+  it("marks rollback incomplete when a production restore stage fails and still attempts the remainder", async () => {
+    // Break caught: one failed rollback action could be hidden or prevent compatible data and gateway recovery.
+    const fixture = updateFixture();
+    fixture.migrationError = new Error("migration broke");
+    fixture.restoreRevisionError = new Error("source restore broke");
+
+    await expect(createUpdate(fixture).run()).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "migration",
+      rollbackComplete: false
     });
 
     expect(fixture.calls.slice(-5)).toEqual([
@@ -267,8 +403,17 @@ describe("safe uninstall", () => {
     };
     const existing = new Set([paths.program, paths.data, paths.database, paths.config]);
     const calls: string[] = [];
+    const status: { current: GatewayUpdateStatus } = { current: { activeOrUncertainDispatches: 0 } };
+    let statusError: Error | undefined;
     const uninstall = createUninstall({
       paths,
+      gateway: {
+        async status() {
+          calls.push("gateway:status");
+          if (statusError !== undefined) throw statusError;
+          return status.current;
+        }
+      },
       launchd: {
         async uninstall() { calls.push("launchd:uninstall"); }
       },
@@ -281,7 +426,10 @@ describe("safe uninstall", () => {
         }
       }
     });
-    return { calls, existing, paths, uninstall };
+    return {
+      calls, existing, paths, status, uninstall,
+      rejectStatus(error: Error) { statusError = error; }
+    };
   }
 
   it("rejects a program path nested inside durable data", () => {
@@ -292,6 +440,7 @@ describe("safe uninstall", () => {
         data: "/Users/pilot/Library/Application Support/orca-hq",
         database: "/Users/pilot/Library/Application Support/orca-hq/runtime.sqlite"
       },
+      gateway: { async status() { return { activeOrUncertainDispatches: 0 }; } },
       launchd: { async uninstall() {} },
       files: { async removeProgram() {}, async removeData() {} }
     })).toThrow("Program and durable data paths are not safely separated.");
@@ -308,9 +457,35 @@ describe("safe uninstall", () => {
     expect(subject.existing.has(subject.paths.data)).toBe(true);
     expect(subject.existing.has(subject.paths.program)).toBe(false);
     expect(subject.calls).toEqual([
+      "gateway:status",
       "launchd:uninstall",
       `files:remove-program:${subject.paths.program}`
     ]);
+  });
+
+  it.each([
+    { activeOrUncertainDispatches: 1 },
+    {},
+    { activeOrUncertainDispatches: 0, nonterminalDispatches: 1 }
+  ] satisfies GatewayUpdateStatus[])("refuses uninstall for active, malformed, or contradictory status %#", async (status) => {
+    // Break caught: uninstall must not remove launchd or program state while work may still be active.
+    const subject = fixture();
+    subject.status.current = status;
+
+    await expect(subject.uninstall.run({ removeData: false })).rejects.toMatchObject({ code: "active_work" });
+
+    expect(subject.calls).toEqual(["gateway:status"]);
+    expect(subject.existing.has(subject.paths.program)).toBe(true);
+  });
+
+  it("refuses uninstall when gateway status is unavailable", async () => {
+    // Break caught: status transport failure must fail closed before launchd or filesystem mutation.
+    const subject = fixture();
+    subject.rejectStatus(new Error("status unavailable"));
+
+    await expect(subject.uninstall.run({ removeData: false })).rejects.toMatchObject({ code: "active_work" });
+
+    expect(subject.calls).toEqual(["gateway:status"]);
   });
 
   it("rejects an inexact data-removal phrase before making any change", async () => {
@@ -320,7 +495,7 @@ describe("safe uninstall", () => {
     await expect(subject.uninstall.run({ removeData: true, confirmation: "REMOVE DATA" }))
       .rejects.toMatchObject({ code: "confirmation_required" });
 
-    expect(subject.calls).toEqual([]);
+    expect(subject.calls).toEqual(["gateway:status"]);
     expect(subject.existing.has(subject.paths.program)).toBe(true);
     expect(subject.existing.has(subject.paths.database)).toBe(true);
   });
@@ -335,6 +510,7 @@ describe("safe uninstall", () => {
     });
 
     expect(subject.calls).toEqual([
+      "gateway:status",
       "launchd:uninstall",
       `files:remove-program:${subject.paths.program}`,
       `files:remove-data:${subject.paths.data}`

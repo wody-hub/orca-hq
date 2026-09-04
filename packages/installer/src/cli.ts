@@ -11,6 +11,7 @@ import {
   defaultLaunchdPaths,
   type LaunchdOperations
 } from "./launchd.js";
+import { createLifecycleHostComposition, type LifecycleComposition } from "./lifecycle-host.js";
 import { createTerminalPrompt, type GuidedPromptPort } from "./prompt.js";
 import { createSetup, type SetupPorts } from "./setup.js";
 
@@ -26,6 +27,7 @@ export interface CliDependencies {
   readonly host?: HostAdapters;
   readonly prompt?: GuidedPromptPort;
   readonly launchd?: LaunchdOperations;
+  readonly lifecycle?: LifecycleComposition;
 }
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
@@ -89,6 +91,41 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       return status.state === "stopped" ? 1 : 0;
     } catch {
       write(output, "Gateway service operation failed.");
+      return 1;
+    }
+  }
+  if (selected === "update" || selected === "uninstall") {
+    const lifecycle = dependencies.lifecycle ?? createLifecycleHostComposition({ doctor: host.doctor });
+    try {
+      if (selected === "update") {
+        if (input.length !== 3 || input[1] !== "--revision" || input[2] === undefined) {
+          write(output, "Usage: hq update --revision <full-commit-sha>");
+          return 2;
+        }
+        const result = await lifecycle.update.run({ revision: input[2] });
+        write(output, JSON.stringify({
+          previousRevision: result.previousRevision,
+          revision: result.revision,
+          backupId: result.backup.id
+        }));
+        return 0;
+      }
+      if (input.length === 2 && input[1] === "--remove-data") {
+        write(output, `Confirmation required: ${lifecycle.uninstall.confirmationPhrase}`);
+        return 2;
+      }
+      if (input.length === 1) {
+        await lifecycle.uninstall.run({ removeData: false });
+      } else if (input.length === 4 && input[1] === "--remove-data" && input[2] === "--confirm" && input[3] !== undefined) {
+        await lifecycle.uninstall.run({ removeData: true, confirmation: input[3] });
+      } else {
+        write(output, "Usage: hq uninstall [--remove-data --confirm <exact-phrase>]");
+        return 2;
+      }
+      write(output, "Orca HQ lifecycle uninstall completed.");
+      return 0;
+    } catch {
+      write(output, "Lifecycle operation failed.");
       return 1;
     }
   }

@@ -1,5 +1,7 @@
 import { isAbsolute, normalize, parse, relative } from "node:path";
 
+import { assertNoActiveWork, type GatewayUpdateStatus } from "./update.js";
+
 export interface UninstallPaths {
   readonly program: string;
   readonly data: string;
@@ -8,6 +10,9 @@ export interface UninstallPaths {
 
 export interface UninstallContext {
   readonly paths: UninstallPaths;
+  readonly gateway: Readonly<{
+    status(): Promise<GatewayUpdateStatus>;
+  }>;
   readonly launchd: Readonly<{
     uninstall(): Promise<void>;
   }>;
@@ -60,6 +65,7 @@ export function dataRemovalConfirmationPhrase(dataPath: string): string {
 
 /** Removes service/program state while preserving Application Support data unless separately confirmed. */
 export function createUninstall(context: UninstallContext): Readonly<{
+  readonly confirmationPhrase: string;
   run(options: UninstallOptions): Promise<UninstallResult>;
 }> {
   const program = safePath(context.paths.program, "Program path");
@@ -70,7 +76,9 @@ export function createUninstall(context: UninstallContext): Readonly<{
   }
 
   return Object.freeze({
+    confirmationPhrase: dataRemovalConfirmationPhrase(data),
     async run(options): Promise<UninstallResult> {
+      await assertNoActiveWork(context);
       if (options.removeData) {
         const expected = dataRemovalConfirmationPhrase(data);
         if (options.confirmation !== expected) throw new UninstallConfirmationError(expected);

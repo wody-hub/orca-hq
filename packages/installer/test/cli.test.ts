@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runCli, type HostAdapters } from "../src/cli.js";
 import type { DoctorPorts } from "../src/doctor.js";
 import type { LaunchdOperations, LaunchdStatus } from "../src/launchd.js";
+import type { LifecycleComposition } from "../src/lifecycle-host.js";
 import type { GuidedPromptPort } from "../src/prompt.js";
 
 function passingDoctor(): DoctorPorts {
@@ -32,7 +33,7 @@ function adapters(options: Readonly<{
   let prompts = 0;
   const doctor = passingDoctor();
   if (options.preflight === "fail") {
-    doctor.checks.macosCpu = async () => "fail";
+    Object.assign(doctor.checks, { macosCpu: async () => "fail" as const });
   }
   return {
     writes,
@@ -74,11 +75,103 @@ function launchd(status: LaunchdStatus = { state: "running", pid: 428 }): Launch
     async install() { calls.push("install"); },
     async start() { calls.push("start"); },
     async stop() { calls.push("stop"); },
-    async status() { calls.push("status"); return status; }
+    async status() { calls.push("status"); return status; },
+    async uninstall() { calls.push("uninstall"); }
   };
 }
 
 describe("hq command-line contract", () => {
+  it("dispatches update with an exact revision through the lifecycle composition", async () => {
+    // Break caught: `pnpm hq update` could remain a reserved branch instead of invoking guarded lifecycle work.
+    const stdout = output();
+    const calls: string[] = [];
+    const revision = "a".repeat(40);
+    const lifecycle: LifecycleComposition = {
+      update: {
+        async run(options?: Readonly<{ revision?: string }>) {
+          calls.push(`update:${options?.revision ?? "missing"}`);
+          return {
+            previousRevision: "b".repeat(40),
+            revision,
+            backup: {
+              id: "backup-1",
+              path: "/pilot/backups/backup-1",
+              databasePath: "/pilot/backups/backup-1/runtime.sqlite",
+              createdAt: "2026-09-04T01:02:03.000Z",
+              sourceRevision: "b".repeat(40),
+              schemaVersion: 2,
+              includesConfig: false,
+              includesSecrets: false
+            }
+          };
+        }
+      },
+      uninstall: {
+        confirmationPhrase: "REMOVE ORCA HQ DATA AT /pilot/data",
+        async run() { throw new Error("unexpected uninstall"); }
+      }
+    };
+
+    const exitCode = await runCli(["update", "--revision", revision], {
+      stdout,
+      lifecycle
+    });
+
+    expect(exitCode).toBe(0);
+    expect(calls).toEqual([`update:${revision}`]);
+    expect(stdout.lines.join("\n")).toContain('"backupId":"backup-1"');
+  });
+
+  it("dispatches safe default and explicitly confirmed data uninstall options", async () => {
+    // Break caught: uninstall CLI parsing could bypass the lifecycle service or imply data removal without exact confirmation.
+    const stdout = output();
+    const calls: unknown[] = [];
+    const phrase = "REMOVE ORCA HQ DATA AT /pilot/data";
+    const lifecycle: LifecycleComposition = {
+      update: { async run() { throw new Error("unexpected update"); } },
+      uninstall: {
+        confirmationPhrase: phrase,
+        async run(options: Readonly<{ removeData: boolean; confirmation?: string }>) {
+          calls.push(options);
+          return { dataPreserved: !options.removeData, removedProgramPath: "/pilot/program" };
+        }
+      }
+    };
+
+    await expect(runCli(["uninstall", "--remove-data"], { stdout, lifecycle })).resolves.toBe(2);
+    expect(stdout.lines.join("\n")).toContain(phrase);
+    await expect(runCli(["uninstall"], { stdout, lifecycle })).resolves.toBe(0);
+    await expect(runCli(
+      ["uninstall", "--remove-data", "--confirm", phrase],
+      { stdout, lifecycle }
+    )).resolves.toBe(0);
+
+    expect(calls).toEqual([
+      { removeData: false },
+      { removeData: true, confirmation: phrase }
+    ]);
+  });
+
+  it("redacts lifecycle provider failures at the CLI boundary", async () => {
+    // Break caught: UpdateFailedError.cause can retain diagnostics internally but must not print provider secrets.
+    const stdout = output();
+    const lifecycle: LifecycleComposition = {
+      update: { async run() { throw new Error("provider-secret-token"); } },
+      uninstall: {
+        confirmationPhrase: "REMOVE ORCA HQ DATA AT /pilot/data",
+        async run() { throw new Error("unexpected uninstall"); }
+      }
+    };
+
+    await expect(runCli(
+      ["update", "--revision", "a".repeat(40)],
+      { stdout, lifecycle }
+    )).resolves.toBe(1);
+
+    expect(stdout.lines.join("\n")).toContain("Lifecycle operation failed.");
+    expect(stdout.lines.join("\n")).not.toContain("provider-secret-token");
+  });
+
   it("uses the host adapter factory for doctor and emits only JSON on stdout", async () => {
     // Break caught: omitting the default host factory would return the old all-fail placeholder report.
     const stdout = output();
