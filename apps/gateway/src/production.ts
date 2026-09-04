@@ -516,6 +516,11 @@ function productionCommandFlow(
       store.saveExecutionProposal(proposal);
       const project = projectFor(proposal);
       if (project === undefined) return { state: "review_required" };
+      store.appendAudit({
+        subjectId: durable.commandId,
+        eventType: "command.route_selected",
+        data: { proposalId: proposal.proposalId, projectKey: project.projectKey }
+      });
       if (proposal.riskLevel === "L2" || proposal.riskLevel === "L3") {
         const approvalId = `approval:${proposal.proposalId}`;
         const existing = store.findApproval(approvalId);
@@ -547,6 +552,11 @@ function productionCommandFlow(
             allowedChannels: ["slack", "tailscale-web"]
           });
         }
+        store.appendAudit({
+          subjectId: durable.commandId,
+          eventType: "command.policy_approval_required",
+          data: { proposalId: proposal.proposalId, approvalId, riskLevel: proposal.riskLevel }
+        });
         store.saveRun({
           id: runId(proposal.proposalId),
           proposalId: proposal.proposalId,
@@ -562,6 +572,11 @@ function productionCommandFlow(
         });
         return { state: "waiting_approval" };
       }
+      store.appendAudit({
+        subjectId: durable.commandId,
+        eventType: "command.policy_authorized",
+        data: { proposalId: proposal.proposalId, riskLevel: proposal.riskLevel }
+      });
       return startAuthorized(proposal, project, { kind: "automatic" });
     }
   };

@@ -398,6 +398,43 @@ describe("ControlStore", () => {
     expect(claimed).toMatchObject({ id: outboxMessage.id });
   });
 
+  it("stores channel cursors independently, updates them, and preserves them across reopen", () => {
+    // Break caught: restart recovery can use an ephemeral/shared cursor instead of each channel's durable high-water mark.
+    const path = temporaryDatabasePath();
+    const firstDatabase = openDatabase(path);
+    const firstStore = new ControlStore(firstDatabase) as ControlStore & {
+      loadChannelCursor(channel: "slack" | "telegram"): string | number | undefined;
+      saveChannelCursor(channel: "slack" | "telegram", cursor: string | number): void;
+    };
+
+    firstStore.saveChannelCursor("slack", "1788451201.000001");
+    firstStore.saveChannelCursor("telegram", 502);
+    firstStore.saveChannelCursor("slack", "1788451202.000002");
+    expect(firstStore.loadChannelCursor("slack")).toBe("1788451202.000002");
+    expect(firstStore.loadChannelCursor("telegram")).toBe(502);
+    firstDatabase.close();
+
+    const reopenedDatabase = openDatabase(path);
+    openDatabases.push(reopenedDatabase);
+    const reopened = new ControlStore(reopenedDatabase) as ControlStore & {
+      loadChannelCursor(channel: "slack" | "telegram"): string | number | undefined;
+    };
+    expect(reopened.loadChannelCursor("slack")).toBe("1788451202.000002");
+    expect(reopened.loadChannelCursor("telegram")).toBe(502);
+  });
+
+  it("rejects invalid channel cursor identities and values", () => {
+    // Break caught: malformed or cross-channel cursor state can overwrite a valid restart position.
+    const store = testStore() as ControlStore & {
+      saveChannelCursor(channel: unknown, cursor: unknown): void;
+    };
+
+    expect(() => store.saveChannelCursor("email", "cursor-1")).toThrow();
+    expect(() => store.saveChannelCursor("slack", "")).toThrow();
+    expect(() => store.saveChannelCursor("telegram", -1)).toThrow();
+    expect(() => store.saveChannelCursor("telegram", 1.5)).toThrow();
+  });
+
   it("claims only due pending outbox messages and increments attempts", () => {
     const store = testStore();
     expect(store.enqueueOutbox(outboxMessage)).toBe("inserted");

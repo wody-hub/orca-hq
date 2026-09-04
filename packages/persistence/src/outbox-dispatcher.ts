@@ -68,6 +68,14 @@ export class OutboxDispatcher {
       this.#prepareSlackHqMirror(message, now);
       const receipt = OutboundDeliveryReceiptSchema.parse(await this.#deliver(message));
       this.#store.markOutboxDelivered(message.id, receipt.providerMessageId, now);
+      if (message.commandId !== undefined) {
+        this.#store.appendAudit({
+          id: `${message.id}:delivered-audit`,
+          subjectId: message.commandId,
+          eventType: "outbox.delivered",
+          data: { messageId: message.id, channel: message.channel }
+        });
+      }
     } catch (error) {
       const failure = normalizeDeliveryFailure(error);
       if (failure.retryable) {

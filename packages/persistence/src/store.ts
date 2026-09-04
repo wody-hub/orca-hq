@@ -74,6 +74,10 @@ const AuditEventSchema = AppendAuditEventSchema.extend({
   createdAt: z.string().datetime()
 }).strict();
 
+const DurableChannelSchema = z.enum(["slack", "telegram"]);
+const SlackCursorSchema = z.string().min(1);
+const TelegramCursorSchema = z.number().int().nonnegative();
+
 const WorktreeLeaseSchema = z.object({
   lockKey: z.string().min(1),
   commandId: z.string().min(1),
@@ -275,6 +279,8 @@ export type EnqueueOutboxMessage = z.infer<typeof EnqueueOutboxMessageSchema>;
 export type OutboxMessage = z.infer<typeof OutboxMessageSchema>;
 export type AppendAuditEvent = z.infer<typeof AppendAuditEventSchema>;
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export type DurableChannel = z.infer<typeof DurableChannelSchema>;
+export type ChannelCursor = string | number;
 export type WorktreeLease = z.infer<typeof WorktreeLeaseSchema>;
 export type WorktreeHeartbeatUpdate = z.infer<typeof WorktreeHeartbeatUpdateSchema>;
 export type WorktreeReleaseUpdate = z.infer<typeof WorktreeReleaseUpdateSchema>;
@@ -2143,6 +2149,37 @@ export class ControlStore implements CommandIngress {
       payload: parseJson(row.payload_json),
       createdAt: row.created_at
     }));
+  }
+
+  loadChannelCursor(channelInput: DurableChannel): ChannelCursor | undefined {
+    const channel = DurableChannelSchema.parse(channelInput);
+    const row = this.database.prepare(`
+      SELECT channel, state_json
+      FROM channel_cursors
+      WHERE id = ?
+    `).get(channel) as { channel: string; state_json: string } | undefined;
+    if (row === undefined) return undefined;
+    if (row.channel !== channel) throw new TypeError("persisted channel cursor identity mismatch");
+    const cursor = parseJson(row.state_json);
+    return channel === "slack"
+      ? SlackCursorSchema.parse(cursor)
+      : TelegramCursorSchema.parse(cursor);
+  }
+
+  saveChannelCursor(channelInput: DurableChannel, cursorInput: ChannelCursor): void {
+    const channel = DurableChannelSchema.parse(channelInput);
+    const cursor = channel === "slack"
+      ? SlackCursorSchema.parse(cursorInput)
+      : TelegramCursorSchema.parse(cursorInput);
+    const now = new Date().toISOString();
+    this.database.prepare(`
+      INSERT INTO channel_cursors (id, channel, state_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        channel = excluded.channel,
+        state_json = excluded.state_json,
+        updated_at = excluded.updated_at
+    `).run(channel, channel, JSON.stringify(cursor), now, now);
   }
 
   enqueueOutbox(messageInput: EnqueueOutboxMessage): "inserted" | "duplicate" {

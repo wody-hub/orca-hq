@@ -12,8 +12,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@orca-hq/codex-hq": "workspace:*",
     "@orca-hq/core": "workspace:*",
     "@orca-hq/gateway": "workspace:*",
+    "@orca-hq/orca-adapter": "workspace:*",
     "@orca-hq/persistence": "workspace:*",
     "@orca-hq/project-registry": "workspace:*",
     "@orca-hq/slack-adapter": "workspace:*",

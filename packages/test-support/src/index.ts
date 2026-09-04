@@ -16,7 +16,9 @@ export { FakeSlack, type FakeSlackOptions } from "./fake-slack.js";
 export { FakeTelegram, type FakeTelegramOptions } from "./fake-telegram.js";
 export {
   PILOT_CRITERION_IDS,
+  pilotAcceptancePassesGate,
   runPilotAcceptance,
+  simulateDurableRestart,
   type PilotAcceptanceReport,
   type PilotCriterionId,
   type RunPilotAcceptanceOptions

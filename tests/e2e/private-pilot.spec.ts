@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
+import * as pilotSupport from "../../packages/test-support/src/index.js";
 import {
   PILOT_CRITERION_IDS,
   runPilotAcceptance
@@ -60,6 +61,47 @@ describe("deterministic private-pilot acceptance", () => {
       "worker_launch:retry_exhausted:third_attempt_blocked:intervention_required",
       "verification_cycle_2:intervention_required:no_success_outbox"
     ]));
+  });
+
+  it.each([
+    "missing_codex_to_claude",
+    "missing_claude_to_codex"
+  ] as const)("fails verified-success coverage when %s evidence is absent", async (verifierEvidenceMode) => {
+    // Break caught: success and evidence events emitted as a pair can hide either direction's missing verifier evidence.
+    const report = await runPilotAcceptance({
+      runs: 1,
+      runIdPrefix: `e2e-coverage-${verifierEvidenceMode}`,
+      verifierEvidenceMode
+    } as Parameters<typeof runPilotAcceptance>[0]);
+
+    expect(report.verifiedSuccessCoverage).toBe(0.5);
+    expect(report.scenarios.filter(({ id }) =>
+      id === "korean_voice_verified_l1" || id === "reverse_model_verification"
+    ).filter(({ status }) => status === "fail")).toHaveLength(1);
+  });
+
+  it.each([
+    "duplicate_provider_delivery",
+    "outbox_recovery_exactly_once"
+  ])("rejects the runner gate when required scenario %s fails despite clean metrics", async (scenarioId) => {
+    // Break caught: the CLI gate can ignore required scenario failure while every aggregate metric remains green.
+    const passesGate = (pilotSupport as unknown as {
+      pilotAcceptancePassesGate?: (report: Awaited<ReturnType<typeof runPilotAcceptance>>) => boolean;
+    }).pilotAcceptancePassesGate;
+    expect(typeof passesGate).toBe("function");
+    if (passesGate === undefined) return;
+    const passing = await runPilotAcceptance({ runs: 1, runIdPrefix: `e2e-gate-${scenarioId}` });
+    const report = {
+      ...passing,
+      scenarios: passing.scenarios.map((scenario) => scenario.id === scenarioId
+        ? { ...scenario, status: "fail" as const }
+        : scenario)
+    };
+
+    expect(report.duplicateExecutions).toBe(0);
+    expect(report.approvalBypasses).toBe(0);
+    expect(report.verifiedSuccessCoverage).toBe(1);
+    expect(passesGate(report)).toBe(false);
   });
 
   it("writes one bounded machine-readable report and rejects unsafe arguments", async () => {

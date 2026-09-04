@@ -14,6 +14,10 @@ export interface FakeTelegramOptions {
   readonly ingress: CommandIngress;
   readonly identities: IdentityResolver;
   readonly nextId: (kind: string) => string;
+  readonly cursorStore?: Readonly<{
+    load(channel: "telegram"): Promise<number | undefined> | number | undefined;
+    save(channel: "telegram", cursor: number): Promise<void> | void;
+  }>;
 }
 
 export class FakeTelegram {
@@ -39,8 +43,11 @@ export class FakeTelegram {
         })
       },
       cursorStore: {
-        load: async () => this.#cursor,
-        save: async (_channel, offset) => { this.#cursor = offset; }
+        load: async () => this.#options.cursorStore?.load("telegram") ?? this.#cursor,
+        save: async (_channel, offset) => {
+          this.#cursor = offset;
+          await this.#options.cursorStore?.save("telegram", offset);
+        }
       },
       outbox: {
         enqueue: async (message) => { this.#deniedRiskLevels.push(message.payload.riskLevel); }
@@ -89,6 +96,11 @@ export class FakeTelegram {
 
   get cursor(): number | undefined {
     return this.#cursor;
+  }
+
+  async reconnectFromCursor(): Promise<void> {
+    this.#cursor = await this.#options.cursorStore?.load("telegram") ?? this.#cursor;
+    this.#connected = true;
   }
 
   get confirmationRequired(): boolean {

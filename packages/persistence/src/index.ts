@@ -5,6 +5,8 @@ export {
   WorkerCompletionConflictError,
   type AppendAuditEvent,
   type AuditEvent,
+  type ChannelCursor,
+  type DurableChannel,
   type EnqueueOutboxMessage,
   type InboxEvent,
   JsonValueSchema,

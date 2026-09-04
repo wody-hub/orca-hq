@@ -530,6 +530,22 @@ describe("Gateway production state machine E2E", () => {
         expect.objectContaining({ commandId: "command-l2", state: "active" })
       ]);
       expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
+      expect(composition.services.store.listAuditEvents()).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          subjectId: "command-l2",
+          eventType: "command.route_selected",
+          data: { proposalId: "proposal-command-501", projectKey: "sandbox" }
+        }),
+        expect.objectContaining({
+          subjectId: "command-l2",
+          eventType: "command.policy_approval_required",
+          data: {
+            proposalId: "proposal-command-501",
+            approvalId: "approval:proposal-command-501",
+            riskLevel: "L2"
+          }
+        })
+      ]));
 
       expect((await confirmThroughDashboard(composition, approval)).statusCode).toBe(403);
       expect(orca.calls.filter(({ kind }) => kind === "dispatch_worker")).toHaveLength(1);
@@ -681,6 +697,23 @@ describe("Gateway production state machine E2E", () => {
       ]);
       expect(composition.services.store.listAuditEvents().map(({ eventType }) => eventType))
         .toContain("verification.passed");
+      expect(composition.services.store.listAuditEvents()).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          subjectId: command.commandId,
+          eventType: "command.route_selected",
+          data: { proposalId: "proposal-command-501", projectKey: "sandbox" }
+        }),
+        expect.objectContaining({
+          subjectId: command.commandId,
+          eventType: "command.policy_authorized",
+          data: { proposalId: "proposal-command-501", riskLevel: "L1" }
+        }),
+        expect.objectContaining({
+          subjectId: command.commandId,
+          eventType: "outbox.delivered",
+          data: { messageId: "report-command-501:success", channel: "telegram" }
+        })
+      ]));
       expect(deliveries).toEqual(["검증 완료"]);
     } finally {
       await composition?.gateway.stop();

@@ -57,17 +57,6 @@ async function boundedOutputPath(value) {
   return outputPath;
 }
 
-function passesGate(report) {
-  return report.evidenceMode === "deterministic_simulation"
-    && report.pilotReady === false
-    && report.criteria.length === 12
-    && report.criteria.every(({ status }) => status === "pass")
-    && report.duplicateExecutions === 0
-    && report.approvalBypasses === 0
-    && report.verifiedSuccessCoverage === 1
-    && report.restartRecoveryRate >= 0.95;
-}
-
 async function harnessNeedsBuild() {
   try {
     const sourceDirectory = resolve(supportRoot, "src");
@@ -111,9 +100,12 @@ if (parsed !== undefined && outputPath !== undefined) {
 if (process.exitCode === undefined && parsed !== undefined && outputPath !== undefined) {
   const temporaryPath = `${outputPath}.${process.pid}.tmp`;
   try {
-    const { runPilotAcceptance } = await import("../packages/test-support/dist/index.js");
+    const {
+      pilotAcceptancePassesGate,
+      runPilotAcceptance
+    } = await import("../packages/test-support/dist/index.js");
     const report = await runPilotAcceptance({ runs: parsed.runs, runIdPrefix: "acceptance" });
-    if (!passesGate(report)) {
+    if (!pilotAcceptancePassesGate(report)) {
       fail(GATE_FAILED, 1);
     } else {
       await writeFile(temporaryPath, `${JSON.stringify(report, null, 2)}\n`, {

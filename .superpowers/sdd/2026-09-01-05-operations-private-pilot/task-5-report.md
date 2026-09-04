@@ -113,3 +113,71 @@ fake의 clock, run/command ID, transcript, agent receipt, provider response, res
 - `.artifacts/**`는 커밋하지 않는다.
 - 보호 경로와 실제 Slack·Telegram·Tailscale·Keychain·launchd·Orca credential/config는 수정하지 않았다.
 - Task 6 이후 실제 clean pilot Mac에서 동료 설치, 채널 로그인, 실제 agent 실행, 실제 재부팅과 launchd recovery를 별도 검증해야 한다.
+
+---
+
+## 수정 라운드 1 — C1~C3 / I1~I3
+
+### RED → GREEN 증거
+
+| 단계 | 명령/대상 | 관찰 결과 |
+|---|---|---|
+| RED | C3 durable cursor 테스트 | `firstStore.saveChannelCursor is not a function`으로 실패해 실제 cursor 저장 경계 부재를 확인했다. |
+| RED | C2 delivery audit 테스트 | `outbox.delivered` 기대에 실제 audit `[]`가 반환됐다. |
+| RED | I1 gate 및 C3 restart seam 테스트 | 기대한 공개 함수가 없어 `expected "function", received "undefined"`로 실패했다. |
+| RED | I3 양 방향 verifier evidence 손실 테스트 | 기대 coverage `0.5`에 실제 `1`이 반환돼 성공과 evidence가 결합돼 있음을 확인했다. |
+| RED | C1 인증 손실/launch retry 테스트 | 실제 결과 속성을 요구하자 기존 리터럴에는 값이 없어 `received undefined`로 실패했다. |
+| RED | C2 production audit 테스트 | `command.route_selected`, `command.policy_authorized`, `command.policy_approval_required`, `outbox.delivered`가 누락됐다. |
+| RED | I2 duplicate evidence 테스트 | 실제 계측은 command뿐인데 기존 evidence가 `commands=1:dags=1:executions=1`을 주장해 실패했다. |
+| GREEN | `pnpm test packages/persistence/test/store.test.ts packages/persistence/test/outbox-dispatcher.test.ts apps/gateway/test/end-to-end.test.ts tests/e2e/private-pilot.spec.ts tests/chaos/restart.spec.ts tests/chaos/provider-failures.spec.ts` | 6개 파일, 62개 테스트가 통과했다. |
+| 통합 진단/수정 | Korean production flow 단독 테스트 | 첫 통합 실행은 `provider_environment_isolation_unavailable`로 실패했다. helper가 production `ExecutionService`에 test provider capability를 전달하지 않은 것이 원인이었고, 기존 production host와 같은 검증된 allowlist/same-host capability를 주입한 뒤 해당 테스트와 private-pilot 8개 테스트가 통과했다. |
+
+### Finding별 변경
+
+- **C1**: `FakeAgents`는 이제 실제 `CodexHqSession`에 `CodexPortError("authentication_required")`만 주입하고 queue defer 및 authority-model 호출 기록에서 인증 손실 결과를 산출한다. launch failure는 실제 `ExecutionService.start`/`recordLaunchFailure`, SQLite `ControlStore`, Orca provider 호출 기록을 통과해 retry 1회와 attempt-two intervention을 계산한다.
+- **C2**: harness의 직접 `appendAudit` 자기삽입을 제거했다. production gateway가 command 기준 route/policy audit을, `OutboxDispatcher`가 redacted delivery audit을 생성하고, 실제 lifecycle/worker/verifier audit과 관계를 따라 7개 linkage를 검증한다.
+- **C3**: Slack/Telegram cursor를 `ControlStore`에 타입별로 저장·복원하는 public seam을 추가했다. file-backed SQLite를 닫고 다시 연 뒤 command/approval/lock/outbox/cursor snapshot을 비교하며, 실제 `reconcileStartup` 결과와 provider launch 호출 수에서 resumable, `review_required`, uncertain worker release 0, duplicate dispatch 0을 산출한다.
+- **I1**: `pilotAcceptancePassesGate`가 모든 criterion뿐 아니라 모든 필수 scenario의 pass를 요구한다. `outbox_recovery_exactly_once`를 restart criterion에 연결했고 duplicate/outbox scenario를 강제로 fail시킨 gate 테스트를 추가했다.
+- **I2**: duplicate evidence를 실제로 센 `commands=1`로 축소하고 Slack/Telegram command 개수를 numeric measurement로 노출·검증한다.
+- **I3**: 각 방향의 `verified_success`와 `verified_success_evidence`를 독립 event로 방출한다. Codex→Claude 또는 Claude→Codex 중 한쪽 evidence를 제거하면 분모 2가 유지되고 coverage가 정확히 `0.5`가 되며 scenario/gate가 실패한다.
+
+### 수정 라운드 1 최종 검증
+
+- `pnpm --filter @orca-hq/test-support typecheck`: 통과
+- `pnpm test`: 45개 파일, 665개 테스트 통과
+- `pnpm typecheck`: 통과 (`tests/tsconfig.json` 포함)
+- `pnpm build`: 15개 workspace project 범위 통과
+- `node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/pilot-report.json`: exit 0
+- 생성 JSON 기계 검증: schema true, criterion 12개/unique, scenario 11개 전부 pass, `restartRecoveryRate=1`, `duplicateExecutions=0`, `approvalBypasses=0`, `verifiedSuccessCoverage=1`
+- `git diff --check`: 통과
+
+### 수정 라운드 1 변경 파일
+
+- `apps/gateway/package.json`
+- `apps/gateway/src/production.ts`
+- `apps/gateway/test/end-to-end.test.ts`
+- `packages/persistence/src/index.ts`
+- `packages/persistence/src/outbox-dispatcher.ts`
+- `packages/persistence/src/store.ts`
+- `packages/persistence/test/outbox-dispatcher.test.ts`
+- `packages/persistence/test/store.test.ts`
+- `packages/test-support/package.json`
+- `packages/test-support/src/fake-agents.ts`
+- `packages/test-support/src/fake-slack.ts`
+- `packages/test-support/src/fake-telegram.ts`
+- `packages/test-support/src/index.ts`
+- `packages/test-support/src/pilot-harness.ts`
+- `packages/test-support/src/production-pilot.ts`
+- `scripts/run-pilot-acceptance.mjs`
+- `tests/chaos/provider-failures.spec.ts`
+- `tests/chaos/restart.spec.ts`
+- `tests/e2e/private-pilot.spec.ts`
+- `pnpm-lock.yaml`
+- `.superpowers/sdd/2026-09-01-05-operations-private-pilot/task-5-report.md`
+
+### 자체 리뷰 및 안전 경계
+
+- 새 테스트는 각 finding이 잡는 production mutation을 이름/주석으로 명시하고, 실제 service/store/provider observable을 검증한다. 정답 리터럴 되읽기, setup/expectation mirror, mock 자체 assertion, evidence 문자열만으로 duplicate/restart를 주장하는 경로를 제거했다.
+- production 변경은 승인된 최소 audit producer와 cursor persistence seam, gateway `./production` export에 한정했다. 외부 network/credential/config를 읽거나 변경하지 않았고 모든 provider 동작은 deterministic fake와 sandbox Git에서 수행했다.
+- 기존 dirty 보호 경로는 stage·restore·삭제하지 않는다. 요구된 acceptance runner의 `.artifacts/pilot-report.json`만 생성 검증했으며 `.artifacts/**`, `apps/web/test-results/**`, roadmap 보호 파일은 커밋 대상에서 제외한다.
+- 남은 범위는 실제 clean pilot Mac에서의 실채널·실계정·실재부팅 검증이며 이 deterministic 수정 라운드의 완료 조건에는 포함되지 않는다.

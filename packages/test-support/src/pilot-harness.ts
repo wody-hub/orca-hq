@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { reconcileStartup } from "@orca-hq/gateway/reconcile";
@@ -17,16 +18,15 @@ import {
 } from "@orca-hq/persistence";
 import {
   decideRankedRoute,
-  routeProject,
-  type ProjectRegistryEntry
 } from "@orca-hq/project-registry";
 import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
 import { GitWorktreePlacementService } from "@orca-hq/worker-routing";
 
-import { FakeAgents } from "./fake-agents.js";
+import { FakeAgents, startDurablePilotExecution } from "./fake-agents.js";
 import { FakeSlack } from "./fake-slack.js";
 import { FakeTelegram } from "./fake-telegram.js";
 import { createSandboxRepo } from "./sandbox-repo.js";
+import { runProductionPilotFlow } from "./production-pilot.js";
 
 export const PILOT_CRITERION_IDS = Object.freeze([
   "coworker_documented_install",
@@ -55,7 +55,12 @@ export interface PilotAcceptanceReport {
     scenarioIds: string[];
     evidence: string[];
   }>;
-  scenarios: Array<{ id: string; status: "pass" | "fail"; evidence: string[] }>;
+  scenarios: Array<{
+    id: string;
+    status: "pass" | "fail";
+    evidence: string[];
+    measurements?: Readonly<Record<string, number>>;
+  }>;
   restartRecoveryRate: number;
   duplicateExecutions: number;
   approvalBypasses: number;
@@ -66,6 +71,10 @@ export interface RunPilotAcceptanceOptions {
   readonly runs: number;
   readonly runIdPrefix?: string;
   readonly now?: () => Date;
+  readonly verifierEvidenceMode?:
+    | "complete"
+    | "missing_codex_to_claude"
+    | "missing_claude_to_codex";
 }
 
 type EventKind =
@@ -77,12 +86,14 @@ type EventKind =
   | "duplicate_execution"
   | "approval_bypass"
   | "verified_success"
-  | "verified_success_evidence";
+  | "verified_success_evidence"
+  | "measurement";
 
 type PilotEvent = Readonly<{
   scenarioId: string;
   kind: EventKind;
   evidence: string;
+  value?: number;
 }>;
 
 const SCENARIO_IDS = Object.freeze([
@@ -110,7 +121,7 @@ const CRITERION_SCENARIOS: Readonly<Record<PilotCriterionId, readonly string[]>>
   failed_verification_never_succeeds: ["agent_failure_safety"],
   telegram_privileged_approval_denied: ["telegram_privileged_denials"],
   slack_tailscale_digest_bound_expiring_approval: ["digest_bound_approvals"],
-  restart_reconciliation: ["restart_reconciliation"],
+  restart_reconciliation: ["restart_reconciliation", "outbox_recovery_exactly_once"],
   complete_user_visible_audit_trail: ["korean_voice_verified_l1"]
 });
 
@@ -125,24 +136,6 @@ const owner: PrincipalBinding = {
 
 function assertCondition(condition: unknown, code: string): asserts condition {
   if (!condition) throw new Error(code);
-}
-
-function project(repositoryPath: string): ProjectRegistryEntry {
-  return {
-    projectKey: "sandbox-web",
-    orcaProjectId: "orca-sandbox-web",
-    repoId: "repo-sandbox-web",
-    absolutePath: repositoryPath,
-    aliases: ["샌드박스 프런트엔드", "sandbox web"],
-    component: "frontend",
-    defaultBaseRef: "main",
-    instructionsFiles: [],
-    setupPolicy: "run",
-    allowedOperations: ["L0", "L1", "L2", "L3"],
-    requiredChecks: ["pnpm test"],
-    sensitivePaths: [".env"],
-    lockKey: "sandbox-web"
-  };
 }
 
 function proposal(input: Readonly<{
@@ -180,6 +173,164 @@ function safeFailure(error: unknown): string {
   return "scripted_scenario_failed";
 }
 
+function durableRestartSnapshot(store: ControlStore) {
+  return structuredClone({
+    commands: store.listCommands(),
+    approvals: store.listApprovals(),
+    lock: store.getWorktreeLock("pilot-restart"),
+    outbox: store.listOutbox(),
+    cursors: {
+      slack: store.loadChannelCursor("slack"),
+      telegram: store.loadChannelCursor("telegram")
+    }
+  });
+}
+
+export async function simulateDurableRestart() {
+  const directory = await mkdtemp(join(tmpdir(), "orca-pilot-restart-"));
+  const databasePath = join(directory, "control.sqlite");
+  let firstDatabase: ReturnType<typeof openDatabase> | undefined;
+  let reopenedDatabase: ReturnType<typeof openDatabase> | undefined;
+  try {
+    firstDatabase = openDatabase(databasePath);
+    const firstStore = new ControlStore(firstDatabase);
+    firstStore.insertCommand({
+      commandId: "pilot-restart-command",
+      idempotencyKey: "pilot:restart-command",
+      channel: "slack",
+      externalMessageId: "pilot-restart-message",
+      principalId: "owner",
+      receivedAt: "2026-09-04T00:00:00.000Z",
+      text: "재시작 상태를 확인해줘"
+    });
+    const execution = await startDurablePilotExecution(firstStore, directory);
+    const approvalProposal = proposal({
+      proposalId: "pilot-restart-approval-proposal",
+      commandId: "pilot-restart-command",
+      operation: "commit_changes",
+      riskLevel: "L2"
+    });
+    firstStore.saveExecutionProposal(approvalProposal);
+    new ApprovalService(firstStore).request({
+      approvalId: "pilot-restart-approval",
+      proposal: approvalProposal,
+      operation: "commit_changes",
+      commandDigest: "a".repeat(64),
+      channel: "slack",
+      allowedChannels: ["slack", "tailscale-web"]
+    });
+    const lockResult = firstStore.acquireWorktreeLock({
+      lockKey: "pilot-restart",
+      commandId: "pilot-restart-command",
+      taskId: "task:pilot-restart:inspect-one",
+      projectKey: "pilot-restart",
+      worktreePath: directory,
+      branch: "main",
+      dispatchId: "dispatch:pilot-restart:inspect-one:1",
+      acquiredAt: "2026-09-04T00:00:00.000Z",
+      heartbeatAt: "2026-09-04T00:00:00.000Z",
+      expiresAt: "2026-09-04T01:00:00.000Z"
+    });
+    assertCondition(lockResult.kind === "acquired", "restart_lock_not_acquired");
+    firstStore.enqueueOutbox({
+      id: "pilot-restart-outbox",
+      commandId: "pilot-restart-command",
+      channel: "slack",
+      destination: "C-PILOT",
+      template: "pilot_summary",
+      payload: { text: "synthetic restart summary" },
+      nextAttemptAt: "2026-09-04T01:00:00.000Z"
+    });
+    firstStore.saveChannelCursor("slack", "1788451201.000001");
+    firstStore.saveChannelCursor("telegram", 903);
+    const before = durableRestartSnapshot(firstStore);
+    const providerDispatchCallsBefore = execution.orca.calls
+      .filter(({ kind }) => kind === "dispatch_worker").length;
+    firstDatabase.close();
+    firstDatabase = undefined;
+
+    reopenedDatabase = openDatabase(databasePath);
+    const store = new ControlStore(reopenedDatabase);
+    const resumedCursors: Array<string | number> = [];
+    const outbox = new OutboxDispatcher({
+      store,
+      workerId: "pilot-restart-outbox-worker",
+      providers: {}
+    });
+    const report = await reconcileStartup({
+      store: {
+        recoverOutboxClaims() {
+          store.recoverExpiredOutboxClaims("2026-09-04T00:10:00.000Z", 60_000);
+        },
+        listNonterminalDispatches() {
+          return store.listTasks().flatMap((task) => store.loadDispatchesForTask(task.id))
+            .filter((value) => {
+              const state = (value as { state?: unknown }).state;
+              return typeof state === "string"
+                && !["worker_done", "launch_failed", "intervention_required"].includes(state);
+            })
+            .map((value) => {
+              const dispatch = value as { id: string; orcaDispatchId?: string };
+              return {
+                dispatchId: dispatch.id,
+                receiptId: dispatch.orcaDispatchId ?? dispatch.id,
+                receipt: { dispatchId: dispatch.orcaDispatchId }
+              };
+            });
+        }
+      },
+      channels: {
+        resumeCursors() {
+          const slack = store.loadChannelCursor("slack");
+          const telegram = store.loadChannelCursor("telegram");
+          if (slack !== undefined) resumedCursors.push(slack);
+          if (telegram !== undefined) resumedCursors.push(telegram);
+        }
+      },
+      orca: {
+        async inspectMany(receipts) {
+          return receipts.map((_, index) => index === 0
+            ? { kind: "running" as const }
+            : { kind: "unknown" as const });
+        }
+      },
+      locks: { reviewExpired() { store.getWorktreeLock("pilot-restart"); } },
+      outbox: { drain: () => outbox.tick("2026-09-04T00:10:00.000Z") },
+      audit: {
+        record(event) {
+          store.appendAudit({
+            subjectId: event.dispatchId,
+            eventType: event.kind === "classified"
+              ? "gateway.reconciliation_classified"
+              : `gateway.reconciliation_${event.kind}`,
+            data: event.kind === "classified"
+              ? { receiptId: event.receiptId, state: event.state }
+              : { receiptId: event.receiptId }
+          });
+        }
+      }
+    });
+    const after = durableRestartSnapshot(store);
+    const providerDispatchCallsAfter = execution.orca.calls
+      .filter(({ kind }) => kind === "dispatch_worker").length;
+    const uncertainWorkerReleases = execution.orca.calls
+      .filter(({ kind }) => kind === "release_worker" || kind === "stop_worker").length;
+    return Object.freeze({
+      before,
+      after,
+      reconcileStates: Object.freeze(report.map(({ state }) => state)),
+      providerDispatchCallsBefore,
+      providerDispatchCallsAfter,
+      uncertainWorkerReleases,
+      resumedCursors: Object.freeze(resumedCursors)
+    });
+  } finally {
+    if (firstDatabase?.open) firstDatabase.close();
+    if (reopenedDatabase?.open) reopenedDatabase.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 class SimulationRun {
   readonly events: PilotEvent[] = [];
   readonly #runId: string;
@@ -189,14 +340,20 @@ class SimulationRun {
   readonly #agents = new FakeAgents();
   readonly #nextId: (kind: string) => string;
   readonly #now: Date;
+  readonly #verifierEvidenceMode: NonNullable<RunPilotAcceptanceOptions["verifierEvidenceMode"]>;
   #slack!: FakeSlack;
   #telegram!: FakeTelegram;
   #sandbox!: Awaited<ReturnType<typeof createSandboxRepo>>;
   #mainCommandId = "";
 
-  constructor(runId: string, now: Date) {
+  constructor(
+    runId: string,
+    now: Date,
+    verifierEvidenceMode: NonNullable<RunPilotAcceptanceOptions["verifierEvidenceMode"]>
+  ) {
     this.#runId = runId;
     this.#now = new Date(now);
+    this.#verifierEvidenceMode = verifierEvidenceMode;
     this.#database = openDatabase(":memory:");
     this.#store = new ControlStore(this.#database);
     this.#identities = new IdentityResolver({
@@ -212,12 +369,20 @@ class SimulationRun {
     this.#slack = new FakeSlack({
       ingress: this.#store,
       identities: this.#identities,
-      nextId: this.#nextId
+      nextId: this.#nextId,
+      cursorStore: {
+        load: () => this.#store.loadChannelCursor("slack") as string | undefined,
+        save: (_channel, cursor) => this.#store.saveChannelCursor("slack", cursor)
+      }
     });
     this.#telegram = new FakeTelegram({
       ingress: this.#store,
       identities: this.#identities,
-      nextId: this.#nextId
+      nextId: this.#nextId,
+      cursorStore: {
+        load: () => this.#store.loadChannelCursor("telegram") as number | undefined,
+        save: (_channel, cursor) => this.#store.saveChannelCursor("telegram", cursor)
+      }
     });
     try {
       await this.#scenario("documented_install_live_gate_marker", () => this.#installMarker());
@@ -253,6 +418,10 @@ class SimulationRun {
 
   #evidence(scenarioId: string, evidence: string): void {
     this.#emit(scenarioId, "evidence", evidence);
+  }
+
+  #measure(scenarioId: string, name: string, value: number): void {
+    this.events.push(Object.freeze({ scenarioId, kind: "measurement", evidence: name, value }));
   }
 
   #installMarker(): void {
@@ -293,54 +462,43 @@ class SimulationRun {
     this.#mainCommandId = accepted.commandId;
     this.#evidence(scenarioId, "transcript_approved:샌드박스 프런트엔드 테스트를 수정해줘");
 
-    const decision = routeProject({
-      text: "샌드박스 프런트엔드 테스트를 수정해줘"
-    }, [project(this.#sandbox.repositoryPath)]);
-    assertCondition(decision.kind === "selected" && decision.projectKey === "sandbox-web", "route_not_selected");
-    this.#evidence(scenarioId, `route_selected:${decision.projectKey}:${decision.evidence[0]}`);
-    this.#evidence(scenarioId, "plan_preview:risk=L1:scope=src/**");
-
-    const placements = new GitWorktreePlacementService(this.#sandbox.git);
-    const planned = await placements.resolve({
-      proposalId: `${this.#runId}-voice-l1`,
-      riskLevel: "L1",
-      repositoryPath: this.#sandbox.repositoryPath,
-      baseRef: "main",
-      attempt: 1
+    const command = this.#store.listCommands().find(({ commandId }) => commandId === this.#mainCommandId);
+    assertCondition(command !== undefined, "confirmed_command_not_durable");
+    const production = await runProductionPilotFlow({
+      sandbox: this.#sandbox,
+      command,
+      runIdentity: `${this.#runId}-voice-l1`,
+      now: this.#now
     });
-    assertCondition(planned.kind === "ready" && planned.worktree.kind === "isolated", "isolated_worktree_not_planned");
-    const created = await placements.createWorktree(planned);
-    assertCondition(created.kind === "ready" && created.worktree.kind === "isolated", "isolated_worktree_not_created");
-    this.#evidence(scenarioId, "worktree:isolated");
-
-    const verified = await this.#agents.verifiedPair(
-      `${this.#runId}-codex`,
-      "codex",
-      created.worktree.path
-    );
     assertCondition(
-      verified.verifierProvider === "claude" && verified.decision.kind === "verified_success",
+      production.proposal?.selectedProjectKey === "sandbox-web"
+      && production.proposal.riskLevel === "L1",
+      "route_not_selected"
+    );
+    this.#evidence(scenarioId, `route_selected:sandbox-web:${production.proposal.routeCandidates[0]?.evidence[0]}`);
+    this.#evidence(scenarioId, `plan_preview:risk=${production.proposal.riskLevel}:scope=${production.proposal.allowedScope.join(",")}`);
+    assertCondition(production.worktreeKind === "isolated", "isolated_worktree_not_created");
+    this.#evidence(scenarioId, "worktree:isolated");
+    assertCondition(
+      production.implementationProvider === "codex"
+      && production.verifierProvider === "claude"
+      && production.decision.kind === "verified_success"
+      && production.runState === "verified_success"
+      && production.outboxState === "delivered",
       "cross_model_verification_failed"
     );
-    assertCondition(verified.evidence.length > 0, "verified_success_missing_evidence");
     this.#evidence(scenarioId, "worker_pair:codex->claude");
     this.#emit(scenarioId, "verified_success", "final_state:verified_success");
-    this.#emit(scenarioId, "verified_success_evidence", "verifier_evidence:present");
-    this.#evidence(scenarioId, "final_state:verified_success");
-
-    for (const eventType of ["route", "policy", "approval", "Dispatch", "worker", "verifier", "delivery"]) {
-      this.#store.appendAudit({
-        subjectId: this.#mainCommandId,
-        eventType: `pilot.${eventType}`,
-        data: { mode: "deterministic_simulation" }
-      });
+    const emittedEvidence = production.evidence.length > 0
+      && this.#verifierEvidenceMode !== "missing_codex_to_claude";
+    if (emittedEvidence) {
+      this.#emit(scenarioId, "verified_success_evidence", "verifier_evidence:present");
     }
-    const linked = new Set(this.#store.listAuditEvents()
-      .filter(({ subjectId }) => subjectId === this.#mainCommandId)
-      .map(({ eventType }) => eventType.replace("pilot.", "")));
+    assertCondition(emittedEvidence, "verified_success_missing_evidence");
+    this.#evidence(scenarioId, "final_state:verified_success");
     assertCondition(
       ["route", "policy", "approval", "Dispatch", "worker", "verifier", "delivery"]
-        .every((part) => linked.has(part)),
+        .every((part) => production.linkedParts.includes(part)),
       "audit_linkage_incomplete"
     );
     this.#evidence(scenarioId, "audit_linkage:route,policy,approval,Dispatch,worker,verifier,delivery");
@@ -357,10 +515,14 @@ class SimulationRun {
       verified.verifierProvider === "codex" && verified.decision.kind === "verified_success",
       "reverse_cross_model_verification_failed"
     );
-    assertCondition(verified.evidence.length > 0, "reverse_verified_success_missing_evidence");
     this.#evidence(scenarioId, "worker_pair:claude->codex");
     this.#emit(scenarioId, "verified_success", "final_state:verified_success");
-    this.#emit(scenarioId, "verified_success_evidence", "verifier_evidence:present");
+    const emittedEvidence = verified.evidence.length > 0
+      && this.#verifierEvidenceMode !== "missing_claude_to_codex";
+    if (emittedEvidence) {
+      this.#emit(scenarioId, "verified_success_evidence", "verifier_evidence:present");
+    }
+    assertCondition(emittedEvidence, "reverse_verified_success_missing_evidence");
     this.#evidence(scenarioId, "final_state:verified_success");
   }
 
@@ -374,7 +536,8 @@ class SimulationRun {
       this.#emit(scenarioId, "duplicate_execution", "fake_slack_duplicate_execution");
     }
     assertCondition(firstSlack.kind === "accepted" && secondSlack.kind === "duplicate" && slackCommands === 1, "slack_dedup_failed");
-    this.#evidence(scenarioId, "fake_slack_duplicate:commands=1:dags=1:executions=1");
+    this.#measure(scenarioId, "slackCommands", slackCommands);
+    this.#evidence(scenarioId, "fake_slack_duplicate:commands=1");
 
     const telegramBefore = this.#store.listCommands().length;
     await this.#telegram.sendText({ text: "sandbox web 확인", messageId: 777, updateId: 777 });
@@ -384,7 +547,8 @@ class SimulationRun {
       this.#emit(scenarioId, "duplicate_execution", "fake_telegram_duplicate_execution");
     }
     assertCondition(telegramCommands === 1, "telegram_dedup_failed");
-    this.#evidence(scenarioId, "fake_telegram_duplicate:commands=1:dags=1:executions=1");
+    this.#measure(scenarioId, "telegramCommands", telegramCommands);
+    this.#evidence(scenarioId, "fake_telegram_duplicate:commands=1");
   }
 
   #approval(
@@ -496,81 +660,79 @@ class SimulationRun {
 
   async #restartReconciliation(): Promise<void> {
     const scenarioId = "restart_reconciliation";
-    const durable = {
-      command: this.#mainCommandId,
-      approval: `approval-${this.#runId}-tailscale-exact`,
-      lock: "sandbox-web",
-      cursor: { slack: this.#slack.cursor, telegram: this.#telegram.cursor },
-      Outbox: "pending"
-    };
-    const before = JSON.stringify(durable);
-    const cases = [
-      ["simulated_gateway_process_loss:state_preserved", "running"],
-      ["simulated_orca_restart:resumable", "resumable"],
-      ["simulated_mac_launchd_restart:review_required", "unknown"],
-      ["fake_slack_disconnect_reconnect:cursor_preserved", "active"],
-      ["fake_telegram_disconnect_reconnect:cursor_preserved", "active"],
-      ["fake_tailscale_disconnect_reconnect:approval_preserved", "active"]
-    ] as const;
-    for (const [evidence, inspectionKind] of cases) {
+    const durable = await simulateDurableRestart();
+    const snapshotsMatch = JSON.stringify(durable.after) === JSON.stringify(durable.before);
+    const duplicateDispatches = Math.max(
+      durable.providerDispatchCallsAfter - durable.providerDispatchCallsBefore,
+      0
+    );
+    const cases: Array<readonly [string, boolean]> = [
+      ["simulated_gateway_process_loss:state_preserved", snapshotsMatch],
+      ["simulated_orca_restart:resumable", durable.reconcileStates.includes("resumable")],
+      ["simulated_mac_launchd_restart:review_required",
+        durable.reconcileStates.includes("review_required") && durable.uncertainWorkerReleases === 0]
+    ];
+
+    const slackCursor = this.#store.loadChannelCursor("slack");
+    this.#slack.disconnect();
+    await this.#slack.reconnectFromCursor();
+    cases.push(["fake_slack_disconnect_reconnect:cursor_preserved",
+      this.#slack.connected && this.#slack.cursor === slackCursor]);
+
+    const telegramCursor = this.#store.loadChannelCursor("telegram");
+    this.#telegram.disconnect();
+    await this.#telegram.reconnectFromCursor();
+    cases.push(["fake_telegram_disconnect_reconnect:cursor_preserved",
+      this.#telegram.connected && this.#telegram.cursor === telegramCursor]);
+
+    const beforeApprovalCount = (durable.before as { approvals: readonly unknown[] }).approvals.length;
+    const afterApprovalCount = (durable.after as { approvals: readonly unknown[] }).approvals.length;
+    cases.push(["fake_tailscale_disconnect_reconnect:approval_preserved",
+      beforeApprovalCount === 1 && afterApprovalCount === beforeApprovalCount]);
+
+    for (const [evidence, recovered] of cases) {
       this.#emit(scenarioId, "restart_attempt", evidence);
-      if (evidence.startsWith("fake_slack")) {
-        const cursor = this.#slack.cursor;
-        this.#slack.disconnect();
-        this.#slack.connect();
-        assertCondition(this.#slack.connected && this.#slack.cursor === cursor, "slack_cursor_lost");
-      }
-      if (evidence.startsWith("fake_telegram")) {
-        const cursor = this.#telegram.cursor;
-        this.#telegram.disconnect();
-        this.#telegram.connect();
-        assertCondition(this.#telegram.connected && this.#telegram.cursor === cursor, "telegram_cursor_lost");
-      }
-      const report = await reconcileStartup({
-        store: {
-          recoverOutboxClaims() {},
-          listNonterminalDispatches: () => [{
-            dispatchId: `${this.#runId}:dispatch:worker`,
-            receiptId: `${this.#runId}:receipt:worker`,
-            receipt: { mode: "deterministic_simulation" }
-          }]
-        },
-        channels: { resumeCursors() {} },
-        orca: {
-          inspectMany: async () => [{ kind: inspectionKind }]
-        },
-        locks: { reviewExpired() {} },
-        outbox: { drain() {} },
-        audit: { record() {} }
-      });
-      const expected = inspectionKind === "unknown" ? "review_required" : "resumable";
-      if (report[0]?.state === expected && JSON.stringify(durable) === before) {
-        this.#emit(scenarioId, "restart_recovered", evidence);
-        this.#evidence(scenarioId, evidence);
-      }
+      if (!recovered) continue;
+      this.#emit(scenarioId, "restart_recovered", evidence);
+      this.#evidence(scenarioId, evidence);
     }
+    for (let index = 0; index < duplicateDispatches; index += 1) {
+      this.#emit(scenarioId, "duplicate_execution", "restart_duplicate_dispatch");
+    }
+    this.#measure(scenarioId, "durableSnapshotsMatched", snapshotsMatch ? 1 : 0);
+    this.#measure(scenarioId, "providerDispatchCallsBefore", durable.providerDispatchCallsBefore);
+    this.#measure(scenarioId, "providerDispatchCallsAfter", durable.providerDispatchCallsAfter);
+    this.#measure(scenarioId, "uncertainWorkerReleases", durable.uncertainWorkerReleases);
     const recovered = this.events.filter(({ scenarioId: id, kind }) =>
       id === scenarioId && kind === "restart_recovered"
     ).length;
     assertCondition(recovered === cases.length, "restart_recovery_incomplete");
-    this.#evidence(scenarioId, "durable_state:command,approval,lock,cursor,Outbox");
-    this.#evidence(scenarioId, "duplicate_dispatches:0");
+    assertCondition(duplicateDispatches === 0, "restart_duplicate_dispatch");
   }
 
   async #agentFailures(): Promise<void> {
     const scenarioId = "agent_failure_safety";
-    const authLoss = this.#agents.simulateCodexAuthenticationLoss();
-    const retry = this.#agents.simulateSafeLaunchRetry();
-    const exhausted = this.#agents.simulateLaunchRetryExhaustion();
+    const authLoss = await this.#agents.simulateCodexAuthenticationLoss();
+    const retry = await this.#agents.simulateSafeLaunchRetry();
+    const exhausted = await this.#agents.simulateLaunchRetryExhaustion();
     const verification = await this.#agents.failTwoCycles(this.#sandbox.repositoryPath);
     assertCondition(
-      authLoss.state === "queue_review" && authLoss.claudeHqTakeovers === 0,
+      authLoss.outcome.kind === "degraded"
+      && authLoss.outcome.reason === "codex_unavailable"
+      && authLoss.deferredCommandIds.length === 1
+      && authLoss.openedAuthorityModels.every((model) => model === "gpt-5.6-sol"),
       "codex_auth_takeover_occurred"
     );
-    assertCondition(retry.retries === 1 && retry.attempts === 2 && !retry.intervention, "safe_retry_count_wrong");
     assertCondition(
-      exhausted.attempts === 2 && exhausted.retries === 1
-      && exhausted.intervention && !exhausted.thirdAttempted,
+      retry.outcome.kind === "retried" && retry.providerLaunches === 2
+      && retry.dispatchStates.join(",") === "launch_failed,running",
+      "safe_retry_count_wrong"
+    );
+    assertCondition(
+      exhausted.outcome.kind === "intervention_required"
+      && exhausted.outcome.reason === "launch_retry_exhausted"
+      && exhausted.providerLaunches === 2
+      && exhausted.dispatchStates.join(",") === "launch_failed,intervention_required",
       "launch_retry_exhaustion_wrong"
     );
     assertCondition(
@@ -666,12 +828,31 @@ function scenarioReport(events: readonly PilotEvent[], runs: number) {
     const evidence = [...new Set(matching
       .filter(({ kind }) => kind === "evidence" || kind === "scenario_fail")
       .map((event) => event.evidence))];
+    const measurements = Object.fromEntries([...new Set(matching
+      .filter(({ kind }) => kind === "measurement")
+      .map(({ evidence: name }) => name))]
+      .map((name) => [name, matching
+        .filter((event) => event.kind === "measurement" && event.evidence === name)
+        .reduce((total, event) => total + (event.value ?? 0), 0)]));
     return {
       id,
       status: passes === runs && failures.length === 0 ? "pass" as const : "fail" as const,
-      evidence
+      evidence,
+      ...(Object.keys(measurements).length === 0 ? {} : { measurements })
     };
   });
+}
+
+export function pilotAcceptancePassesGate(report: PilotAcceptanceReport): boolean {
+  return report.evidenceMode === "deterministic_simulation"
+    && report.pilotReady === false
+    && report.criteria.length === 12
+    && report.criteria.every(({ status }) => status === "pass")
+    && report.scenarios.every(({ status }) => status === "pass")
+    && report.duplicateExecutions === 0
+    && report.approvalBypasses === 0
+    && report.verifiedSuccessCoverage === 1
+    && report.restartRecoveryRate >= 0.95;
 }
 
 export async function runPilotAcceptance(
@@ -683,9 +864,10 @@ export async function runPilotAcceptance(
   const now = options.now?.() ?? new Date("2026-09-04T00:00:00.000Z");
   if (!Number.isFinite(now.getTime())) throw new TypeError("pilot clock must return a valid Date");
   const prefix = options.runIdPrefix?.trim() || "pilot";
+  const verifierEvidenceMode = options.verifierEvidenceMode ?? "complete";
   const events: PilotEvent[] = [];
   for (let index = 1; index <= options.runs; index += 1) {
-    const run = new SimulationRun(`${prefix}-${index}`, now);
+    const run = new SimulationRun(`${prefix}-${index}`, now, verifierEvidenceMode);
     events.push(...await run.execute());
   }
   const scenarios = scenarioReport(events, options.runs);

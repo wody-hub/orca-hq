@@ -214,12 +214,18 @@ importers:
 
   packages/test-support:
     dependencies:
+      '@orca-hq/codex-hq':
+        specifier: workspace:*
+        version: link:../codex-hq
       '@orca-hq/core':
         specifier: workspace:*
         version: link:../core
       '@orca-hq/gateway':
         specifier: workspace:*
         version: link:../../apps/gateway
+      '@orca-hq/orca-adapter':
+        specifier: workspace:*
+        version: link:../orca-adapter
       '@orca-hq/persistence':
         specifier: workspace:*
         version: link:../persistence

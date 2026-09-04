@@ -1,22 +1,69 @@
 import { describe, expect, it } from "vitest";
 
-import { runPilotAcceptance } from "../../packages/test-support/src/index.js";
+import { FakeAgents, runPilotAcceptance } from "../../packages/test-support/src/index.js";
 
 describe("scripted provider and policy failures", () => {
   it("deduplicates provider delivery and rejects every Telegram privileged operation", async () => {
-    // Break caught: replay creates another command/DAG, or Telegram gains privileged approval authority.
+    // Break caught: replay creates another command, or unmeasured DAG/execution claims leak into evidence.
     const report = await runPilotAcceptance({ runs: 1, runIdPrefix: "chaos-provider" });
     const duplicate = report.scenarios.find(({ id }) => id === "duplicate_provider_delivery");
     const telegram = report.scenarios.find(({ id }) => id === "telegram_privileged_denials");
 
     expect(duplicate?.evidence).toEqual(expect.arrayContaining([
-      "fake_slack_duplicate:commands=1:dags=1:executions=1",
-      "fake_telegram_duplicate:commands=1:dags=1:executions=1"
+      "fake_slack_duplicate:commands=1",
+      "fake_telegram_duplicate:commands=1"
     ]));
+    expect(duplicate?.measurements).toEqual({ slackCommands: 1, telegramCommands: 1 });
+    expect(duplicate?.evidence.join("\n")).not.toContain("dags=");
+    expect(duplicate?.evidence.join("\n")).not.toContain("executions=");
     expect(telegram?.evidence).toContain(
       "telegram_denied:commit,push,PR,merge,deploy,database,deletion,secret"
     );
     expect(report.approvalBypasses).toBe(0);
+  });
+
+  it("defers an authentication-lost Codex HQ command through the real session without Claude takeover", async () => {
+    // Break caught: authentication failure can be replaced by a literal queue_review result or transfer HQ authority to Claude.
+    const result = await new FakeAgents().simulateCodexAuthenticationLoss() as unknown as {
+      outcome: unknown;
+      deferredCommandIds: readonly string[];
+      openedAuthorityModels: readonly string[];
+    };
+
+    expect(result.outcome).toEqual({ kind: "degraded", reason: "codex_unavailable" });
+    expect(result.deferredCommandIds).toEqual(["pilot-auth-loss"]);
+    expect(result.openedAuthorityModels).toEqual(["gpt-5.6-sol"]);
+    expect(result.openedAuthorityModels.filter((model) => model !== "gpt-5.6-sol")).toHaveLength(0);
+  });
+
+  it("uses the real execution launch-failure boundary for one retry and attempt-two intervention", async () => {
+    // Break caught: launch retry counts can be hard-coded without exercising Dispatch state or blocking a third provider start.
+    const agents = new FakeAgents();
+    const retry = await agents.simulateSafeLaunchRetry() as unknown as {
+      outcome: unknown;
+      providerLaunches: number;
+      dispatchStates: readonly string[];
+    };
+    const exhausted = await agents.simulateLaunchRetryExhaustion() as unknown as {
+      outcome: unknown;
+      providerLaunches: number;
+      dispatchStates: readonly string[];
+    };
+
+    expect(retry.outcome).toEqual({
+      kind: "retried",
+      dispatchId: "orca-dispatch-2",
+      retryOf: "orca-dispatch-1"
+    });
+    expect(retry.providerLaunches).toBe(2);
+    expect(retry.dispatchStates).toEqual(["launch_failed", "running"]);
+    expect(exhausted.outcome).toEqual({
+      kind: "intervention_required",
+      reason: "launch_retry_exhausted",
+      dispatchId: "orca-dispatch-2"
+    });
+    expect(exhausted.providerLaunches).toBe(2);
+    expect(exhausted.dispatchStates).toEqual(["launch_failed", "intervention_required"]);
   });
 
   it("binds Slack and Tailscale approval to exact unexpired digests", async () => {

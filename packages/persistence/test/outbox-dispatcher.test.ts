@@ -74,6 +74,27 @@ describe("OutboxDispatcher", () => {
     expect(store.getTask("t1")).toMatchObject({ state: "completed" });
   });
 
+  it("links a successful delivery audit to the durable command without provider payload", async () => {
+    // Break caught: a successful provider send can disappear from the command audit trail or persist outbound content.
+    const dispatcher = new OutboxDispatcher({
+      store,
+      workerId: "dispatcher-1",
+      providers: {
+        slack: { deliver: deliveryPort().mockResolvedValue({ providerMessageId: "172.001" }) }
+      }
+    });
+
+    await dispatcher.tick(now);
+
+    expect(store.listAuditEvents()).toContainEqual(expect.objectContaining({
+      subjectId: "command-1",
+      eventType: "outbox.delivered",
+      data: { messageId: "m1", channel: "slack" }
+    }));
+    expect(JSON.stringify(store.listAuditEvents())).not.toContain("Completed result");
+    expect(JSON.stringify(store.listAuditEvents())).not.toContain("172.001");
+  });
+
   it("audits a non-retryable rejection without exposing sensitive bodies or changing the task", async () => {
     // Break caught: persisting a raw provider error or touching Task state leaks content and falsifies work completion.
     const secretBody = "production bearer token secret-value";

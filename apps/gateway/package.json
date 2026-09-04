@@ -11,6 +11,10 @@
     "./reconcile": {
       "types": "./dist/reconcile.d.ts",
       "default": "./dist/reconcile.js"
+    },
+    "./production": {
+      "types": "./dist/production.d.ts",
+      "default": "./dist/production.js"
     }
   },
   "scripts": {
