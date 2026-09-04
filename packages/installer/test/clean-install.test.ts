@@ -57,6 +57,14 @@ async function createCleanWorkspace(): Promise<string> {
       return firstSegment !== "dist" && firstSegment !== "node_modules" && firstSegment !== "test";
     }
   });
+  const coreRoot = join(repositoryRoot, "packages", "core");
+  await cp(coreRoot, join(fixture, "packages", "core"), {
+    recursive: true,
+    filter(source) {
+      const firstSegment = relative(coreRoot, source).split(sep)[0];
+      return firstSegment !== "dist" && firstSegment !== "node_modules" && firstSegment !== "test";
+    }
+  });
   return fixture;
 }
 
@@ -70,6 +78,7 @@ async function createIsolatedHost(fixture: string): Promise<NodeJS.ProcessEnv> {
   await mkdir(bin, { recursive: true });
   await writeFile(configPath, JSON.stringify({
     schema: "orca-hq.private-pilot.v1",
+    databasePath: join(home, "Library/Application Support/orca-hq/control.sqlite"),
     projectRegistryPath: registryPath,
     credentialAccounts: [
       "slack-app-token",

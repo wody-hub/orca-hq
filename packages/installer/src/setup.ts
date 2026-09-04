@@ -13,6 +13,7 @@ export interface SetupOutputPort {
 }
 
 export interface SetupPorts extends DoctorPorts {
+  readonly databasePath: string;
   readonly keychain: KeychainPort;
   readonly configFile: ConfigFilePort;
   readonly output: SetupOutputPort;
@@ -53,6 +54,7 @@ export function createSetup(ports: SetupPorts): Readonly<{
       const accounts = credentialAccounts(answers.credentials);
       const config = createConfigText({
         schema: "orca-hq.private-pilot.v1",
+        databasePath: ports.databasePath,
         projectRegistryPath: answers.registryPath,
         credentialAccounts: accounts
       });

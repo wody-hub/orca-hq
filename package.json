@@ -6,7 +6,7 @@
   "engines": { "node": ">=22.20 <23" },
   "scripts": {
     "build": "pnpm -r build",
-    "prepare": "pnpm --filter @orca-hq/installer build",
+    "prepare": "pnpm --filter @orca-hq/core build && pnpm --filter @orca-hq/installer build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

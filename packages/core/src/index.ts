@@ -8,5 +8,6 @@ export * from "./digest.js";
 export * from "./identity.js";
 export * from "./idempotency.js";
 export * from "./policy.js";
+export * from "./pilot-config.js";
 export * from "./ports.js";
 export * from "./proposal.js";

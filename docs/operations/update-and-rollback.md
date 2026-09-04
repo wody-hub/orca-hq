@@ -5,10 +5,12 @@ Orca HQ lifecycle operations fail closed around active work and preserve durable
 The default source-installed layout is exact and bounded:
 
 - program: the repository root containing the installed `hq` command;
-- database: `~/Library/Application Support/orca-hq/control.sqlite`;
+- database: the absolute `databasePath` recorded in the non-secret pilot configuration (setup defaults to `~/Library/Application Support/orca-hq/control.sqlite`);
 - backups: `~/Library/Application Support/orca-hq/backups`;
-- config: `~/.config/orca-hq/pilot.json`;
+- config: `${XDG_CONFIG_HOME}/orca-hq/pilot.json` when `XDG_CONFIG_HOME` is set, otherwise `~/.config/orca-hq/pilot.json`;
 - launchd: the single `com.orcahq.gateway` user LaunchAgent and its exact plist.
+
+Setup writes `databasePath` into that pilot configuration. Doctor, gateway composition, update, and uninstall validate the same secret-free configuration: gateway startup rejects a runtime database path that differs from `pilot.json`, and lifecycle commands reject missing, legacy, malformed, relative, or out-of-data-directory database configuration before source, launchd, SQLite, or filesystem mutation. Run setup again to migrate a legacy configuration safely after reviewing its preview.
 
 ## Update safety contract
 
@@ -69,20 +71,27 @@ Default uninstall is:
 pnpm hq uninstall
 ```
 
-It removes the exact launchd service/plist and configured program path. It preserves the entire Application Support data path, including the SQLite database and backups, and does not access Keychain credentials. Configuration remains at the separate config path.
+Without confirmation this command is preview-only: it prints the absolute program path, the exact phrase, and the complete re-run command, then exits with usage status without reading launchd or changing program/data state. Confirm only after reviewing the path:
+
+```text
+REMOVE ORCA HQ PROGRAM AT /absolute/path/to/orca-hq
+pnpm hq uninstall --confirm 'REMOVE ORCA HQ PROGRAM AT /absolute/path/to/orca-hq'
+```
+
+The confirmed command removes the exact launchd service/plist and configured program path. It preserves the entire Application Support data path, including the SQLite database and backups, and does not access Keychain credentials. Configuration remains at the separate XDG-aware config path.
 
 Data removal is a separate destructive operation. The adapter must display the generated phrase returned for the exact normalized data path and require a byte-for-byte match:
 
 ```text
-REMOVE ORCA HQ DATA AT /Users/<user>/Library/Application Support/orca-hq
+REMOVE ORCA HQ PROGRAM AT /absolute/path/to/orca-hq AND DATA AT /Users/<user>/Library/Application Support/orca-hq
 ```
 
 Pass the generated phrase as one quoted argument:
 
 ```text
-pnpm hq uninstall --remove-data --confirm "REMOVE ORCA HQ DATA AT /Users/<user>/Library/Application Support/orca-hq"
+pnpm hq uninstall --remove-data --confirm 'REMOVE ORCA HQ PROGRAM AT /absolute/path/to/orca-hq AND DATA AT /Users/<user>/Library/Application Support/orca-hq'
 ```
 
-A missing or inexact phrase fails before launchd or filesystem mutation. After a correct phrase, removal is limited to the configured data path. Configuration is rejected up front when program and data paths overlap, the database is outside the data path, or any target is relative or a filesystem root.
+A missing or inexact phrase fails before launchd or filesystem mutation. After a correct phrase, removal is limited to the configured program and data paths. Configuration is rejected up front when program and data paths overlap, the database is outside the data path, or any target resolves to a relative path, filesystem root, top-level directory, home directory, or protected ancestor.
 
 Before confirming data removal, copy any backup that must survive outside the configured data directory and verify its receipt. Default uninstall is the recovery-friendly choice for reinstalling the program later.

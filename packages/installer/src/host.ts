@@ -2,9 +2,15 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { arch, homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { promisify } from "node:util";
 
+import {
+  defaultPilotDatabasePath,
+  parsePilotConfigText,
+  pilotConfigurationPath,
+  type PilotConfig
+} from "@orca-hq/core";
 import { parse } from "yaml";
 
 import type { ConfigFilePort } from "./config-files.js";
@@ -44,26 +50,18 @@ export interface HostAdapters {
   setup(output: SetupOutputPort, confirm: () => Promise<boolean>, pending: SetupAnswers): SetupPorts;
 }
 
-interface PilotConfigSnapshot {
-  readonly projectRegistryPath: string;
-  readonly credentialAccounts: readonly string[];
+export function configurationPath(machine: Pick<HostReadPort, "homeDirectory" | "configDirectory">): string {
+  return pilotConfigurationPath({
+    homeDirectory: machine.homeDirectory(),
+    configDirectory: machine.configDirectory()
+  });
 }
 
-function configurationPath(machine: HostReadPort): string {
-  return join(machine.configDirectory() ?? join(machine.homeDirectory(), ".config"), "orca-hq", "pilot.json");
-}
-
-async function config(machine: HostReadPort): Promise<PilotConfigSnapshot | undefined> {
+async function config(machine: HostReadPort): Promise<PilotConfig | undefined> {
   const text = await machine.readText(configurationPath(machine));
   if (text === undefined) return undefined;
   try {
-    const candidate: unknown = JSON.parse(text);
-    if (candidate === null || typeof candidate !== "object") return undefined;
-    const value = candidate as { projectRegistryPath?: unknown; credentialAccounts?: unknown };
-    return typeof value.projectRegistryPath === "string" && Array.isArray(value.credentialAccounts)
-      && value.credentialAccounts.every((account) => typeof account === "string")
-      ? { projectRegistryPath: value.projectRegistryPath, credentialAccounts: value.credentialAccounts }
-      : undefined;
+    return parsePilotConfigText(text);
   } catch {
     return undefined;
   }
@@ -118,6 +116,7 @@ async function pendingCredentialReady(
 /** Builds concrete macOS adapters. Doctor receives only the read-only half of this boundary. */
 export function createMacosHostAdapters(machine: HostMachinePort = createNodeMachine()): HostAdapters {
   const configPath = configurationPath(machine);
+  const databasePath = defaultPilotDatabasePath(machine.homeDirectory());
   const doctor: DoctorPorts = {
     checks: {
       macosCpu: async () => machine.platform() === "darwin" && ["arm64", "x64"].includes(machine.architecture()) ? "pass" : "fail",
@@ -154,6 +153,7 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
       };
       return {
         ...doctor,
+        databasePath,
         checks: {
           ...doctor.checks,
           slackSocketMode: async () => pendingCredentialReady(machine, pending, ["slack-app-token", "slack-channel-id"]),

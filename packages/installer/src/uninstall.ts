@@ -10,6 +10,7 @@ export interface UninstallPaths {
 
 export interface UninstallContext {
   readonly paths: UninstallPaths;
+  readonly protectedPaths?: readonly string[];
   readonly gateway: Readonly<{
     status(): Promise<GatewayUpdateStatus>;
   }>;
@@ -38,7 +39,7 @@ export class UninstallConfirmationError extends Error {
   readonly expectedPhrase: string;
 
   constructor(expectedPhrase: string) {
-    super("Exact path-specific confirmation is required to remove user data.");
+    super("Exact path-specific confirmation is required for uninstall.");
     this.name = "UninstallConfirmationError";
     this.expectedPhrase = expectedPhrase;
   }
@@ -46,7 +47,9 @@ export class UninstallConfirmationError extends Error {
 
 function safePath(path: string, label: string): string {
   const normalized = normalize(path);
-  if (!isAbsolute(normalized) || normalized === parse(normalized).root) {
+  const root = parse(normalized).root;
+  if (!isAbsolute(normalized) || normalized === root || normalize(parse(normalized).dir) === root
+    || /[\u0000\r\n]/u.test(normalized)) {
     throw new TypeError(`${label} must be a specific absolute path.`);
   }
   return normalized;
@@ -59,30 +62,46 @@ function inside(child: string, parent: string): boolean {
 }
 
 /** Returns the exact phrase required for the configured destructive data-removal path. */
-export function dataRemovalConfirmationPhrase(dataPath: string): string {
-  return `REMOVE ORCA HQ DATA AT ${safePath(dataPath, "Data path")}`;
+export function programRemovalConfirmationPhrase(programPath: string): string {
+  return `REMOVE ORCA HQ PROGRAM AT ${safePath(programPath, "Program path")}`;
+}
+
+/** Returns the stronger exact phrase required to remove both program and durable data. */
+export function dataRemovalConfirmationPhrase(programPath: string, dataPath: string): string {
+  return `${programRemovalConfirmationPhrase(programPath)} AND DATA AT ${safePath(dataPath, "Data path")}`;
 }
 
 /** Removes service/program state while preserving Application Support data unless separately confirmed. */
 export function createUninstall(context: UninstallContext): Readonly<{
-  readonly confirmationPhrase: string;
+  readonly programPath: string;
+  readonly dataPath: string;
+  readonly programConfirmationPhrase: string;
+  readonly dataConfirmationPhrase: string;
   run(options: UninstallOptions): Promise<UninstallResult>;
 }> {
   const program = safePath(context.paths.program, "Program path");
   const data = safePath(context.paths.data, "Data path");
   const database = safePath(context.paths.database, "Database path");
-  if (program === data || inside(data, program) || inside(program, data) || !inside(database, data)) {
+  const protectedPaths = (context.protectedPaths ?? []).map((path) => safePath(path, "Protected path"));
+  const overlapsProtected = (path: string): boolean => protectedPaths.some(
+    (protectedPath) => path === protectedPath || inside(protectedPath, path)
+  );
+  if (program === data || inside(data, program) || inside(program, data) || !inside(database, data)
+    || overlapsProtected(program) || overlapsProtected(data)) {
     throw new TypeError("Program and durable data paths are not safely separated.");
   }
 
   return Object.freeze({
-    confirmationPhrase: dataRemovalConfirmationPhrase(data),
+    programPath: program,
+    dataPath: data,
+    programConfirmationPhrase: programRemovalConfirmationPhrase(program),
+    dataConfirmationPhrase: dataRemovalConfirmationPhrase(program, data),
     async run(options): Promise<UninstallResult> {
       await assertNoActiveWork(context);
-      if (options.removeData) {
-        const expected = dataRemovalConfirmationPhrase(data);
-        if (options.confirmation !== expected) throw new UninstallConfirmationError(expected);
-      }
+      const expected = options.removeData
+        ? dataRemovalConfirmationPhrase(program, data)
+        : programRemovalConfirmationPhrase(program);
+      if (options.confirmation !== expected) throw new UninstallConfirmationError(expected);
 
       await context.launchd.uninstall();
       await context.files.removeProgram(program);

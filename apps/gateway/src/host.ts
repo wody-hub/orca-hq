@@ -1,4 +1,5 @@
 import type { OrcaClient } from "@orca-hq/orca-adapter";
+import { validatePilotConfig, type PilotConfig } from "@orca-hq/core";
 import type { OutboxDispatcherOptions } from "@orca-hq/persistence";
 import {
   GitWorktreePlacementService,
@@ -35,6 +36,7 @@ type OutboundProviders = Omit<
 >["providers"];
 
 export type GatewayHostSettings = Readonly<{
+  pilotConfig: PilotConfig;
   gateway: GatewayConfig;
   projectRegistryPath: string;
   discoveredProjects: readonly DiscoveredProject[];
@@ -132,8 +134,12 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
     throw unavailable();
   }
   try {
+    const pilotConfig = validatePilotConfig(settings.pilotConfig);
     const gateway = validateGatewayConfig(settings.gateway as GatewayConfig);
     const projectRegistryPath = NonBlankStringSchema.parse(settings.projectRegistryPath);
+    if (gateway.databasePath !== pilotConfig.databasePath || projectRegistryPath !== pilotConfig.projectRegistryPath) {
+      throw unavailable();
+    }
     const discoveredProjects = DiscoveredProjectSchema.array().min(1).parse(
       settings.discoveredProjects
     );
@@ -176,6 +182,7 @@ function validatedBoundaries(value: unknown): GatewayExternalBoundaries {
       }
     }
     const normalizedSettings: GatewayHostSettings = Object.freeze({
+      pilotConfig,
       gateway,
       projectRegistryPath,
       discoveredProjects: Object.freeze(

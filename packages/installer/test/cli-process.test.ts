@@ -52,6 +52,7 @@ async function createHostFixture(): Promise<Readonly<{
   await mkdir(bin, { recursive: true });
   await writeFile(configPath, JSON.stringify({
     schema: "orca-hq.private-pilot.v1",
+    databasePath: join(home, "Library/Application Support/orca-hq/control.sqlite"),
     projectRegistryPath: registryPath,
     credentialAccounts: ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
   }), "utf8");

@@ -11,7 +11,7 @@ import {
   defaultLaunchdPaths,
   type LaunchdOperations
 } from "./launchd.js";
-import { createLifecycleHostComposition, type LifecycleComposition } from "./lifecycle-host.js";
+import { createDefaultLifecycleHostComposition, type LifecycleComposition } from "./lifecycle-host.js";
 import { createTerminalPrompt, type GuidedPromptPort } from "./prompt.js";
 import { createSetup, type SetupPorts } from "./setup.js";
 
@@ -32,6 +32,10 @@ export interface CliDependencies {
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
   output.write(`${text}\n`);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 function command(input: readonly string[]): CommandName | undefined {
@@ -95,8 +99,8 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
     }
   }
   if (selected === "update" || selected === "uninstall") {
-    const lifecycle = dependencies.lifecycle ?? createLifecycleHostComposition({ doctor: host.doctor });
     try {
+      const lifecycle = dependencies.lifecycle ?? await createDefaultLifecycleHostComposition({ doctor: host.doctor });
       if (selected === "update") {
         if (input.length !== 3 || input[1] !== "--revision" || input[2] === undefined) {
           write(output, "Usage: hq update --revision <full-commit-sha>");
@@ -110,16 +114,25 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
         }));
         return 0;
       }
-      if (input.length === 2 && input[1] === "--remove-data") {
-        write(output, `Confirmation required: ${lifecycle.uninstall.confirmationPhrase}`);
+      if (input.length === 1) {
+        write(output, `Program path: ${lifecycle.uninstall.programPath}`);
+        write(output, `Confirmation required: ${lifecycle.uninstall.programConfirmationPhrase}`);
+        write(output, `Re-run: pnpm hq uninstall --confirm ${shellQuote(lifecycle.uninstall.programConfirmationPhrase)}`);
         return 2;
       }
-      if (input.length === 1) {
-        await lifecycle.uninstall.run({ removeData: false });
+      if (input.length === 2 && input[1] === "--remove-data") {
+        write(output, `Program path: ${lifecycle.uninstall.programPath}`);
+        write(output, `Data path: ${lifecycle.uninstall.dataPath}`);
+        write(output, `Confirmation required: ${lifecycle.uninstall.dataConfirmationPhrase}`);
+        write(output, `Re-run: pnpm hq uninstall --remove-data --confirm ${shellQuote(lifecycle.uninstall.dataConfirmationPhrase)}`);
+        return 2;
+      }
+      if (input.length === 3 && input[1] === "--confirm" && input[2] !== undefined) {
+        await lifecycle.uninstall.run({ removeData: false, confirmation: input[2] });
       } else if (input.length === 4 && input[1] === "--remove-data" && input[2] === "--confirm" && input[3] !== undefined) {
         await lifecycle.uninstall.run({ removeData: true, confirmation: input[3] });
       } else {
-        write(output, "Usage: hq uninstall [--remove-data --confirm <exact-phrase>]");
+        write(output, "Usage: hq uninstall [--confirm <exact-program-phrase> | --remove-data [--confirm <exact-program-and-data-phrase>]]");
         return 2;
       }
       write(output, "Orca HQ lifecycle uninstall completed.");

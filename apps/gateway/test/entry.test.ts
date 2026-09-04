@@ -43,6 +43,12 @@ function externalBoundaries(directory: string, events: string[]): GatewayExterna
   });
   return {
     settings: {
+      pilotConfig: {
+        schema: "orca-hq.private-pilot.v1",
+        databasePath: join(directory, "control.sqlite"),
+        projectRegistryPath,
+        credentialAccounts: []
+      },
       gateway: {
         databasePath: join(directory, "control.sqlite"),
         shutdownDrainMs: 1_000,
@@ -138,6 +144,25 @@ describe("gateway production entry", () => {
       config: { databasePath: ":memory:", shutdownDrainMs: 1_000 },
       dependencies: {}
     }))).rejects.toThrow("Gateway configuration or secret provider is unavailable");
+  });
+
+  it("rejects a gateway database path that differs from the canonical pilot config", async () => {
+    // Break caught: gateway and lifecycle can inspect different SQLite files while each configuration is individually valid.
+    const directory = await mkdtemp(join(tmpdir(), "orca-entry-config-mismatch-"));
+    const events: string[] = [];
+    try {
+      const complete = externalBoundaries(directory, events);
+      await expect(createGatewayHost(async () => ({
+        ...complete,
+        settings: {
+          ...complete.settings,
+          gateway: { ...complete.settings.gateway, databasePath: join(directory, "other.sqlite") }
+        }
+      }))).rejects.toThrow("Gateway configuration or secret provider is unavailable");
+      expect(events).toEqual([]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it.each([

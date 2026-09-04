@@ -5,7 +5,11 @@ import {
   type BackupReceipt,
   type BackupServicePorts
 } from "../src/backup.js";
-import { createUninstall, dataRemovalConfirmationPhrase } from "../src/uninstall.js";
+import {
+  createUninstall,
+  dataRemovalConfirmationPhrase,
+  programRemovalConfirmationPhrase
+} from "../src/uninstall.js";
 import {
   createUpdate,
   prepareUpdate,
@@ -407,6 +411,7 @@ describe("safe uninstall", () => {
     let statusError: Error | undefined;
     const uninstall = createUninstall({
       paths,
+      protectedPaths: ["/Users/pilot"],
       gateway: {
         async status() {
           calls.push("gateway:status");
@@ -450,7 +455,10 @@ describe("safe uninstall", () => {
     // Break caught: uninstalling only the program could recursively include durable user state.
     const subject = fixture();
 
-    await subject.uninstall.run({ removeData: false });
+    await subject.uninstall.run({
+      removeData: false,
+      confirmation: programRemovalConfirmationPhrase(subject.paths.program)
+    });
 
     expect(subject.existing.has(subject.paths.database)).toBe(true);
     expect(subject.existing.has(subject.paths.config)).toBe(true);
@@ -472,7 +480,10 @@ describe("safe uninstall", () => {
     const subject = fixture();
     subject.status.current = status;
 
-    await expect(subject.uninstall.run({ removeData: false })).rejects.toMatchObject({ code: "active_work" });
+    await expect(subject.uninstall.run({
+      removeData: false,
+      confirmation: programRemovalConfirmationPhrase(subject.paths.program)
+    })).rejects.toMatchObject({ code: "active_work" });
 
     expect(subject.calls).toEqual(["gateway:status"]);
     expect(subject.existing.has(subject.paths.program)).toBe(true);
@@ -483,7 +494,10 @@ describe("safe uninstall", () => {
     const subject = fixture();
     subject.rejectStatus(new Error("status unavailable"));
 
-    await expect(subject.uninstall.run({ removeData: false })).rejects.toMatchObject({ code: "active_work" });
+    await expect(subject.uninstall.run({
+      removeData: false,
+      confirmation: programRemovalConfirmationPhrase(subject.paths.program)
+    })).rejects.toMatchObject({ code: "active_work" });
 
     expect(subject.calls).toEqual(["gateway:status"]);
   });
@@ -500,13 +514,49 @@ describe("safe uninstall", () => {
     expect(subject.existing.has(subject.paths.database)).toBe(true);
   });
 
+  it("rejects missing or inexact program confirmation before launchd or filesystem mutation", async () => {
+    // Break caught: default uninstall can remove the program tree with no path-specific confirmation.
+    for (const confirmation of [undefined, "REMOVE ORCA HQ PROGRAM"]) {
+      const subject = fixture();
+      await expect(subject.uninstall.run({
+        removeData: false,
+        ...(confirmation === undefined ? {} : { confirmation })
+      }))
+        .rejects.toMatchObject({ code: "confirmation_required" });
+      expect(subject.calls).toEqual(["gateway:status"]);
+      expect(subject.existing.has(subject.paths.program)).toBe(true);
+    }
+  });
+
+  it.each([
+    "/",
+    "/Users",
+    "/Users/pilot",
+    "/Users/pilot/source/orca-hq/../..",
+    "/usr",
+    "/pilot/unsafe\nprogram"
+  ])("rejects dangerous program target %s", (program) => {
+    // Break caught: normalization can resolve a configured program target to home, an ancestor, or a top-level directory.
+    expect(() => createUninstall({
+      paths: {
+        program,
+        data: "/Users/pilot/Library/Application Support/orca-hq",
+        database: "/Users/pilot/Library/Application Support/orca-hq/control.sqlite"
+      },
+      protectedPaths: ["/Users/pilot"],
+      gateway: { async status() { return { activeOrUncertainDispatches: 0 }; } },
+      launchd: { async uninstall() {} },
+      files: { async removeProgram() {}, async removeData() {} }
+    })).toThrow();
+  });
+
   it("removes only the configured data path after the exact generated phrase", async () => {
     // Break caught: confirmed removal could target a parent directory or use a phrase unrelated to the actual path.
     const subject = fixture();
 
     await subject.uninstall.run({
       removeData: true,
-      confirmation: dataRemovalConfirmationPhrase(subject.paths.data)
+      confirmation: dataRemovalConfirmationPhrase(subject.paths.program, subject.paths.data)
     });
 
     expect(subject.calls).toEqual([

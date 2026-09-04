@@ -42,6 +42,7 @@ function adapters(options: Readonly<{
     setup(cliOutput, requestConfirmation, _pending) {
       return {
         ...doctor,
+        databasePath: "/Users/pilot/Library/Application Support/orca-hq/control.sqlite",
         keychain: { set: async (_service, account) => {
           if (options.keychainError !== undefined) throw options.keychainError;
           writes.push(`keychain:${account}`);
@@ -107,7 +108,10 @@ describe("hq command-line contract", () => {
         }
       },
       uninstall: {
-        confirmationPhrase: "REMOVE ORCA HQ DATA AT /pilot/data",
+        programPath: "/pilot/program",
+        dataPath: "/pilot/data",
+        programConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program",
+        dataConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program AND DATA AT /pilot/data",
         async run() { throw new Error("unexpected uninstall"); }
       }
     };
@@ -122,15 +126,19 @@ describe("hq command-line contract", () => {
     expect(stdout.lines.join("\n")).toContain('"backupId":"backup-1"');
   });
 
-  it("dispatches safe default and explicitly confirmed data uninstall options", async () => {
-    // Break caught: uninstall CLI parsing could bypass the lifecycle service or imply data removal without exact confirmation.
+  it("previews both uninstall targets and dispatches only exact program or program-plus-data confirmation", async () => {
+    // Break caught: uninstall CLI can recursively delete a checkout without first displaying and confirming its absolute path.
     const stdout = output();
     const calls: unknown[] = [];
-    const phrase = "REMOVE ORCA HQ DATA AT /pilot/data";
+    const programPhrase = "REMOVE ORCA HQ PROGRAM AT /pilot/program";
+    const dataPhrase = "REMOVE ORCA HQ PROGRAM AT /pilot/program AND DATA AT /pilot/data";
     const lifecycle: LifecycleComposition = {
       update: { async run() { throw new Error("unexpected update"); } },
       uninstall: {
-        confirmationPhrase: phrase,
+        programPath: "/pilot/program",
+        dataPath: "/pilot/data",
+        programConfirmationPhrase: programPhrase,
+        dataConfirmationPhrase: dataPhrase,
         async run(options: Readonly<{ removeData: boolean; confirmation?: string }>) {
           calls.push(options);
           return { dataPreserved: !options.removeData, removedProgramPath: "/pilot/program" };
@@ -138,18 +146,44 @@ describe("hq command-line contract", () => {
       }
     };
 
+    await expect(runCli(["uninstall"], { stdout, lifecycle })).resolves.toBe(2);
+    expect(stdout.lines.join("\n")).toContain("Program path: /pilot/program");
+    expect(stdout.lines.join("\n")).toContain(`pnpm hq uninstall --confirm '${programPhrase}'`);
+    expect(calls).toEqual([]);
+    await expect(runCli(["uninstall", "--confirm", programPhrase], { stdout, lifecycle })).resolves.toBe(0);
     await expect(runCli(["uninstall", "--remove-data"], { stdout, lifecycle })).resolves.toBe(2);
-    expect(stdout.lines.join("\n")).toContain(phrase);
-    await expect(runCli(["uninstall"], { stdout, lifecycle })).resolves.toBe(0);
+    expect(stdout.lines.join("\n")).toContain("Data path: /pilot/data");
+    expect(stdout.lines.join("\n")).toContain(`pnpm hq uninstall --remove-data --confirm '${dataPhrase}'`);
     await expect(runCli(
-      ["uninstall", "--remove-data", "--confirm", phrase],
+      ["uninstall", "--remove-data", "--confirm", dataPhrase],
       { stdout, lifecycle }
     )).resolves.toBe(0);
 
     expect(calls).toEqual([
-      { removeData: false },
-      { removeData: true, confirmation: phrase }
+      { removeData: false, confirmation: programPhrase },
+      { removeData: true, confirmation: dataPhrase }
     ]);
+  });
+
+  it("shell-quotes the preview re-run command without evaluating path metacharacters", async () => {
+    // Break caught: copying a preview command can evaluate shell syntax embedded in an otherwise valid local path.
+    const stdout = output();
+    const phrase = "REMOVE ORCA HQ PROGRAM AT /pilot/$(touch unsafe)";
+    const lifecycle: LifecycleComposition = {
+      update: { async run() { throw new Error("unexpected update"); } },
+      uninstall: {
+        programPath: "/pilot/$(touch unsafe)",
+        dataPath: "/pilot/data",
+        programConfirmationPhrase: phrase,
+        dataConfirmationPhrase: `${phrase} AND DATA AT /pilot/data`,
+        async run() { throw new Error("unexpected uninstall"); }
+      }
+    };
+
+    await expect(runCli(["uninstall"], { stdout, lifecycle })).resolves.toBe(2);
+
+    expect(stdout.lines.join("\n")).toContain(`pnpm hq uninstall --confirm '${phrase}'`);
+    expect(stdout.lines.join("\n")).not.toContain(`--confirm "${phrase}"`);
   });
 
   it("redacts lifecycle provider failures at the CLI boundary", async () => {
@@ -158,7 +192,10 @@ describe("hq command-line contract", () => {
     const lifecycle: LifecycleComposition = {
       update: { async run() { throw new Error("provider-secret-token"); } },
       uninstall: {
-        confirmationPhrase: "REMOVE ORCA HQ DATA AT /pilot/data",
+        programPath: "/pilot/program",
+        dataPath: "/pilot/data",
+        programConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program",
+        dataConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program AND DATA AT /pilot/data",
         async run() { throw new Error("unexpected uninstall"); }
       }
     };

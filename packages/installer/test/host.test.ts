@@ -23,6 +23,8 @@ class RecordingMachine implements HostMachinePort {
     this.requests.push(`read:${path}`);
     if (path.endsWith("pilot.json") && this.hasConfig) {
       return JSON.stringify({
+        schema: "orca-hq.private-pilot.v1",
+        databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
         projectRegistryPath: "/temporary/projects.yaml",
         credentialAccounts: ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
       });

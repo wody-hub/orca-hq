@@ -126,3 +126,53 @@ Atomic commit message: `feat(operations): add safe update and uninstall`.
 실제 Mac, credential, Keychain, launchd service, 운영 SQLite 또는 source checkout은 테스트에서 변경하지 않았다. production migration은 새 checkout의 persistence package를 먼저 build한 뒤 별도 Node process에서 실행하므로, 해당 build/process가 실패하면 기록된 `migration` 단계에서 full rollback이 수행된다. 이번 수정 범위 밖 Minor 12건은 의도적으로 남겼다.
 
 원자 커밋 메시지: `fix(operations): harden safe lifecycle commands`.
+
+## Fix round 2/5
+
+### 결과
+
+신규 Important `N1`~`N3`만 수정했다. secret-free `pilot.json` 스키마에 절대 `databasePath`를 추가하고 shared core helper가 config 위치(`XDG_CONFIG_HOME ?? ~/.config`), 기본 Application Support data/database 위치, parsing을 단일화했다. setup과 doctor, gateway host, lifecycle 기본 factory가 이 정본을 함께 소비하며 gateway runtime database와 pilot 설정이 다르거나 lifecycle 설정이 누락·legacy·malformed·상대 경로·data 경계 밖이면 외부 mutation 전에 고정 오류로 fail-closed 한다.
+
+uninstall은 program 삭제에도 exact path confirmation을 요구한다. 무인자 기본 호출은 program 절대 경로·문구·shell-quoted 재실행 명령만 출력하고 exit 2로 끝나며, `--remove-data` preview는 program/data 두 경로와 더 강한 결합 문구를 출력한다. service도 두 문구를 독립 검증하고 root, top-level, home/protected ancestor, overlap, out-of-data database, control-character target을 거부한다. 기본 확인 성공은 program만 삭제하고 data/config/Keychain을 보존한다.
+
+### TDD RED 증거
+
+- `N1/N3`: `pnpm test packages/installer/test/lifecycle-host.test.ts packages/installer/test/setup.test.ts` — exit 1. 신규 production factory 4건은 `createDefaultLifecycleHostComposition is not a function`, setup은 기대한 `databasePath` 누락으로 실패했다.
+- `N2`: `pnpm test packages/installer/test/lifecycle-commands.test.ts packages/installer/test/cli.test.ts` — exit 1. 기본 `uninstall`이 preview exit 2가 아니라 즉시 exit 0으로 삭제 service를 호출했고, program confirmation helper/검증이 없으며 `/usr`가 허용되어 9건이 실패했다.
+- gateway 정본: `pnpm test apps/gateway/test/entry.test.ts` — exit 1. pilot database와 runtime gateway database가 달라도 host 조합이 resolve되어 불일치 테스트가 실패했다.
+- 경로/재실행 보강: `pnpm test packages/installer/test/lifecycle-commands.test.ts packages/installer/test/cli.test.ts` — exit 1. newline program target이 허용되고 `$()` 포함 phrase가 double-quoted 재실행 명령에 그대로 들어가는 2건을 확인했다.
+
+### GREEN 근거
+
+- `N1`: `packages/core/src/pilot-config.ts`, `packages/installer/src/config-files.ts`, `setup.ts`, `host.ts`, `lifecycle-host.ts`, `apps/gateway/src/host.ts`가 한 pilot config schema/path를 사용한다. `lifecycle-host.test.ts`는 custom database에서 update와 confirmed default uninstall이 같은 경로를 총 3회 status 조회하고 update가 성공하는지, 누락/파싱 오류/out-of-data 불일치가 mutation call 0으로 거부되는지 검증한다. `entry.test.ts`는 gateway database mismatch를 조합 전에 거부한다.
+- `N2`: `uninstall.ts`가 program-only와 program+data exact phrase 및 보호 경로를 검증하고, `cli.ts`가 확인 없는 두 형태를 preview-only로 처리한다. `lifecycle-commands.test.ts`는 missing/wrong phrase 무변경, exact program 성공/data 보존, exact combined phrase data 삭제, root/home/ancestor/top-level/정규화/control-character 경로 거부를 검증한다. `cli.test.ts`는 두 preview·재실행 명령·confirmed dispatch와 shell metacharacter quoting을 검증한다.
+- `N3`: shared `pilotConfigurationPath`가 setup/doctor/lifecycle에 동일한 XDG/fallback 규칙을 제공한다. migration 실패를 주입한 production composition 테스트가 custom XDG config를 backup하고 같은 위치로 restore하며 `~/.config` 잔여 경로를 전혀 선택하지 않음을 검증하고, 별도 fallback 테스트가 `~/.config/orca-hq/pilot.json`을 고정한다.
+
+### 변경 파일
+
+- 공유 설정/배선: `packages/core/src/pilot-config.ts`, `packages/core/src/index.ts`, `packages/installer/src/config-files.ts`, `setup.ts`, `host.ts`, `lifecycle-host.ts`, `cli.ts`, `uninstall.ts`, `apps/gateway/src/host.ts`.
+- 테스트: `packages/installer/test/setup.test.ts`, `host.test.ts`, `lifecycle-host.test.ts`, `lifecycle-commands.test.ts`, `cli.test.ts`, `clean-install.test.ts`, `cli-process.test.ts`, `apps/gateway/test/entry.test.ts`, `end-to-end.test.ts`.
+- dependency/build/문서: `packages/installer/package.json`, `package.json`, `pnpm-lock.yaml`, `docs/operations/update-and-rollback.md`, 이 보고서.
+
+### 검증
+
+- focused: `pnpm test packages/installer/test/lifecycle-host.test.ts packages/installer/test/lifecycle-commands.test.ts packages/installer/test/cli.test.ts packages/installer/test/setup.test.ts apps/gateway/test/entry.test.ts` — 5 files, 62 tests 통과.
+- installer 전체: `pnpm test packages/installer` — 9 files, 78 tests 통과.
+- installer source: `pnpm --filter @orca-hq/installer typecheck` — 통과.
+- installer test: `pnpm --filter @orca-hq/installer typecheck:test` — 통과.
+- root typecheck: `pnpm typecheck` — 통과.
+- 전체 suite: `pnpm test` — 42 files, 633 tests 통과.
+- build: `pnpm build` — exit 0. `Scope: 15 of 16 workspace projects`는 root가 재귀 실행 주체라 제외된 표기이며 build 대상 15개 하위 workspace는 모두 `Done`; 실패나 skip 없음.
+
+### Self-review 및 기존 finding 비회귀
+
+- `N1`: config read/parse/path validation은 composition 전에 끝나며 error 원문은 CLI에 노출되지 않는다. custom DB는 update status/backup/schema/migration과 uninstall status가 모두 동일 정본을 쓴다.
+- `N2`: preview branch는 service `run()`을 호출하지 않고, service 자체도 active-work 검사와 exact confirmation 뒤에만 launchd/program/data mutation을 둔다. program-only는 data와 별도 XDG config, Keychain을 건드리지 않는다.
+- `N3`: config path 문자열은 core helper 한 곳에서 계산하며 backup과 rollback restore가 composition의 동일 path를 공유한다.
+- 이전 `C1/I1~I7` 비회귀: update stage/cause/receipt rollback, status rejection 정규화, stop→backup 순서, rollback continuation, active-work uninstall guard, production SQLite/launchd/source adapters, CLI redaction, lifecycle test typecheck는 기존 installer 전체 및 전체 suite에서 유지됐다. 기존 Minor와 이번 범위 밖 `M1~M6`은 재설계하지 않았다.
+
+### 남은 우려
+
+기존 `databasePath` 없는 legacy config는 추측 경로로 진행하지 않고 doctor/lifecycle/gateway에서 fail-closed 하므로, 운영자는 preview를 확인한 뒤 `hq setup`을 다시 실행해 명시적 필드를 기록해야 한다. 실제 Slack·Telegram·Tailscale·Keychain·launchd·운영 SQLite·credential/config는 변경하지 않았고 모든 destructive 외부 경계는 recording fake 또는 임시 디렉터리에서만 검증했다.
+
+원자 커밋 메시지: `fix(operations): align lifecycle paths and confirmations`.

@@ -30,6 +30,7 @@ function ports(): SetupPorts & { keychain: RecordingKeychain; configFile: Record
   const output = { lines: [] as string[], write(text: string) { this.lines.push(text); } };
   const pass = async () => "pass" as const;
   return {
+    databasePath: "/Users/pilot/Library/Application Support/orca-hq/control.sqlite",
     keychain,
     configFile,
     output,
@@ -65,6 +66,9 @@ describe("guided private-pilot setup", () => {
     expect(fixture.output.lines.join("\n")).not.toContain("telegram-secret");
     expect(fixture.configFile.writes.join("\n")).not.toContain("xapp-secret");
     expect(fixture.configFile.previews).toHaveLength(1);
+    expect(JSON.parse(fixture.configFile.writes[0] ?? "{}")).toMatchObject({
+      databasePath: "/Users/pilot/Library/Application Support/orca-hq/control.sqlite"
+    });
     expect(fixture.output.lines.join("\n")).toContain(fixture.configFile.path);
   });
 

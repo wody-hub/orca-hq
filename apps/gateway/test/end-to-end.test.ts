@@ -253,6 +253,12 @@ function boundaries(
   );
   return {
     settings: {
+      pilotConfig: {
+        schema: "orca-hq.private-pilot.v1",
+        databasePath: join(directory, "control.sqlite"),
+        projectRegistryPath,
+        credentialAccounts: []
+      },
       gateway: {
         databasePath: join(directory, "control.sqlite"),
         shutdownDrainMs: 1_000,

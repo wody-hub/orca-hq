@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { DoctorPorts } from "../src/doctor.js";
 import {
+  createDefaultLifecycleHostComposition,
   createLifecycleHostComposition,
   type LifecycleHostMachinePort,
   type LifecycleHostPaths
@@ -24,7 +25,7 @@ function passingDoctor(): DoctorPorts {
   };
 }
 
-function fixture(): Readonly<{
+function fixture(options: Readonly<{ migrationError?: Error }> = {}): Readonly<{
   calls: string[];
   paths: LifecycleHostPaths;
   machine: LifecycleHostMachinePort;
@@ -57,7 +58,10 @@ function fixture(): Readonly<{
       async backup(source, destination) { calls.push(`sqlite:backup:${source}:${destination}`); },
       async schemaVersion(path) { calls.push(`sqlite:schema:${path}`); return 2; },
       async nonterminalDispatches(path) { calls.push(`sqlite:active:${path}`); return 0; },
-      async migrate(path, program) { calls.push(`sqlite:migrate:${path}:cwd=${program}`); }
+      async migrate(path, program) {
+        calls.push(`sqlite:migrate:${path}:cwd=${program}`);
+        if (options.migrationError !== undefined) throw options.migrationError;
+      }
     }
   };
   let status: LaunchdStatus = { state: "running", pid: 42 };
@@ -72,6 +76,134 @@ function fixture(): Readonly<{
 }
 
 describe("production lifecycle host composition", () => {
+  it("uses one custom pilot database path for update and uninstall", async () => {
+    // Break caught: the real CLI factory can ignore pilot.json and inspect the hard-coded control.sqlite instead.
+    const subject = fixture();
+    const databasePath = "/Users/pilot/Library/Application Support/orca-hq/custom.sqlite";
+    const configPath = "/pilot/xdg/orca-hq/pilot.json";
+    const composition = await createDefaultLifecycleHostComposition({
+      configuration: {
+        homeDirectory: () => "/Users/pilot",
+        configDirectory: () => "/pilot/xdg",
+        async readText(path) {
+          expect(path).toBe(configPath);
+          return JSON.stringify({
+            schema: "orca-hq.private-pilot.v1",
+            databasePath,
+            projectRegistryPath: "/pilot/projects.yaml",
+            credentialAccounts: []
+          });
+        }
+      },
+      program: subject.paths.program,
+      machine: subject.machine,
+      launchd: subject.launchd,
+      doctor: passingDoctor(),
+      now: () => new Date("2026-09-04T01:02:03.000Z")
+    });
+
+    await expect(composition.update.run({ revision: targetRevision })).resolves.toMatchObject({
+      backup: { sourceRevision: previousRevision }
+    });
+    await composition.uninstall.run({
+      removeData: false,
+      confirmation: composition.uninstall.programConfirmationPhrase
+    });
+
+    expect(subject.calls.filter((call) => call.startsWith("sqlite:active:"))).toEqual([
+      `sqlite:active:${databasePath}`,
+      `sqlite:active:${databasePath}`,
+      `sqlite:active:${databasePath}`
+    ]);
+  });
+
+  it("fails closed before mutation when pilot database configuration is missing, malformed, or outside durable data", async () => {
+    // Break caught: invalid canonical configuration can fall back to a guessed database and mutate source or launchd.
+    for (const text of [
+      undefined,
+      "{not-json",
+      JSON.stringify({
+        schema: "orca-hq.private-pilot.v1",
+        databasePath: "/tmp/not-orca-hq.sqlite",
+        projectRegistryPath: "/pilot/projects.yaml",
+        credentialAccounts: []
+      })
+    ]) {
+      const subject = fixture();
+      await expect(createDefaultLifecycleHostComposition({
+        configuration: {
+          homeDirectory: () => "/Users/pilot",
+          configDirectory: () => "/pilot/xdg",
+          readText: async () => text
+        },
+        program: subject.paths.program,
+        machine: subject.machine,
+        launchd: subject.launchd,
+        doctor: passingDoctor()
+      })).rejects.toMatchObject({ code: "lifecycle_config_invalid" });
+      expect(subject.calls).toEqual([]);
+    }
+  });
+
+  it("backs up and restores the XDG pilot config without selecting a stale fallback file", async () => {
+    // Break caught: lifecycle backup can copy ~/.config/pilot.json while setup and doctor use XDG_CONFIG_HOME.
+    const subject = fixture({ migrationError: new Error("migration failed") });
+    const databasePath = "/Users/pilot/Library/Application Support/orca-hq/custom.sqlite";
+    const configPath = "/pilot/xdg/orca-hq/pilot.json";
+    const composition = await createDefaultLifecycleHostComposition({
+      configuration: {
+        homeDirectory: () => "/Users/pilot",
+        configDirectory: () => "/pilot/xdg",
+        readText: async () => JSON.stringify({
+          schema: "orca-hq.private-pilot.v1",
+          databasePath,
+          projectRegistryPath: "/pilot/projects.yaml",
+          credentialAccounts: []
+        })
+      },
+      program: subject.paths.program,
+      machine: subject.machine,
+      launchd: subject.launchd,
+      doctor: passingDoctor(),
+      now: () => new Date("2026-09-04T01:02:03.000Z")
+    });
+
+    await expect(composition.update.run({ revision: targetRevision })).rejects.toMatchObject({
+      code: "update_failed",
+      stage: "migration"
+    });
+
+    const backupConfig = "/Users/pilot/Library/Application Support/orca-hq/backups/2026-09-04T01-02-03-000Z/pilot.json";
+    expect(subject.calls).toContain(`copy:${configPath}:${backupConfig}`);
+    expect(subject.calls).toContain(`copy:${backupConfig}:${configPath}`);
+    expect(subject.calls.some((call) => call.includes("/Users/pilot/.config/orca-hq/pilot.json"))).toBe(false);
+  });
+
+  it("uses ~/.config as the lifecycle pilot config fallback", async () => {
+    // Break caught: a shared config helper could honor XDG but lose the established default fallback.
+    const subject = fixture();
+    const expectedConfigPath = "/Users/pilot/.config/orca-hq/pilot.json";
+    await createDefaultLifecycleHostComposition({
+      configuration: {
+        homeDirectory: () => "/Users/pilot",
+        configDirectory: () => undefined,
+        async readText(path) {
+          expect(path).toBe(expectedConfigPath);
+          return JSON.stringify({
+            schema: "orca-hq.private-pilot.v1",
+            databasePath: "/Users/pilot/Library/Application Support/orca-hq/control.sqlite",
+            projectRegistryPath: "/pilot/projects.yaml",
+            credentialAccounts: []
+          });
+        }
+      },
+      program: subject.paths.program,
+      machine: subject.machine,
+      launchd: subject.launchd,
+      doctor: passingDoctor()
+    });
+  });
+
   it("uses exact source, frozen install, read-only preflight, online SQLite, schema, and launchd ports", async () => {
     // Break caught: the production composition can silently omit one of the host safety boundaries required by update.
     const subject = fixture();
@@ -111,7 +243,10 @@ describe("production lifecycle host composition", () => {
       doctor: passingDoctor()
     });
 
-    await composition.uninstall.run({ removeData: false });
+    await composition.uninstall.run({
+      removeData: false,
+      confirmation: composition.uninstall.programConfirmationPhrase
+    });
 
     expect(subject.calls).toEqual([
       "sqlite:active:/pilot/data/control.sqlite",

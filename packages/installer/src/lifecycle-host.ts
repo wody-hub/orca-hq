@@ -1,11 +1,16 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import Database from "better-sqlite3";
+import {
+  defaultPilotDataDirectory,
+  parsePilotConfigText,
+  pilotConfigurationPath
+} from "@orca-hq/core";
 
 import { createBackupService } from "./backup.js";
 import { createDoctor, type DoctorPorts } from "./doctor.js";
@@ -55,11 +60,23 @@ export interface LifecycleComposition {
 }
 
 export interface LifecycleHostCompositionOptions {
-  readonly paths?: LifecycleHostPaths;
+  readonly paths: LifecycleHostPaths;
+  readonly protectedPaths?: readonly string[];
   readonly machine?: LifecycleHostMachinePort;
   readonly launchd?: LaunchdOperations;
   readonly doctor?: DoctorPorts;
   readonly now?: () => Date;
+}
+
+export interface LifecycleConfigurationPort {
+  homeDirectory(): string;
+  configDirectory(): string | undefined;
+  readText(path: string): Promise<string | undefined>;
+}
+
+export interface DefaultLifecycleHostCompositionOptions extends Omit<LifecycleHostCompositionOptions, "paths"> {
+  readonly configuration?: LifecycleConfigurationPort;
+  readonly program?: string;
 }
 
 function commandError(operation: string): Error {
@@ -85,19 +102,69 @@ function exactRevision(revision: string): boolean {
 }
 
 export function defaultLifecycleHostPaths(input: Readonly<{
-  readonly homeDirectory?: string;
+  readonly homeDirectory: string;
+  readonly configDirectory?: string | undefined;
+  readonly databasePath: string;
   readonly program?: string;
-}> = {}): LifecycleHostPaths {
-  const home = resolve(input.homeDirectory ?? homedir());
+}>): LifecycleHostPaths {
+  const home = resolve(input.homeDirectory);
   const program = resolve(input.program ?? join(moduleDirectory, "../../.."));
-  const data = join(home, "Library/Application Support/orca-hq");
+  const data = defaultPilotDataDirectory(home);
   return Object.freeze({
     program,
     data,
-    database: join(data, "control.sqlite"),
-    config: join(home, ".config/orca-hq/pilot.json"),
+    database: resolve(input.databasePath),
+    config: pilotConfigurationPath({ homeDirectory: home, configDirectory: input.configDirectory }),
     backups: join(data, "backups")
   });
+}
+
+function lifecycleConfigError(): Error {
+  return Object.assign(new Error("Lifecycle configuration is missing or invalid."), {
+    code: "lifecycle_config_invalid"
+  });
+}
+
+function createNodeLifecycleConfiguration(): LifecycleConfigurationPort {
+  return {
+    homeDirectory: homedir,
+    configDirectory: () => process.env.XDG_CONFIG_HOME,
+    async readText(path) {
+      try {
+        return await readFile(path, "utf8");
+      } catch {
+        return undefined;
+      }
+    }
+  };
+}
+
+/** Loads the secret-free pilot config used by setup, doctor, gateway, and lifecycle before composing mutations. */
+export async function createDefaultLifecycleHostComposition(
+  options: DefaultLifecycleHostCompositionOptions = {}
+): Promise<LifecycleComposition> {
+  const configuration = options.configuration ?? createNodeLifecycleConfiguration();
+  const homeDirectory = resolve(configuration.homeDirectory());
+  const configDirectory = configuration.configDirectory();
+  const configPath = pilotConfigurationPath({ homeDirectory, configDirectory });
+  const text = await configuration.readText(configPath);
+  if (text === undefined) throw lifecycleConfigError();
+  try {
+    const config = parsePilotConfigText(text);
+    return createLifecycleHostComposition({
+      ...options,
+      protectedPaths: [homeDirectory],
+      paths: defaultLifecycleHostPaths({
+        homeDirectory,
+        configDirectory,
+        databasePath: config.databasePath,
+        ...(options.program === undefined ? {} : { program: options.program })
+      })
+    });
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "lifecycle_config_invalid") throw error;
+    throw lifecycleConfigError();
+  }
 }
 
 /** Concrete Node/macOS filesystem, process, and SQLite boundary for lifecycle commands. */
@@ -175,9 +242,9 @@ export function createNodeLifecycleHostMachine(): LifecycleHostMachinePort {
 
 /** Wires production lifecycle services while allowing tests to fake every external boundary. */
 export function createLifecycleHostComposition(
-  options: LifecycleHostCompositionOptions = {}
+  options: LifecycleHostCompositionOptions
 ): LifecycleComposition {
-  const paths = options.paths ?? defaultLifecycleHostPaths();
+  const paths = options.paths;
   const machine = options.machine ?? createNodeLifecycleHostMachine();
   const launchd = options.launchd ?? createLaunchdOperations(
     defaultLaunchdPaths({ homeDirectory: dirname(dirname(dirname(paths.data))), workspaceRoot: paths.program }),
@@ -261,6 +328,7 @@ export function createLifecycleHostComposition(
     }),
     uninstall: createUninstall({
       paths,
+      ...(options.protectedPaths === undefined ? {} : { protectedPaths: options.protectedPaths }),
       gateway,
       launchd: { uninstall: async () => launchd.uninstall() },
       files: {
