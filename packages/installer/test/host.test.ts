@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createDoctor } from "../src/doctor.js";
-import { createMacosHostAdapters, type HostMachinePort } from "../src/host.js";
+import { createMacosHostAdapters, createNodeMachine, type HostMachinePort } from "../src/host.js";
 import { createSetup } from "../src/setup.js";
 
 class RecordingMachine implements HostMachinePort {
@@ -36,6 +36,25 @@ class RecordingMachine implements HostMachinePort {
 }
 
 describe("macOS host adapters", () => {
+  it("replaces Keychain command failures with a fixed secret-free error", async () => {
+    // Break caught: Node's execFile error contains every argv value, including the credential passed after -w.
+    const secret = "xapp-SUPERSECRET";
+    const machine = createNodeMachine(async (_executable, arguments_) => {
+      throw new Error(`Command failed: security ${arguments_.join(" ")}`);
+    });
+
+    let thrown: unknown;
+    try {
+      await machine.storeKeychainSecret("orca-hq", "slack-app-token", secret);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("Unable to store credential in macOS Keychain.");
+    expect((thrown as Error).message).not.toContain(secret);
+  });
+
   it("runs every doctor probe through a recording read-only machine boundary", async () => {
     // Break caught: adding a config, filesystem, process, or Keychain write to doctor must make this assertion fail.
     const machine = new RecordingMachine();

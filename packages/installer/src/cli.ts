@@ -1,3 +1,6 @@
+#!/usr/bin/env node
+
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { createDoctor, doctorExitCode, type DoctorPorts } from "./doctor.js";
@@ -47,10 +50,17 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
   }
   if (selected === "setup") {
     const prompt = dependencies.prompt ?? createTerminalPrompt();
-    const answers = await prompt.collectSetupAnswers();
-    const setup = dependencies.setup ?? host.setup({ write: (text) => write(output, text) }, () => prompt.confirm(), answers);
-    const result = await createSetup(setup).run(answers);
-    return result.ok ? 0 : 1;
+    try {
+      const answers = await prompt.collectSetupAnswers();
+      const setup = dependencies.setup ?? host.setup({ write: (text) => write(output, text) }, () => prompt.confirm(), answers);
+      const result = await createSetup(setup).run(answers);
+      return result.ok ? 0 : 1;
+    } catch {
+      write(output, "Setup failed while applying configuration.");
+      return 1;
+    } finally {
+      prompt.close();
+    }
   }
   write(output, `hq ${selected} is reserved for the private-pilot service adapter.`);
   return 1;
@@ -60,6 +70,15 @@ async function main(): Promise<void> {
   process.exitCode = await runCli(process.argv.slice(2));
 }
 
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+function isMainModule(): boolean {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   await main();
 }

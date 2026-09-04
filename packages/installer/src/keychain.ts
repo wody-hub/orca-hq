@@ -1,8 +1,4 @@
-/**
- * The installer never invokes `security` itself. A host-specific adapter owns that
- * boundary so setup tests and source-distributed runs cannot accidentally touch a
- * user's Keychain.
- */
+/** A host-specific adapter owns the `security` process boundary. */
 export interface KeychainPort {
   set(service: string, account: string, value: string): Promise<void>;
 }

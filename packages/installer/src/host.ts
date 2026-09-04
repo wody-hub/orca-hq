@@ -14,6 +14,12 @@ import type { SetupAnswers, SetupOutputPort, SetupPorts } from "./setup.js";
 
 const execFileAsync = promisify(execFile);
 
+export type HostCommandRunner = (
+  executable: string,
+  arguments_: readonly string[],
+  options: Readonly<{ timeout?: number; maxBuffer: number }>
+) => Promise<Readonly<{ stdout: string }>>;
+
 export interface HostReadPort {
   platform(): string;
   architecture(): string;
@@ -164,7 +170,12 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
   };
 }
 
-function createNodeMachine(): HostMachinePort {
+export function createNodeMachine(
+  runCommand: HostCommandRunner = async (executable, arguments_, options) => {
+    const result = await execFileAsync(executable, [...arguments_], options);
+    return { stdout: result.stdout };
+  }
+): HostMachinePort {
   return {
     platform,
     architecture: arch,
@@ -173,7 +184,7 @@ function createNodeMachine(): HostMachinePort {
     configDirectory: () => process.env.XDG_CONFIG_HOME,
     async command(executable, arguments_) {
       try {
-        const result = await execFileAsync(executable, [...arguments_], { timeout: 5_000, maxBuffer: 64 * 1024 });
+        const result = await runCommand(executable, arguments_, { timeout: 5_000, maxBuffer: 64 * 1024 });
         return { ok: true, stdout: result.stdout };
       } catch {
         return { ok: false, stdout: "" };
@@ -188,7 +199,11 @@ function createNodeMachine(): HostMachinePort {
     async createDirectory(path) { await mkdir(path, { recursive: true }); },
     async writeText(path, text) { await writeFile(path, text, { encoding: "utf8", mode: 0o600 }); },
     async storeKeychainSecret(service, account, value) {
-      await execFileAsync("security", ["add-generic-password", "-U", "-s", service, "-a", account, "-w", value], { maxBuffer: 64 * 1024 });
+      try {
+        await runCommand("security", ["add-generic-password", "-U", "-s", service, "-a", account, "-w", value], { maxBuffer: 64 * 1024 });
+      } catch {
+        throw new Error("Unable to store credential in macOS Keychain.");
+      }
     }
   };
 }

@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@orca-hq/installer':
+        specifier: workspace:*
+        version: link:packages/installer
     devDependencies:
       '@types/node':
         specifier: ^22.15.0
