@@ -9,7 +9,11 @@ export default defineConfig({
         extends: true,
         test: {
           name: "orca-hq",
-          include: ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts"]
+          include: [
+            "packages/*/test/**/*.test.ts",
+            "apps/*/test/**/*.test.ts",
+            "tests/{e2e,chaos}/**/*.spec.ts"
+          ]
         }
       },
       {

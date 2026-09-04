@@ -212,7 +212,35 @@ importers:
         specifier: ^3.24.2
         version: 3.25.76
 
-  packages/test-support: {}
+  packages/test-support:
+    dependencies:
+      '@orca-hq/core':
+        specifier: workspace:*
+        version: link:../core
+      '@orca-hq/gateway':
+        specifier: workspace:*
+        version: link:../../apps/gateway
+      '@orca-hq/persistence':
+        specifier: workspace:*
+        version: link:../persistence
+      '@orca-hq/project-registry':
+        specifier: workspace:*
+        version: link:../project-registry
+      '@orca-hq/slack-adapter':
+        specifier: workspace:*
+        version: link:../slack-adapter
+      '@orca-hq/tailscale-adapter':
+        specifier: workspace:*
+        version: link:../tailscale-adapter
+      '@orca-hq/telegram-adapter':
+        specifier: workspace:*
+        version: link:../telegram-adapter
+      '@orca-hq/voice':
+        specifier: workspace:*
+        version: link:../voice
+      '@orca-hq/worker-routing':
+        specifier: workspace:*
+        version: link:../worker-routing
 
   packages/voice:
     dependencies:

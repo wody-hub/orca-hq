@@ -3,6 +3,16 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./lifecycle": {
+      "types": "./dist/lifecycle.d.ts",
+      "default": "./dist/lifecycle.js"
+    },
+    "./reconcile": {
+      "types": "./dist/reconcile.d.ts",
+      "default": "./dist/reconcile.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

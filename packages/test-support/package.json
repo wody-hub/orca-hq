@@ -10,5 +10,16 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@orca-hq/core": "workspace:*",
+    "@orca-hq/gateway": "workspace:*",
+    "@orca-hq/persistence": "workspace:*",
+    "@orca-hq/project-registry": "workspace:*",
+    "@orca-hq/slack-adapter": "workspace:*",
+    "@orca-hq/tailscale-adapter": "workspace:*",
+    "@orca-hq/telegram-adapter": "workspace:*",
+    "@orca-hq/voice": "workspace:*",
+    "@orca-hq/worker-routing": "workspace:*"
   }
 }
