@@ -1,16 +1,16 @@
-# Orca HQ private pilot
+# Orca HQ public source, invitation-only pilot
 
-Orca HQ는 Slack, Telegram, Tailscale web에서 받은 작업을 한 대의 Mac에서 Orca의 Codex·Claude Code worker로 전달하고 검증하는 private pilot입니다. 현재 대상은 초대된 동료 3–5명뿐이며, **호스트 Mac이 켜져 있고 깨어 있고 네트워크에 연결된 동안에만 동작**합니다.
+Orca HQ는 Slack, Telegram, Tailscale web에서 받은 작업을 한 대의 Mac에서 Orca의 Codex·Claude Code worker로 전달하고 검증합니다. source repository는 공개되어 있지만 현재 운영 pilot과 지원은 초대된 동료 3–5명만 대상으로 하며, **호스트 Mac이 켜져 있고 깨어 있고 네트워크에 연결된 동안에만 동작**합니다.
 
 ## 처음 시작하기
 
-새 설치는 [20분 private pilot 설치 가이드](docs/installation/private-pilot.md)에서 시작하세요. 이 pilot의 설치 방식은 private Git 저장소를 `git clone`한 뒤 `pnpm install`과 `pnpm hq setup`을 실행하는 것뿐입니다. public npm 또는 Homebrew 패키지는 제공하지 않습니다.
+새 설치는 [20분 invitation-only pilot 설치 가이드](docs/installation/private-pilot.md)에서 시작하세요. 공개 Git repository를 `git clone`한 뒤 `pnpm install`과 `pnpm hq setup`을 실행합니다. public npm 또는 Homebrew package와 production/general-availability support는 제공하지 않습니다. repository에는 아직 license가 없으므로 공개 열람 가능 상태를 open-source 사용·수정·재배포 허가로 해석하지 마세요.
 
 ## 문서
 
 | 독자 | 문서 | 목적 |
 | --- | --- | --- |
-| 신규 동료 개발자 | [private pilot 설치](docs/installation/private-pilot.md) | 개인 계정 준비부터 `doctor`, 시작, 확인까지 |
+| 초대된 pilot 동료 | [invitation-only pilot 설치](docs/installation/private-pilot.md) | 개인 계정 준비부터 `doctor`, 시작, 확인까지 |
 | 운영자 | [운영 runbook](docs/operations/runbook.md) | 장애, 재시작, backup, update, rollback, uninstall |
 | 보안 검토자 | [threat model](docs/security/threat-model.md) | 신뢰 경계, 위협, 통제, 잔여 위험 |
 | 사용자·운영자 | [data handling](docs/security/data-handling.md) | credential, SQLite, log, 첨부물, 진단 자료의 처리 |

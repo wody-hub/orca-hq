@@ -2,15 +2,16 @@
 
 ## 지원 범위
 
-현재 지원 대상은 private repository의 최신 `dev`/pilot revision을 source install한 macOS private pilot뿐입니다. public npm, Homebrew, Linux/Windows host, public dashboard, Tailscale Funnel은 지원 범위가 아닙니다.
+source repository는 공개되어 있지만 현재 지원 대상은 초대된 동료가 최신 `dev`/pilot revision을 source install한 macOS 운영 pilot뿐입니다. public npm, Homebrew, Linux/Windows host, public dashboard, Tailscale Funnel과 일반 공개 사용자는 지원 범위가 아닙니다.
 
 ## 취약점은 비공개로 신고하세요
 
-credential 노출, approval bypass, identity confusion, duplicate destructive execution, path escape, unsafe uninstall, diagnostic leak, dashboard exposure, dependency compromise를 발견하면 public issue나 Slack/Telegram work channel에 쓰지 마세요.
+credential 노출, approval bypass, identity confusion, duplicate destructive execution, path escape, unsafe uninstall, diagnostic leak, dashboard exposure, dependency compromise를 발견해도 public issue나 Slack/Telegram work channel에 취약점 상세를 쓰지 마세요. 현재 이 repository의 GitHub private vulnerability reporting은 비활성 상태입니다.
 
-1. GitHub repository의 **Security → Report a vulnerability** private report를 사용합니다.
-2. private reporting이 보이지 않으면 repository owner에게 승인된 비공개 연락 경로로 security report를 요청합니다.
-3. token, raw transcript, raw SQLite, 실제 Registry, 고객/회사 path를 본문에 붙이지 않습니다. 필요한 증거는 최소 redacted reproduction과 synthetic fixture로 만듭니다.
+1. 초대된 pilot 동료는 초대에 사용된 기존 사내 비공개 연락 경로에서 maintainer에게 security report channel을 요청하고 그 비공개 channel로만 상세를 보냅니다.
+2. 그 연락 경로가 없는 공개 독자는 public issue에 **private security contact requested**라고 연락 연결만 요청합니다. issue에는 취약점 종류·영향·경로·로그·token·재현 단계나 추측을 적지 않습니다.
+3. maintainer는 상세를 요청하기 전에 GitHub private vulnerability reporting을 실제로 활성화하거나 reporter에게 별도 비공개 channel을 제공해야 합니다. public issue는 연락 연결용이며 보안 증거 수집 경로가 아닙니다.
+4. 비공개 channel에서도 token, raw transcript, raw SQLite, 실제 Registry, 고객/회사 path를 본문에 붙이지 않습니다. 필요한 증거는 최소 redacted reproduction과 synthetic fixture로 만듭니다.
 
 report에는 다음을 포함합니다.
 
@@ -35,8 +36,8 @@ pnpm hq doctor --format json
 
 SQLite, Registry, worktree, approval row를 직접 수정하지 않습니다. [운영 runbook](docs/operations/runbook.md)에서 backup과 receipt review를 수행하고, [data handling](docs/security/data-handling.md)에 따라 최소 diagnostic만 만듭니다.
 
-## 공개 전 gate
+## production/general-availability promotion gate
 
-private pilot이 사용자당 5개 curated project로 2주 운영되고 승인 지표를 통과하기 전에는 repository visibility를 변경하지 않습니다. 공개 전에는 Git object 전체의 secret/company-data scan, license/code of conduct/privacy/support/release policy, signed checksum, provenance, SBOM, 외부 clean-machine install, threat-model/dependency audit가 별도로 필요합니다.
+source repository는 이미 공개되어 있습니다. 운영 pilot을 production 또는 general availability로 승격하기 전에는 사용자당 5개 curated project로 2주 운영하고 승인 지표를 통과해야 합니다. 현재 없는 license와 code of conduct를 포함해 privacy/support/release policy, Git object 전체의 secret/company-data scan, signed checksum, provenance, SBOM, 외부 clean-machine install, threat-model/dependency audit도 별도로 필요합니다.
 
 보안 경계와 잔여 위험은 [threat model](docs/security/threat-model.md)을 참고하세요.

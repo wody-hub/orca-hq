@@ -108,22 +108,43 @@ tail -n 200 "$HOME/Library/Logs/orca-hq/gateway.error.log"
 
 독립 `hq backup` subcommand는 없습니다. update는 gateway를 멈춘 뒤 SQLite online backup, non-secret config, `manifest.json`을 `~/Library/Application Support/orca-hq/backups/<timestamp>/`에 자동 생성합니다. Keychain secret은 어떤 backup에도 포함되지 않습니다.
 
-update 밖에서 수동 backup이 필요하면 먼저 active/uncertain work가 없음을 확인하고 gateway를 graceful stop한 뒤 cold copy를 만듭니다. custom `databasePath`를 썼다면 아래 기본값 대신 pilot JSON의 정확한 값을 사용합니다.
+update 밖에서 수동 backup이 필요하면 먼저 active/uncertain work가 없음을 확인합니다. 다음 절차는 `stop` 성공과 `status`의 정확한 `stopped` JSON을 모두 확인하지 못하면 backup을 중단합니다. macOS `sqlite3`의 `.backup`은 main DB와 WAL의 committed transaction을 하나의 일관된 image로 만들며, backup image는 read-only immutable mode로 integrity check합니다. custom `databasePath`를 썼다면 아래 기본값 대신 pilot JSON의 정확한 값을 사용합니다.
 
 ```bash
-pnpm hq stop
+set -euo pipefail
+if ! pnpm hq stop; then
+  echo "Backup aborted: gateway stop failed." >&2
+  exit 1
+fi
+set +e
+STATUS_JSON=$(pnpm hq status)
+STATUS_EXIT=$?
+set -e
+if [[ "$STATUS_EXIT" -ne 1 || "$STATUS_JSON" != '{"state":"stopped"}' ]]; then
+  echo "Backup aborted: gateway is not proven stopped." >&2
+  exit 1
+fi
 CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/orca-hq/pilot.json"
 DATABASE_PATH="$HOME/Library/Application Support/orca-hq/control.sqlite"
 BACKUP_DIR="$HOME/Library/Application Support/orca-hq/manual-backups/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+if [[ ! -f "$DATABASE_PATH" || ! -f "$CONFIG_PATH" ]]; then
+  echo "Backup aborted: exact database or config file is missing." >&2
+  exit 1
+fi
 mkdir -p "$BACKUP_DIR"
-cp "$DATABASE_PATH" "$BACKUP_DIR/runtime.sqlite"
+sqlite3 "$DATABASE_PATH" ".backup '$BACKUP_DIR/runtime.sqlite'"
+if [[ "$(sqlite3 "file:$BACKUP_DIR/runtime.sqlite?immutable=1" 'PRAGMA integrity_check;')" != "ok" ]]; then
+  echo "Backup aborted: SQLite integrity check failed." >&2
+  exit 1
+fi
 cp "$CONFIG_PATH" "$BACKUP_DIR/pilot.json"
-shasum -a 256 "$BACKUP_DIR/runtime.sqlite" "$BACKUP_DIR/pilot.json"
+(cd "$BACKUP_DIR" && shasum -a 256 runtime.sqlite pilot.json > SHA256SUMS)
+(cd "$BACKUP_DIR" && shasum -a 256 -c SHA256SUMS)
 pnpm hq start
 pnpm hq doctor --format json
 ```
 
-backup directory 안에 token export, Keychain dump, raw attachment, raw transcript를 넣지 않습니다. `--remove-data` uninstall 전에 보존할 backup은 data directory 밖의 암호화된 사용자 전용 위치로 복사하고 hash를 재확인합니다.
+어느 검증이든 실패하면 gateway를 자동으로 다시 시작하지 말고 원인을 확인합니다. main file만 raw `cp`하거나 live `-wal`/`-shm`을 따로 조합하지 않습니다. backup directory 안에 token export, Keychain dump, raw attachment, raw transcript를 넣지 않습니다. `--remove-data` uninstall 전에 보존할 backup은 data directory 밖의 암호화된 사용자 전용 위치로 복사하고 hash를 재확인합니다.
 
 ## exact revision으로 update하기
 
@@ -140,19 +161,86 @@ update는 active/uncertain work를 두 번 확인하고, exact revision과 froze
 
 자동 rollback 뒤에는 먼저 status, doctor, error log, backup `manifest.json`을 확인합니다. generic `Lifecycle operation failed.`만으로 현재 source와 DB를 추측하지 않습니다. manifest의 `sourceRevision`, `schemaVersion`, `databasePath`, `configPath`, `includesSecrets: false`가 서로 맞는지 확인합니다.
 
-자동 rollback이 끝나지 않았다는 근거가 있고 repository owner가 수동 복구를 승인한 경우에만 다음 순서를 사용합니다. `<...>`는 검증한 manifest와 pilot JSON의 exact 값으로 바꿉니다.
+자동 rollback이 끝나지 않았다는 근거가 있고 repository owner가 수동 복구를 승인한 경우에만 다음 순서를 사용합니다. `<...>`는 검증한 manifest와 pilot JSON의 exact 값으로 바꿉니다. backup checksum과 immutable integrity check를 먼저 통과시키며, `stop` 성공과 정확한 `stopped` 상태를 확인하지 못하면 복구를 중단합니다.
 
 ```bash
-pnpm hq stop
+set -euo pipefail
+BACKUP_DIR="<verified-backup-directory>"
+BACKUP_DATABASE="$BACKUP_DIR/runtime.sqlite"
+BACKUP_CONFIG="$BACKUP_DIR/pilot.json"
+DATABASE_PATH="<configured-database-path>"
+CONFIG_PATH="<pilot-config-path>"
+(cd "$BACKUP_DIR" && shasum -a 256 -c SHA256SUMS)
+if [[ "$(sqlite3 "file:$BACKUP_DATABASE?immutable=1" 'PRAGMA integrity_check;')" != "ok" ]]; then
+  echo "Restore aborted: backup integrity check failed." >&2
+  exit 1
+fi
+if ! pnpm hq stop; then
+  echo "Restore aborted: gateway stop failed." >&2
+  exit 1
+fi
+set +e
+STATUS_JSON=$(pnpm hq status)
+STATUS_EXIT=$?
+set -e
+if [[ "$STATUS_EXIT" -ne 1 || "$STATUS_JSON" != '{"state":"stopped"}' ]]; then
+  echo "Restore aborted: gateway is not proven stopped." >&2
+  exit 1
+fi
 git checkout --detach <source-revision-from-manifest>
 pnpm install --frozen-lockfile
-cp "<backup-runtime-sqlite>" "<configured-database-path>"
-cp "<backup-pilot-json>" "<pilot-config-path>"
+QUARANTINE_DIR="$HOME/Library/Application Support/orca-hq/manual-restore-quarantine/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+mkdir -p "$QUARANTINE_DIR/database" "$QUARANTINE_DIR/config" "$QUARANTINE_DIR/failed-restore"
+for suffix in "" "-wal" "-shm"; do
+  current="${DATABASE_PATH}${suffix}"
+  if [[ -e "$current" ]]; then
+    mv "$current" "$QUARANTINE_DIR/database/$(basename "$current")"
+  fi
+done
+if [[ -e "$CONFIG_PATH" ]]; then
+  mv "$CONFIG_PATH" "$QUARANTINE_DIR/config/$(basename "$CONFIG_PATH")"
+fi
+sqlite3 "$DATABASE_PATH" ".restore '$BACKUP_DATABASE'"
+cp "$BACKUP_CONFIG" "$CONFIG_PATH"
+chmod 600 "$DATABASE_PATH"
+chmod 600 "$CONFIG_PATH"
+if [[ "$(sqlite3 "file:$DATABASE_PATH?immutable=1" 'PRAGMA integrity_check;')" != "ok" ]]; then
+  echo "Restore failed integrity check; keep the gateway stopped and recover the quarantine." >&2
+  exit 1
+fi
 pnpm hq start
 pnpm hq doctor --format json
 ```
 
-기존 실패 상태는 덮어쓰기 전에 별도 cold backup으로 보존합니다. program과 호환되는 database/config snapshot을 함께 복구하고, doctor가 정상일 때까지 새 update를 시작하지 않습니다.
+위 절차는 기존 main DB, `-wal`, `-shm`, config를 삭제하거나 덮어쓰지 않고 timestamped quarantine으로 옮깁니다. `.restore`, target integrity check, start가 실패했거나 복구 image가 호환되지 않아 기존 상태로 돌아가기로 승인했다면 gateway를 stopped로 유지한 채 다음 exact-path 절차를 사용합니다.
+
+```bash
+set -euo pipefail
+for suffix in "" "-wal" "-shm"; do
+  current="${DATABASE_PATH}${suffix}"
+  saved="$QUARANTINE_DIR/database/$(basename "$current")"
+  if [[ -e "$current" ]]; then
+    mv "$current" "$QUARANTINE_DIR/failed-restore/$(basename "$current")"
+  fi
+  if [[ -e "$saved" ]]; then
+    mv "$saved" "$current"
+  fi
+done
+current_config="$CONFIG_PATH"
+saved_config="$QUARANTINE_DIR/config/$(basename "$CONFIG_PATH")"
+if [[ -e "$current_config" ]]; then
+  mv "$current_config" "$QUARANTINE_DIR/failed-restore/$(basename "$current_config")"
+fi
+if [[ -e "$saved_config" ]]; then
+  mv "$saved_config" "$current_config"
+fi
+if [[ "$(sqlite3 "$DATABASE_PATH" 'PRAGMA integrity_check;')" != "ok" ]]; then
+  echo "Quarantine recovery failed integrity check; do not start the gateway." >&2
+  exit 1
+fi
+```
+
+quarantine과 `failed-restore`는 검증과 incident review가 끝날 때까지 보존합니다. broad glob/delete를 사용하지 않습니다. program과 호환되는 database/config snapshot을 함께 복구하고, doctor가 정상일 때까지 새 update를 시작하지 않습니다.
 
 ## local redacted diagnostic 만들기
 
@@ -175,7 +263,7 @@ printf 'Diagnostic directory: %s\n' "$DIAGNOSTIC_DIR"
 sed -n '1,240p' "$DIAGNOSTIC_DIR/manifest.json"
 ```
 
-bundle은 OS temporary directory 아래 `manifest.json` 하나만 가집니다. `[Redacted]`가 필요한 곳에 있는지, 실제 token·prompt·transcript·회사명·사용자 절대 경로가 없는지 사람이 확인한 뒤에만 승인된 비공개 issue에 첨부합니다. raw log나 SQLite를 bundle에 덧붙이지 않습니다.
+bundle은 OS temporary directory 아래 `manifest.json` 하나만 가집니다. `[Redacted]`가 필요한 곳에 있는지, 실제 token·prompt·transcript·회사명·사용자 절대 경로가 없는지 사람이 확인한 뒤에만 maintainer가 제공한 비공개 보안 channel에 첨부합니다. public issue는 private 연락 연결만 요청하는 곳이며 diagnostic을 첨부하는 곳이 아닙니다. raw log나 SQLite를 bundle에 덧붙이지 않습니다.
 
 ## reinstall과 uninstall
 

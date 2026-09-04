@@ -1,4 +1,4 @@
-name: Private macOS CI
+name: macOS pilot CI
 
 on:
   pull_request:
@@ -11,17 +11,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: private-macos-ci-${{ github.ref }}
+  group: macos-pilot-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    name: Test source-installed private pilot
+    name: Test public source for invitation-only pilot
     runs-on: macos-latest
     timeout-minutes: 30
 
     steps:
-      - name: Check out private source
+      - name: Check out public source
         uses: actions/checkout@v4
 
       - name: Install pnpm
@@ -48,12 +48,67 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Verify read-only doctor JSON contract
+      - name: Verify isolated doctor config/data state and JSON contract
         shell: bash
         run: |
+          set -euo pipefail
+          DOCTOR_HOME="$RUNNER_TEMP/doctor-home"
+          DOCTOR_XDG="$RUNNER_TEMP/doctor-xdg"
+          CONFIG_SCOPE="$DOCTOR_XDG/orca-hq"
+          DATA_SCOPE="$DOCTOR_HOME/Library/Application Support/orca-hq"
+          mkdir -p "$CONFIG_SCOPE" "$DATA_SCOPE"
+          printf 'read-only config sentinel\n' > "$CONFIG_SCOPE/sentinel.txt"
+          printf 'read-only data sentinel\n' > "$DATA_SCOPE/sentinel.txt"
+
+          snapshot_state() {
+            local destination="$1"
+            node --input-type=module - "$CONFIG_SCOPE" "$DATA_SCOPE" "$destination" <<'NODE'
+          import { createHash } from "node:crypto";
+          import { lstat, readFile, readdir, readlink, writeFile } from "node:fs/promises";
+          import { join, relative } from "node:path";
+
+          async function snapshot(root) {
+            const entries = [];
+            async function visit(path) {
+              let stat;
+              try {
+                stat = await lstat(path, { bigint: true });
+              } catch (error) {
+                if (error?.code === "ENOENT") return { root, exists: false, entries: [] };
+                throw error;
+              }
+              const entry = {
+                path: relative(root, path) || ".",
+                mode: Number(stat.mode),
+                size: stat.size.toString(),
+                mtimeNs: stat.mtimeNs.toString(),
+                type: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other"
+              };
+              if (stat.isFile()) entry.sha256 = createHash("sha256").update(await readFile(path)).digest("hex");
+              if (stat.isSymbolicLink()) entry.target = await readlink(path);
+              entries.push(entry);
+              if (stat.isDirectory()) {
+                const children = await readdir(path);
+                children.sort();
+                for (const child of children) {
+                  const missing = await visit(join(path, child));
+                  if (missing !== undefined) throw new Error(`Snapshot child disappeared: ${path}/${child}`);
+                }
+              }
+            }
+            const missing = await visit(root);
+            return missing ?? { root, exists: true, entries };
+          }
+
+          const report = await Promise.all(process.argv.slice(2, 4).map(snapshot));
+          await writeFile(process.argv[4], `${JSON.stringify(report, null, 2)}\n`);
+          NODE
+          }
+
+          snapshot_state "$RUNNER_TEMP/doctor-before.json"
           before_status=$(git status --porcelain)
           set +e
-          pnpm hq doctor --format json > "$RUNNER_TEMP/doctor.json"
+          HOME="$DOCTOR_HOME" XDG_CONFIG_HOME="$DOCTOR_XDG" pnpm hq doctor --format json > "$RUNNER_TEMP/doctor.json"
           doctor_exit=$?
           set -e
           if [[ "$doctor_exit" -ne 0 && "$doctor_exit" -ne 1 ]]; then
@@ -76,7 +131,14 @@ jobs:
             echo "doctor changed the repository working tree" >&2
             exit 1
           fi
-          echo "doctor JSON valid (environment exit: $doctor_exit)"
+          snapshot_state "$RUNNER_TEMP/doctor-after.json"
+          if ! cmp -s "$RUNNER_TEMP/doctor-before.json" "$RUNNER_TEMP/doctor-after.json"; then
+            diff -u "$RUNNER_TEMP/doctor-before.json" "$RUNNER_TEMP/doctor-after.json" >&2 || true
+            echo "doctor changed isolated config or Application Support state" >&2
+            exit 1
+          fi
+          echo "doctor JSON valid and isolated config/data state unchanged (environment exit: $doctor_exit)"
+          echo "Keychain and launchd remain read-only adapter probes; this file snapshot does not claim to observe those services."
 
       - name: Run deterministic pilot acceptance
         run: node scripts/run-pilot-acceptance.mjs --runs 20 --output .artifacts/private-ci-acceptance.json

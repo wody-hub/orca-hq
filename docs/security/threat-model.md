@@ -1,6 +1,6 @@
-# Orca HQ private pilot threat model
+# Orca HQ public-source, invitation-only pilot threat model
 
-이 문서는 macOS 한 대에서 동작하는 private pilot의 보안 경계와 잔여 위험을 설명합니다. 공개 SaaS, 24×7 availability, public npm/Homebrew 배포, Tailscale Funnel은 범위에 없습니다.
+이 문서는 공개 source repository에서 제공되고 초대된 동료만 macOS 한 대에서 운영하는 pilot의 보안 경계와 잔여 위험을 설명합니다. 공개 SaaS, 24×7 availability, public npm/Homebrew 배포, 일반 공개 운영 지원, Tailscale Funnel은 범위에 없습니다.
 
 ## 보호할 자산
 
@@ -128,12 +128,12 @@ Tailscale tailnet -- private dashboard identity boundary
 
 통제:
 
-- source install은 private origin과 `pnpm install --frozen-lockfile`을 사용합니다.
+- source install은 공개 origin의 exact commit과 `pnpm install --frozen-lockfile`을 사용합니다.
 - update는 locally resolvable한 exact 40/64-character commit을 검증합니다.
-- private macOS CI는 test, typecheck, build, doctor JSON contract, deterministic acceptance를 실행합니다.
-- Dependabot은 npm과 GitHub Actions update를 private repository 안에서 제안합니다.
+- macOS CI는 test, typecheck, build, isolated doctor JSON/config-data state contract, deterministic acceptance를 실행합니다.
+- Dependabot은 공개 repository에 npm과 GitHub Actions update를 제안하므로 maintainer review 없이 신뢰하거나 merge하지 않습니다.
 
-잔여 위험: 현재 release signing, SBOM, public provenance gate는 아직 pilot 범위 밖입니다. repository visibility는 2주 pilot 및 open-source promotion gate 이전에 바꾸지 않습니다.
+잔여 위험: source repository는 이미 공개되어 있지만 license, release signing, SBOM, public provenance, privacy/support/release policy가 아직 없습니다. 2주 pilot과 보안·운영 gate를 통과하기 전에는 production/general availability로 승격하지 않습니다.
 
 ## Private-pilot worker environment 예외
 

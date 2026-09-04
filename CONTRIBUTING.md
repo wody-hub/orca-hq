@@ -1,11 +1,11 @@
 # Orca HQ에 기여하기
 
-이 repository는 macOS private pilot용입니다. 실제 Slack, Telegram, Tailscale, Keychain, Orca credential/config를 바꾸지 않고 synthetic fixture와 fake adapter로 개발합니다.
+이 public source repository는 초대된 동료만 운영하는 macOS pilot용입니다. 실제 Slack, Telegram, Tailscale, Keychain, Orca credential/config를 바꾸지 않고 synthetic fixture와 fake adapter로 개발합니다. 아직 license와 code of conduct가 없어 공개 열람 가능 상태가 사용·수정·재배포 허가나 일반 공개 contribution/support 접수를 뜻하지 않습니다.
 
 ## 개발 환경
 
 - macOS, Node `>=22.20 <23`, Corepack, pnpm `9.15.5`
-- private repository 접근 권한
+- public repository를 clone할 Git
 - 실제 provider token이 없는 test 환경
 
 ```bash

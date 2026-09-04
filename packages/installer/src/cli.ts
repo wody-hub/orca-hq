@@ -53,9 +53,8 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
     return 2;
   }
   if (selected === "doctor") {
-    const format = input[1] === "--format" ? input[2] : undefined;
-    if (format !== "json") {
-      write(output, "hq doctor requires --format json");
+    if (input.length !== 3 || input[1] !== "--format" || input[2] !== "json") {
+      write(output, "Usage: hq doctor --format json");
       return 2;
     }
     const result = await createDoctor(dependencies.doctor ?? host.doctor).run({ format: "json" });

@@ -1,11 +1,11 @@
-# 20분 안에 Orca HQ private pilot 설치하기
+# 20분 안에 Orca HQ invitation-only pilot 설치하기
 
-이 가이드를 끝내면 private Git checkout에서 Orca HQ를 설치하고, non-secret 설정과 macOS Keychain credential을 구성하고, read-only `doctor`를 통과시킨 뒤 gateway를 시작할 수 있습니다. 20분 목표는 아래 외부 계정과 앱이 이미 준비되어 있다는 전제입니다.
+이 가이드를 끝내면 public source checkout에서 Orca HQ를 설치하고, non-secret 설정과 macOS Keychain credential을 구성하고, read-only `doctor`를 통과시킨 뒤 invitation-only 운영 pilot gateway를 시작할 수 있습니다. 20분 목표는 아래 외부 계정과 앱이 이미 준비되어 있다는 전제입니다.
 
 ## 준비물
 
 - Apple Silicon 또는 Intel 기반 macOS Mac. Mac은 서비스 사용 중 켜져 있고 깨어 있고 네트워크에 연결되어 있어야 합니다.
-- Git, Node `>=22.20 <23`, Corepack, private 저장소 read 권한.
+- Git, Node `>=22.20 <23`, Corepack. repository를 읽고 clone하는 데 초대나 별도 권한은 필요하지 않습니다.
 - 직접 설치하고 로그인한 Orca, Codex, Claude Code, Tailscale.
 - 직접 만든 Slack App, 전용 Slack channel, Telegram bot과 허용할 chat ID, OpenAI API key.
 - Orca에서 확인하고 승인한 정확히 5개의 pilot project.
@@ -22,7 +22,7 @@ Orca HQ setup은 외부 계정을 대신 만들거나 권한을 변경하지 않
 4. **Tailscale**: 자신의 계정으로 승인된 tailnet에 Mac을 연결합니다. dashboard는 Tailscale Serve 전용이며 Funnel 또는 public bind를 사용하지 않습니다.
 5. **OpenAI voice**: 자신의 OpenAI API key를 준비합니다. key는 setup 입력 직후 Keychain에 저장되고 repository나 pilot JSON에 기록되지 않습니다.
 
-## 1. private 저장소 설치하기
+## 1. public source repository 설치하기
 
 원하는 program directory의 상위 위치에서 실행합니다.
 
@@ -76,7 +76,7 @@ setup은 먼저 필수 조건을 검사합니다. 통과하면 non-secret plan�
 pnpm hq doctor --format json
 ```
 
-stdout은 `ok` boolean과 `checks` array가 있는 JSON 한 개뿐입니다. 각 check는 `id`, `status`(`pass`, `warn`, `fail`), `message`, 필요하면 `remediation`을 가집니다. 필수 check가 하나라도 `fail`이면 JSON을 출력한 뒤 exit 1로 끝나는 것이 정상입니다. exit 2와 `hq doctor requires --format json`은 `--format json`을 빠뜨린 사용 오류입니다.
+stdout은 `ok` boolean과 `checks` array가 있는 JSON 한 개뿐입니다. 각 check는 `id`, `status`(`pass`, `warn`, `fail`), `message`, 필요하면 `remediation`을 가집니다. 필수 check가 하나라도 `fail`이면 JSON을 출력한 뒤 exit 1로 끝나는 것이 정상입니다. exit 2와 `Usage: hq doctor --format json`은 argv 또는 flag 사용 오류입니다.
 
 대표 remediation은 다음과 같습니다.
 
