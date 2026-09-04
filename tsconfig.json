@@ -7,6 +7,9 @@
     "paths": {
       "@orca-hq/core": ["packages/core/src/index.ts"],
       "@orca-hq/codex-hq": ["packages/codex-hq/src/index.ts"],
+      "@orca-hq/gateway/lifecycle": ["apps/gateway/src/lifecycle.ts"],
+      "@orca-hq/gateway/production": ["apps/gateway/src/production.ts"],
+      "@orca-hq/gateway/reconcile": ["apps/gateway/src/reconcile.ts"],
       "@orca-hq/orca-adapter": ["packages/orca-adapter/src/index.ts"],
       "@orca-hq/observability": ["packages/observability/src/index.ts"],
       "@orca-hq/persistence": ["packages/persistence/src/index.ts"],

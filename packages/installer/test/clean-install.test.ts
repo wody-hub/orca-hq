@@ -11,9 +11,19 @@ import { preservedCorepackHome } from "./corepack-home.js";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function cleanPath(): string {
+  const repositoryBin = resolve(repositoryRoot, "node_modules", ".bin");
+  const comparableRepositoryBin = process.platform === "win32"
+    ? repositoryBin.toLowerCase()
+    : repositoryBin;
   return (process.env.PATH ?? "")
     .split(delimiter)
-    .filter((entry) => !entry.includes(`${sep}node_modules${sep}.bin`))
+    .filter((entry) => {
+      const absoluteEntry = resolve(entry);
+      const comparableEntry = process.platform === "win32"
+        ? absoluteEntry.toLowerCase()
+        : absoluteEntry;
+      return comparableEntry !== comparableRepositoryBin;
+    })
     .join(delimiter);
 }
 
@@ -102,6 +112,22 @@ async function createIsolatedHost(fixture: string): Promise<NodeJS.ProcessEnv> {
     PATH: `${bin}${delimiter}${cleanPath()}`
   };
 }
+
+it("removes only the repository-local dependency bin from PATH", () => {
+  // Break caught: pnpm/action-setup installs pnpm in an external node_modules/.bin directory.
+  const repositoryBin = join(repositoryRoot, "node_modules", ".bin");
+  const actionSetupBin = join(tmpdir(), "setup-pnpm", "node_modules", ".bin");
+  const systemBin = join(tmpdir(), "system-bin");
+  const originalPath = process.env.PATH;
+  process.env.PATH = [repositoryBin, actionSetupBin, systemBin].join(delimiter);
+
+  try {
+    expect(cleanPath().split(delimiter)).toEqual([actionSetupBin, systemBin]);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
 
 it("runs exact pnpm hq after the first offline install of a clean source workspace", async () => {
   // Break caught: if the package bin points at a generated dist file, pnpm skips the first-install shim before prepare builds it.
