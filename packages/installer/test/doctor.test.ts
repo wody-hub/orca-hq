@@ -13,7 +13,7 @@ function ports(): DoctorPorts & { mutations: string[] } {
   return {
     mutations,
     checks: {
-      macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
+      pilotConfiguration: pass, macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
       claudeAuthentication: pass, tailscaleTailnet: pass, slackSocketMode: pass,
       telegramAllowlistedChat: pass, openAiVoice: pass, keychain: pass, sqliteDirectory: pass,
       launchd: pass, projectDiscovery: pass
@@ -54,6 +54,22 @@ describe("read-only private-pilot doctor", () => {
 
     await expect(doctorExitCode(warning)).resolves.toBe(0);
     await expect(doctorExitCode(failed)).resolves.toBe(1);
+  });
+
+  it("reports legacy pilot configuration with a fixed migration warning", async () => {
+    // Break caught: a legacy schema can be misreported as unrelated credential and Registry failures.
+    const machine = ports();
+    machine.checks.pilotConfiguration = async () => "warn";
+
+    const result = await createDoctor(machine).run({ format: "json" });
+
+    expect(result.checks.find((check) => check.id === "config.pilot-schema")).toEqual({
+      id: "config.pilot-schema",
+      status: "warn",
+      message: "Pilot configuration migration is required.",
+      remediation: "Run hq setup to create or migrate the pilot configuration."
+    });
+    await expect(doctorExitCode(result)).resolves.toBe(0);
   });
 
   it("does not downgrade an explicit failed Registry review to a warning", async () => {

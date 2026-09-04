@@ -10,7 +10,11 @@ The default source-installed layout is exact and bounded:
 - config: `${XDG_CONFIG_HOME}/orca-hq/pilot.json` when `XDG_CONFIG_HOME` is set, otherwise `~/.config/orca-hq/pilot.json`;
 - launchd: the single `com.orcahq.gateway` user LaunchAgent and its exact plist.
 
-Setup writes `databasePath` into that pilot configuration. Doctor, gateway composition, update, and uninstall validate the same secret-free configuration: gateway startup rejects a runtime database path that differs from `pilot.json`, and lifecycle commands reject missing, legacy, malformed, relative, or out-of-data-directory database configuration before source, launchd, SQLite, or filesystem mutation. Run setup again to migrate a legacy configuration safely after reviewing its preview.
+Setup writes `databasePath` into that pilot configuration. Doctor, gateway composition, update, and uninstall validate the same secret-free configuration: gateway startup rejects a runtime database path that differs from `pilot.json`, and lifecycle commands reject missing, legacy, malformed, relative, or out-of-data-directory database configuration before source, launchd, SQLite, or filesystem mutation.
+
+The read-only doctor distinguishes the exact prior three-field configuration (`schema`, `projectRegistryPath`, and `credentialAccounts`) from missing or arbitrary malformed input. It reports the dedicated `config.pilot-schema` check as `warn` with `Pilot configuration migration is required.` for that legacy shape, while still checking the recorded credential account names and Registry path. Missing or malformed configuration reports this check as `fail`; it is never treated as migratable legacy state.
+
+To migrate, run `pnpm hq setup`, review the non-secret preview, and confirm it. Leaving credential prompts blank preserves the legacy account names without reading, printing, or rewriting their Keychain secret values; credentials newly entered during this run are written to Keychain and merged with those names. Leaving the Registry prompt blank preserves the existing legacy Registry path. The confirmed write keeps those non-secret fields and adds the default `databasePath`; until then, update and uninstall remain fail-closed.
 
 ## Update safety contract
 
@@ -53,7 +57,7 @@ Any migration, restart, or doctor failure after backup triggers full rollback in
 3. Restore the database and configuration from the recorded backup, still excluding secrets.
 4. Restart the prior revision.
 
-Rollback attempts every step even if an earlier recovery action fails. The internal update error retains a stable `stage`, the original `cause`, the backup receipt when one exists, and `rollbackComplete`; a false value requires operator review before another update. The CLI deliberately prints only a fixed lifecycle failure message so provider, process, or credential text cannot cross the redaction boundary. Do not substitute broad process kills, parent-directory deletion, or an unrecorded backup.
+Rollback attempts every step even if an earlier recovery action fails. The internal update error retains a stable `stage`, the original `cause`, the backup receipt when one exists, and `rollbackComplete`; a false value requires operator review before another update. The CLI deliberately prints fixed messages so provider, process, path, or credential text cannot cross the redaction boundary. A configuration failure prints `Lifecycle configuration is missing or invalid; run hq setup to create or migrate it.`; other lifecycle provider failures retain the generic `Lifecycle operation failed.` message. Invalid update syntax and syntactically impossible uninstall arguments return usage status before loading configuration, while uninstall previews still load the safe lifecycle factory to derive their canonical paths. Do not substitute broad process kills, parent-directory deletion, or an unrecorded backup.
 
 For manual recovery, use only the paths and prior revision in the receipt, restore the program before its compatible database/config snapshot, then run the read-only doctor check. Retain a failed-update backup until the prior revision has restarted and doctor reports healthy.
 

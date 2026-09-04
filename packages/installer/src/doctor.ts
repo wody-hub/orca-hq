@@ -17,6 +17,7 @@ export type DoctorResult = z.infer<typeof DoctorResultSchema>;
 export type CheckStatus = DoctorCheck["status"];
 
 export const pilotCheckDefinitions = Object.freeze([
+  { key: "pilotConfiguration", id: "config.pilot-schema", label: "pilot configuration schema", remediation: "Run hq setup to create or migrate the pilot configuration." },
   { key: "macosCpu", id: "host.macos-cpu", label: "supported macOS and CPU", remediation: "Use a supported macOS host and CPU." },
   { key: "nodePnpm", id: "runtime.node-pnpm", label: "Node and pnpm", remediation: "Install the supported Node and pnpm versions." },
   { key: "orcaCapabilities", id: "orca.capabilities", label: "Orca version and capabilities", remediation: "Update Orca to a compatible version." },
@@ -53,6 +54,18 @@ function checkResult(
   definition: (typeof pilotCheckDefinitions)[number],
   status: CheckStatus
 ): DoctorCheck {
+  if (definition.key === "pilotConfiguration") {
+    return {
+      id: definition.id,
+      status,
+      message: status === "pass"
+        ? "Pilot configuration schema is current."
+        : status === "warn"
+          ? "Pilot configuration migration is required."
+          : "Pilot configuration is missing or invalid.",
+      ...(status === "pass" ? {} : { remediation: definition.remediation })
+    };
+  }
   return {
     id: definition.id,
     status,

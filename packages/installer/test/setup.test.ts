@@ -36,7 +36,7 @@ function ports(): SetupPorts & { keychain: RecordingKeychain; configFile: Record
     output,
     confirm: async () => true,
     checks: {
-      macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
+      pilotConfiguration: pass, macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
       claudeAuthentication: pass, tailscaleTailnet: pass, slackSocketMode: pass,
       telegramAllowlistedChat: pass, openAiVoice: pass, keychain: pass, sqliteDirectory: pass,
       launchd: pass, projectDiscovery: pass

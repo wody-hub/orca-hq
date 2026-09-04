@@ -28,6 +28,7 @@ export interface CliDependencies {
   readonly prompt?: GuidedPromptPort;
   readonly launchd?: LaunchdOperations;
   readonly lifecycle?: LifecycleComposition;
+  readonly lifecycleFactory?: () => Promise<LifecycleComposition>;
 }
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
@@ -99,14 +100,23 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
     }
   }
   if (selected === "update" || selected === "uninstall") {
+    if (selected === "update" && (input.length !== 3 || input[1] !== "--revision" || input[2] === undefined)) {
+      write(output, "Usage: hq update --revision <full-commit-sha>");
+      return 2;
+    }
+    const uninstallSyntaxValid = input.length === 1
+      || (input.length === 2 && input[1] === "--remove-data")
+      || (input.length === 3 && input[1] === "--confirm" && input[2] !== undefined)
+      || (input.length === 4 && input[1] === "--remove-data" && input[2] === "--confirm" && input[3] !== undefined);
+    if (selected === "uninstall" && !uninstallSyntaxValid) {
+      write(output, "Usage: hq uninstall [--confirm <exact-program-phrase> | --remove-data [--confirm <exact-program-and-data-phrase>]]");
+      return 2;
+    }
     try {
-      const lifecycle = dependencies.lifecycle ?? await createDefaultLifecycleHostComposition({ doctor: host.doctor });
+      const lifecycle = dependencies.lifecycle
+        ?? await (dependencies.lifecycleFactory ?? (() => createDefaultLifecycleHostComposition({ doctor: host.doctor })))();
       if (selected === "update") {
-        if (input.length !== 3 || input[1] !== "--revision" || input[2] === undefined) {
-          write(output, "Usage: hq update --revision <full-commit-sha>");
-          return 2;
-        }
-        const result = await lifecycle.update.run({ revision: input[2] });
+        const result = await lifecycle.update.run({ revision: input[2]! });
         write(output, JSON.stringify({
           previousRevision: result.previousRevision,
           revision: result.revision,
@@ -137,8 +147,10 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       }
       write(output, "Orca HQ lifecycle uninstall completed.");
       return 0;
-    } catch {
-      write(output, "Lifecycle operation failed.");
+    } catch (error) {
+      write(output, (error as { code?: unknown }).code === "lifecycle_config_invalid"
+        ? "Lifecycle configuration is missing or invalid; run hq setup to create or migrate it."
+        : "Lifecycle operation failed.");
       return 1;
     }
   }

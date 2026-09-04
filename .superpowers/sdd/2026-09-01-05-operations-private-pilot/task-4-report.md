@@ -176,3 +176,53 @@ uninstall은 program 삭제에도 exact path confirmation을 요구한다. 무�
 기존 `databasePath` 없는 legacy config는 추측 경로로 진행하지 않고 doctor/lifecycle/gateway에서 fail-closed 하므로, 운영자는 preview를 확인한 뒤 `hq setup`을 다시 실행해 명시적 필드를 기록해야 한다. 실제 Slack·Telegram·Tailscale·Keychain·launchd·운영 SQLite·credential/config는 변경하지 않았고 모든 destructive 외부 경계는 recording fake 또는 임시 디렉터리에서만 검증했다.
 
 원자 커밋 메시지: `fix(operations): align lifecycle paths and confirmations`.
+
+## Fix round 3/5
+
+### 결과
+
+신규 `B1`과 `B3`만 수정했다. current config 파서는 lifecycle의 fail-closed 정본으로 그대로 유지하고, 별도의 strict legacy inspection이 정확한 이전 3필드 config만 `legacy`로 분류한다. doctor는 `config.pilot-schema`를 current `pass`, legacy `warn`, missing·malformed `fail`로 고정 보고하면서 legacy의 credential account 이름과 Registry 경로로 실제 read-only 진단을 계속한다.
+
+setup은 legacy snapshot의 non-secret account 이름과 Registry 경로를 preflight와 확정 config에 보존하고 기본 `databasePath`를 추가한다. credential 입력을 비우면 Keychain secret을 읽거나 다시 쓰지 않으며, 새로 입력한 credential만 Keychain에 저장하고 기존 account 이름과 합친다. lifecycle CLI는 config 오류에만 `hq setup` 생성·마이그레이션 행동을 포함한 고정 문구를 내고, 다른 provider 실패에는 기존 일반 redacted 문구를 유지한다. update의 잘못된 인자와 문법적으로 불가능한 uninstall 인자는 lifecycle config factory 전에 usage exit 2로 거부하며, 실제 경로가 필요한 uninstall preview는 factory를 통과한다.
+
+### TDD RED 증거
+
+- `pnpm test packages/installer/test/doctor.test.ts packages/installer/test/host.test.ts packages/installer/test/setup.test.ts packages/installer/test/cli.test.ts packages/installer/test/lifecycle-host.test.ts` — exit 1, 8건 실패.
+- `B1`: 전용 `config.pilot-schema` check가 없어 doctor 단위 테스트와 missing/malformed host 진단이 `undefined`였고, legacy config는 `result.ok=false`로 credential/Registry 실패에 흡수됐다. blank credential setup migration과 신규 credential 병합도 preflight에서 중단됐다.
+- `B3`: config factory의 `lifecycle_config_invalid`가 `Lifecycle operation failed.`로 흡수됐고, 잘못된 update/uninstall 구문은 factory 오류 때문에 usage 2 대신 exit 1을 반환했다. preview용 factory 주입도 연결되지 않아 exit 1이었다.
+- 첫 GREEN 시도는 `host.ts`의 비동기 기본 인자 문법 오류로 3 suite가 transform 단계에서 멈췄다. `await`를 함수 본문으로 옮긴 뒤 같은 기능 가설로 재검증했다.
+
+### GREEN 근거
+
+- `packages/core/src/pilot-config.ts`는 current strict schema와 별개인 strict `LegacyPilotConfigSchema` 및 `inspectPilotConfigText`를 제공한다. 누락, JSON 파싱 실패, extra field를 포함한 임의 config는 legacy가 아니라 `missing`/`invalid`다. lifecycle은 계속 `parsePilotConfigText`만 사용하므로 마이그레이션 전 update/uninstall fail-closed가 유지된다.
+- `packages/installer/src/doctor.ts`와 `host.ts`는 고정 config schema check를 추가했다. legacy credential 진단은 password 출력 옵션 없이 `security find-generic-password`의 account 존재만 확인하고 Registry는 기록된 절대 경로를 읽는다. doctor 경계에는 mutation port 호출이 없다.
+- `packages/installer/src/setup.ts`와 `host.ts`는 한 setup 실행에서 읽은 legacy/current non-secret snapshot을 preflight와 config 생성에 재사용한다. blank credential migration은 Keychain write 0, 기존 account/path 보존, 기본 database 기록을 단언하며 신규 credential fixture는 새 값 1건만 Keychain에 쓰고 account 이름을 병합함을 단언한다.
+- `packages/installer/src/cli.ts`는 usage shape를 factory 전에 판정하고, config 오류 코드에만 고정 migration 행동을 노출한다. CLI 테스트는 update와 uninstall config 오류 양쪽에서 secret/path 원문 부재, 일반 provider 문구 비회귀, invalid syntax factory 0회, 두 preview factory 2회를 단언한다.
+
+### 변경 파일
+
+- config/doctor/setup/CLI 구현: `packages/core/src/pilot-config.ts`, `packages/installer/src/doctor.ts`, `host.ts`, `setup.ts`, `cli.ts`.
+- 테스트: `packages/installer/test/doctor.test.ts`, `host.test.ts`, `setup.test.ts`, `cli.test.ts`, `lifecycle-host.test.ts`.
+- 운영 문서/보고: `docs/operations/update-and-rollback.md`, 이 보고서.
+
+### 검증
+
+- focused: 5 files, 39 tests 통과.
+- installer 전체: 9 files, 86 tests 통과.
+- installer source typecheck와 installer test typecheck: 모두 통과.
+- root typecheck: 통과.
+- 전체 suite: 42 files, 641 tests 통과.
+- build: exit 0, root 실행 주체를 제외한 15개 workspace project 모두 `Done`.
+- `git diff --check`: 통과.
+
+### Self-review 및 비회귀
+
+- `B1`: legacy 판정은 exact strict schema 하나에만 열려 있고 doctor의 고정 경고와 setup migration이 같은 non-secret snapshot을 사용한다. setup은 confirmation 전에는 config/Keychain을 변경하지 않으며 기존 secret 조회·복사 경로가 없다.
+- `B3`: CLI는 오류 객체의 code만 비교하고 message/cause/path를 출력하지 않는다. 일반 provider redaction은 기존 테스트가 유지하며 preview에는 canonical program/data path가 필요하므로 안전한 factory 통과 계약도 유지한다.
+- `N1`: current `databasePath`는 여전히 gateway/lifecycle 정본이고 legacy에는 추측 database를 제공하지 않는다. `N2`: uninstall 서비스의 active-work, exact confirmation, 보호 경로 검사는 변경하지 않았다. `N3`: setup/doctor/lifecycle의 XDG-aware config path helper와 backup/restore 경로는 그대로 유지됐다. 전체 installer 및 repository suite가 기존 회귀 테스트를 모두 통과했다.
+
+### 남은 우려
+
+실제 Slack·Telegram·Tailscale·Keychain·launchd·운영 SQLite·Orca credential/config는 변경하지 않았다. 테스트의 credential 확인과 저장은 recording machine 경계만 사용했고 secret 원문은 config/CLI 출력에 포함되지 않았다. `B2`, `B4`, `B5`와 이전 deferred Minor는 계약대로 이번 범위에서 재설계하지 않았다.
+
+원자 커밋 메시지: `fix(installer): support safe config migration`.

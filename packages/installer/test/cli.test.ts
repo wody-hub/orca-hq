@@ -10,7 +10,7 @@ function passingDoctor(): DoctorPorts {
   const pass = async () => "pass" as const;
   return {
     checks: {
-      macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
+      pilotConfiguration: pass, macosCpu: pass, nodePnpm: pass, orcaCapabilities: pass, codexAuthentication: pass,
       claudeAuthentication: pass, tailscaleTailnet: pass, slackSocketMode: pass,
       telegramAllowlistedChat: pass, openAiVoice: pass, keychain: pass, sqliteDirectory: pass,
       launchd: pass, projectDiscovery: pass
@@ -207,6 +207,75 @@ describe("hq command-line contract", () => {
 
     expect(stdout.lines.join("\n")).toContain("Lifecycle operation failed.");
     expect(stdout.lines.join("\n")).not.toContain("provider-secret-token");
+  });
+
+  it("reports lifecycle configuration failures with a fixed setup action and no raw details", async () => {
+    // Break caught: an invalid pilot config can be absorbed into the generic provider failure with no recovery action.
+    for (const input of [
+      ["update", "--revision", "a".repeat(40)],
+      ["uninstall"]
+    ]) {
+      const stdout = output();
+      const lifecycleFactory = async (): Promise<LifecycleComposition> => {
+        throw Object.assign(new Error("secret=/tmp/private/pilot.json"), { code: "lifecycle_config_invalid" });
+      };
+
+      await expect(runCli(input, { stdout, lifecycleFactory })).resolves.toBe(1);
+
+      expect(stdout.lines).toEqual([
+        "Lifecycle configuration is missing or invalid; run hq setup to create or migrate it.\n"
+      ]);
+      expect(stdout.lines.join("\n")).not.toContain("secret=");
+      expect(stdout.lines.join("\n")).not.toContain("/tmp/private/pilot.json");
+    }
+  });
+
+  it("rejects impossible lifecycle syntax before creating the lifecycle host", async () => {
+    // Break caught: a typo can invoke config loading first and be misreported as a configuration failure.
+    let factoryCalls = 0;
+    const lifecycleFactory = async (): Promise<LifecycleComposition> => {
+      factoryCalls += 1;
+      throw new Error("factory must not run");
+    };
+
+    for (const input of [
+      ["update"],
+      ["update", "--revision"],
+      ["update", "--wrong", "a".repeat(40)],
+      ["uninstall", "--wrong"],
+      ["uninstall", "--confirm"],
+      ["uninstall", "--confirm", "phrase", "extra"]
+    ]) {
+      const stdout = output();
+      await expect(runCli(input, { stdout, lifecycleFactory })).resolves.toBe(2);
+      expect(stdout.lines.join("\n")).toContain("Usage: hq");
+    }
+
+    expect(factoryCalls).toBe(0);
+  });
+
+  it("creates the lifecycle host for uninstall path previews", async () => {
+    // Break caught: moving every uninstall form ahead of the factory can produce a preview without canonical paths.
+    let factoryCalls = 0;
+    const subject: LifecycleComposition = {
+      update: { async run() { throw new Error("unexpected update"); } },
+      uninstall: {
+        programPath: "/pilot/program",
+        dataPath: "/pilot/data",
+        programConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program",
+        dataConfirmationPhrase: "REMOVE ORCA HQ PROGRAM AT /pilot/program AND DATA AT /pilot/data",
+        async run() { throw new Error("unexpected uninstall"); }
+      }
+    };
+    const lifecycleFactory = async (): Promise<LifecycleComposition> => {
+      factoryCalls += 1;
+      return subject;
+    };
+
+    await expect(runCli(["uninstall"], { stdout: output(), lifecycleFactory })).resolves.toBe(2);
+    await expect(runCli(["uninstall", "--remove-data"], { stdout: output(), lifecycleFactory })).resolves.toBe(2);
+
+    expect(factoryCalls).toBe(2);
   });
 
   it("uses the host adapter factory for doctor and emits only JSON on stdout", async () => {

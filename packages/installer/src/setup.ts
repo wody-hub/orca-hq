@@ -17,6 +17,10 @@ export interface SetupPorts extends DoctorPorts {
   readonly keychain: KeychainPort;
   readonly configFile: ConfigFilePort;
   readonly output: SetupOutputPort;
+  readonly existingConfig?: () => Promise<Readonly<{
+    projectRegistryPath: string;
+    credentialAccounts: readonly string[];
+  }> | undefined>;
   /** Called only after the non-secret plan and config destination were displayed. */
   confirm(): Promise<boolean>;
 }
@@ -33,11 +37,16 @@ export interface SetupResult {
 
 export type { PilotCheckPorts, RegistryReviewPort };
 
-function credentialAccounts(credentials: Readonly<Record<string, string>>): string[] {
-  return Object.entries(credentials)
+function credentialAccounts(
+  credentials: Readonly<Record<string, string>>,
+  existing: readonly string[] = []
+): string[] {
+  return [...new Set([
+    ...existing,
+    ...Object.entries(credentials)
     .filter(([, value]) => value.length > 0)
     .map(([account]) => account)
-    .sort();
+  ])].sort();
 }
 
 export function createSetup(ports: SetupPorts): Readonly<{
@@ -51,11 +60,15 @@ export function createSetup(ports: SetupPorts): Readonly<{
         return Object.freeze({ ok: false, checks: preflight.checks });
       }
 
-      const accounts = credentialAccounts(answers.credentials);
+      const existing = await ports.existingConfig?.();
+      const accounts = credentialAccounts(answers.credentials, existing?.credentialAccounts);
+      const registryPath = answers.registryPath.trim().length > 0
+        ? answers.registryPath
+        : existing?.projectRegistryPath ?? answers.registryPath;
       const config = createConfigText({
         schema: "orca-hq.private-pilot.v1",
         databasePath: ports.databasePath,
-        projectRegistryPath: answers.registryPath,
+        projectRegistryPath: registryPath,
         credentialAccounts: accounts
       });
       ports.output.write(`Planned configuration: ${ports.configFile.path}`);

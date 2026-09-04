@@ -7,8 +7,12 @@ import { createSetup } from "../src/setup.js";
 class RecordingMachine implements HostMachinePort {
   readonly requests: string[] = [];
   readonly mutations: string[] = [];
+  writtenConfig: string | undefined;
 
-  constructor(private readonly hasConfig = true) {}
+  constructor(private readonly options: Readonly<{
+    config?: "current" | "legacy" | "missing" | "malformed" | "arbitrary";
+    legacyAccounts?: readonly string[];
+  }> = {}) {}
 
   platform(): string { this.requests.push("platform"); return "darwin"; }
   architecture(): string { this.requests.push("architecture"); return "arm64"; }
@@ -21,19 +25,29 @@ class RecordingMachine implements HostMachinePort {
   }
   async readText(path: string): Promise<string | undefined> {
     this.requests.push(`read:${path}`);
-    if (path.endsWith("pilot.json") && this.hasConfig) {
-      return JSON.stringify({
+    if (path.endsWith("pilot.json")) {
+      const config = this.options.config ?? "current";
+      if (config === "missing") return undefined;
+      if (config === "malformed") return "{not-json";
+      const snapshot: Record<string, unknown> = {
         schema: "orca-hq.private-pilot.v1",
-        databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
         projectRegistryPath: "/temporary/projects.yaml",
-        credentialAccounts: ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
-      });
+        credentialAccounts: this.options.legacyAccounts ?? ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
+      };
+      if (config === "arbitrary") snapshot.unexpected = "not-a-legacy-config";
+      if (config === "current") {
+        snapshot.databasePath = "/temporary/home/Library/Application Support/orca-hq/control.sqlite";
+      }
+      return JSON.stringify(snapshot);
     }
     return "projects:\n  - one\n  - two\n  - three\n  - four\n  - five\n";
   }
   async directoryWritable(path: string): Promise<boolean> { this.requests.push(`access:${path}`); return true; }
   async createDirectory(path: string): Promise<void> { this.mutations.push(`mkdir:${path}`); }
-  async writeText(path: string): Promise<void> { this.mutations.push(`write:${path}`); }
+  async writeText(path: string, text: string): Promise<void> {
+    this.mutations.push(`write:${path}`);
+    this.writtenConfig = text;
+  }
   async storeKeychainSecret(_service: string, account: string): Promise<void> { this.mutations.push(`keychain:${account}`); }
 }
 
@@ -72,6 +86,38 @@ describe("macOS host adapters", () => {
     expect(machine.requests).toContain("access:/temporary/config");
   });
 
+  it("diagnoses a legacy config as migration-needed while preserving credential and Registry checks", async () => {
+    // Break caught: dropping legacy fields during parsing makes healthy Keychain accounts and Registry look unavailable.
+    const machine = new RecordingMachine({ config: "legacy" });
+
+    const result = await createDoctor(createMacosHostAdapters(machine).doctor).run({ format: "json" });
+
+    expect(result.ok).toBe(true);
+    expect(result.checks.find((check) => check.id === "config.pilot-schema")?.status).toBe("warn");
+    expect(result.checks.find((check) => check.id === "slack.socket-mode")?.status).toBe("pass");
+    expect(result.checks.find((check) => check.id === "telegram.allowlisted-chat")?.status).toBe("pass");
+    expect(result.checks.find((check) => check.id === "openai.voice")?.status).toBe("pass");
+    expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("pass");
+    expect(machine.mutations).toEqual([]);
+    expect(machine.requests.filter((request) => request.startsWith("command:security:find-generic-password"))).toHaveLength(5);
+    expect(machine.requests.join("\n")).not.toContain(" -w ");
+  });
+
+  it("fails the dedicated config check for missing and arbitrary malformed config", async () => {
+    // Break caught: missing or malformed input can accidentally enter the narrow legacy migration branch.
+    for (const config of ["missing", "malformed", "arbitrary"] as const) {
+      const machine = new RecordingMachine({ config });
+
+      const result = await createDoctor(createMacosHostAdapters(machine).doctor).run({ format: "json" });
+
+      expect(result.ok).toBe(false);
+      expect(result.checks.find((check) => check.id === "config.pilot-schema")?.status).toBe("fail");
+      expect(result.checks.find((check) => check.id === "slack.socket-mode")?.status).toBe("fail");
+      expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("fail");
+      expect(machine.mutations).toEqual([]);
+    }
+  });
+
   it("records real setup writes, proving the doctor read-only fake is not a no-op", async () => {
     // Break caught: if recording mutations is disconnected, the preceding no-mutation assertion would be vacuous.
     const machine = new RecordingMachine();
@@ -94,7 +140,7 @@ describe("macOS host adapters", () => {
 
   it("allows a fresh guided setup to validate the supplied plan before it exists on disk", async () => {
     // Break caught: a new source installation must not require a pre-existing config or Keychain entry before it can create either.
-    const machine = new RecordingMachine(false);
+    const machine = new RecordingMachine({ config: "missing" });
     const adapters = createMacosHostAdapters(machine);
     const answers = {
       credentials: {
@@ -109,5 +155,43 @@ describe("macOS host adapters", () => {
 
     expect(result.ok).toBe(true);
     expect(machine.mutations).toContain("write:/temporary/config/orca-hq/pilot.json");
+  });
+
+  it("migrates a legacy config with blank inputs without reading or rewriting Keychain secrets", async () => {
+    // Break caught: setup can require every secret again or erase legacy account names during migration.
+    const machine = new RecordingMachine({ config: "legacy" });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials: {}, registryPath: "" };
+
+    const result = await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers);
+
+    expect(result.ok).toBe(true);
+    expect(machine.mutations.filter((mutation) => mutation.startsWith("keychain:"))).toEqual([]);
+    expect(machine.requests.join("\n")).not.toContain(" -w ");
+    expect(JSON.parse(machine.writtenConfig ?? "{}")).toEqual({
+      schema: "orca-hq.private-pilot.v1",
+      databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
+      projectRegistryPath: "/temporary/projects.yaml",
+      credentialAccounts: ["openai-api-key", "slack-app-token", "slack-channel-id", "telegram-allowed-chat-id", "telegram-bot-token"]
+    });
+  });
+
+  it("merges a newly entered credential with legacy account names", async () => {
+    // Break caught: entering one new credential can replace every preserved account name in pilot.json.
+    const machine = new RecordingMachine({
+      config: "legacy",
+      legacyAccounts: ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id"]
+    });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials: { "openai-api-key": "new-secret" }, registryPath: "" };
+
+    const result = await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers);
+
+    expect(result.ok).toBe(true);
+    expect(machine.mutations.filter((mutation) => mutation.startsWith("keychain:"))).toEqual(["keychain:openai-api-key"]);
+    expect(JSON.parse(machine.writtenConfig ?? "{}")).toMatchObject({
+      projectRegistryPath: "/temporary/projects.yaml",
+      credentialAccounts: ["openai-api-key", "slack-app-token", "slack-channel-id", "telegram-allowed-chat-id", "telegram-bot-token"]
+    });
   });
 });
