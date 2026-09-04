@@ -7,17 +7,11 @@ import {
   renameSync,
   rmSync
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
-const backupDirectory = mkdtempSync(join(tmpdir(), "orca-hq-dist-backup-"));
-const originalOutputsDirectory = join(backupDirectory, "original");
-const generatedOutputsDirectory = join(backupDirectory, "generated");
-mkdirSync(originalOutputsDirectory);
-mkdirSync(generatedOutputsDirectory);
 const workspaceDirectories = ["packages", "apps"].flatMap((parentName) => {
   const parentDirectory = join(workspaceRoot, parentName);
   return readdirSync(parentDirectory, { withFileTypes: true })
@@ -113,9 +107,21 @@ function assertExactWorkspaceDist(expectedOutputs, phase) {
 }
 
 let verificationError;
-let restorationError;
+const restorationErrors = [];
+let backupComplete = false;
+let backupDirectory;
+let originalOutputsDirectory;
+let generatedOutputsDirectory;
 
 try {
+  const stagingRoot = join(workspaceRoot, ".clean-workspace-staging");
+  mkdirSync(stagingRoot, { recursive: true });
+  backupDirectory = mkdtempSync(join(stagingRoot, "run-"));
+  originalOutputsDirectory = join(backupDirectory, "original");
+  generatedOutputsDirectory = join(backupDirectory, "generated");
+  mkdirSync(originalOutputsDirectory);
+  mkdirSync(generatedOutputsDirectory);
+
   for (const { relativePath, outputPath } of workspaceDirectories) {
     if (!existsSync(outputPath)) continue;
 
@@ -125,6 +131,7 @@ try {
     movedOutputs.push({ outputPath, backupPath });
   }
 
+  backupComplete = true;
   assertNoWorkspaceDist();
   run("pnpm", ["prepare"]);
   assertExactWorkspaceDist(prepareOutputs, "clean prepare");
@@ -135,27 +142,49 @@ try {
 } catch (error) {
   verificationError = error;
 } finally {
-  try {
+  if (backupComplete && generatedOutputsDirectory !== undefined) {
     for (const { relativePath, outputPath } of workspaceDirectories) {
-      if (existsSync(outputPath)) {
-        const generatedPath = join(generatedOutputsDirectory, relativePath);
+      if (!existsSync(outputPath)) continue;
+      const generatedPath = join(generatedOutputsDirectory, relativePath);
+      try {
         mkdirSync(dirname(generatedPath), { recursive: true });
         renameSync(outputPath, generatedPath);
+      } catch (error) {
+        restorationErrors.push(error);
       }
     }
-    for (const { outputPath, backupPath } of movedOutputs) {
-      renameSync(backupPath, outputPath);
+  }
+  for (const { outputPath, backupPath } of movedOutputs) {
+    if (existsSync(outputPath)) {
+      restorationErrors.push(
+        new Error(`Refusing to overwrite ${outputPath} while restoring its original dist`)
+      );
+      continue;
     }
-    rmSync(backupDirectory, { recursive: true });
-  } catch (error) {
-    restorationError = error;
+    try {
+      renameSync(backupPath, outputPath);
+    } catch (error) {
+      restorationErrors.push(error);
+    }
+  }
+  if (restorationErrors.length === 0 && backupDirectory !== undefined) {
+    try {
+      rmSync(backupDirectory, { recursive: true });
+    } catch (error) {
+      restorationErrors.push(error);
+    }
   }
 }
 
-if (restorationError !== undefined) {
+if (restorationErrors.length > 0) {
+  const retentionLocation = backupDirectory === undefined
+    ? "before a backup directory was created"
+    : `backup retained at ${backupDirectory}`;
   throw new AggregateError(
-    verificationError === undefined ? [restorationError] : [verificationError, restorationError],
-    `clean-workspace verification could not restore dist outputs; backup retained at ${backupDirectory}`
+    verificationError === undefined
+      ? restorationErrors
+      : [verificationError, ...restorationErrors],
+    `clean-workspace verification could not restore dist outputs; ${retentionLocation}`
   );
 }
 if (verificationError !== undefined) {

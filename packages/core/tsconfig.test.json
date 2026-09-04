@@ -6,6 +6,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "test/clean-workspace-verifier.test.ts",
     "test/workspace.test.ts"
   ]
 }

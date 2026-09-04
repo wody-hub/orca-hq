@@ -1,4 +1,5 @@
 .worktrees/
+.clean-workspace-staging/
 .superpowers/
 .artifacts/
 apps/web/test-results/
