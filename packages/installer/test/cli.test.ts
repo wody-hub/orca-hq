@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { runCli, type HostAdapters } from "../src/cli.js";
 import type { DoctorPorts } from "../src/doctor.js";
+import type { LaunchdOperations, LaunchdStatus } from "../src/launchd.js";
 import type { GuidedPromptPort } from "../src/prompt.js";
 
 function passingDoctor(): DoctorPorts {
@@ -63,6 +64,17 @@ function guidedPrompt(credentials: Readonly<Record<string, string>> = {}): Guide
     collectSetupAnswers: async () => ({ credentials, registryPath: "/temporary/projects.yaml" }),
     confirm: async () => true,
     close: () => { closeCalls += 1; }
+  };
+}
+
+function launchd(status: LaunchdStatus = { state: "running", pid: 428 }): LaunchdOperations & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    async install() { calls.push("install"); },
+    async start() { calls.push("start"); },
+    async stop() { calls.push("stop"); },
+    async status() { calls.push("status"); return status; }
   };
 }
 
@@ -147,6 +159,43 @@ describe("hq command-line contract", () => {
 
     await expect(runCli(["missing"], { stdout })).resolves.toBe(2);
     await expect(runCli(["doctor", "--format", "text"], { stdout })).resolves.toBe(2);
-    await expect(runCli(["start"], { stdout })).resolves.toBe(1);
+    await expect(runCli(["logs"], { stdout })).resolves.toBe(1);
+  });
+
+  it("installs and starts the LaunchAgent through the reserved start surface", async () => {
+    // Break caught: `pnpm hq start` remains a placeholder and never installs the user LaunchAgent.
+    const stdout = output();
+    const service = launchd();
+
+    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(0);
+
+    expect(service.calls).toEqual(["install", "start"]);
+    expect(stdout.lines).toEqual(["Orca HQ gateway started.\n"]);
+  });
+
+  it("stops and reports status through the exact LaunchAgent operations", async () => {
+    // Break caught: stop/status bypass the injected service boundary or expose raw launchctl output.
+    const stopOutput = output();
+    const statusOutput = output();
+    const service = launchd({ state: "stopped" });
+
+    await expect(runCli(["stop"], { stdout: stopOutput, launchd: service })).resolves.toBe(0);
+    await expect(runCli(["status"], { stdout: statusOutput, launchd: service })).resolves.toBe(1);
+
+    expect(service.calls).toEqual(["stop", "status"]);
+    expect(stopOutput.lines).toEqual(["Orca HQ gateway stopped.\n"]);
+    expect(statusOutput.lines).toEqual([`${JSON.stringify({ state: "stopped" })}\n`]);
+  });
+
+  it("returns a redacted failure when a launchd operation rejects", async () => {
+    // Break caught: launchctl stderr or command details can leak through the CLI service boundary.
+    const stdout = output();
+    const service = launchd();
+    service.start = async () => { throw new Error("TOKEN=launchd-secret"); };
+
+    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(1);
+
+    expect(stdout.lines.join("\n")).toContain("Gateway service operation failed.");
+    expect(stdout.lines.join("\n")).not.toContain("launchd-secret");
   });
 });

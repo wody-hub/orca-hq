@@ -1,4 +1,5 @@
 import { validateGatewayConfig, type GatewayConfig, type ValidatedGatewayConfig } from "./config.js";
+import { reconcileStartup, type ReconcilePorts } from "./reconcile.js";
 
 export type { GatewayConfig } from "./config.js";
 
@@ -100,12 +101,16 @@ export interface GatewayAuditPort {
   }>): Promise<void> | void;
 }
 
+export type GatewayReconcilePort =
+  | (() => Promise<readonly GatewayDiagnostic[] | void>)
+  | ReconcilePorts;
+
 export interface RuntimeAdapters {
   readonly config: GatewayConfigPort;
   readonly database: GatewayDatabasePort;
   readonly orca: GatewayOrcaPort;
   /** Reconciles durable queues, channel cursors, Outbox claims, and nonterminal Orca state. */
-  readonly reconcile: () => Promise<readonly GatewayDiagnostic[] | void>;
+  readonly reconcile: GatewayReconcilePort;
   readonly http: GatewayIngressPort;
   /** Runs after the loopback listener exists so its configured Serve upstream can be compared. */
   readonly diagnoseHttp?: (() => Promise<readonly GatewayDiagnostic[]>) | undefined;
@@ -173,7 +178,7 @@ export class Gateway {
       this.#throwIfStopRequested();
       await this.#adapters.orca.check();
       this.#throwIfStopRequested();
-      this.#recordDiagnostics(await this.#adapters.reconcile());
+      this.#recordDiagnostics(await this.#reconcile());
       this.#throwIfStopRequested();
       await this.#adapters.http.start();
       this.#httpStarted = true;
@@ -300,6 +305,22 @@ export class Gateway {
   #recordDiagnostics(diagnostics: readonly GatewayDiagnostic[] | void): void {
     if (diagnostics === undefined) return;
     for (const diagnostic of diagnostics) this.#recordDiagnostic(diagnostic);
+  }
+
+  async #reconcile(): Promise<readonly GatewayDiagnostic[] | void> {
+    if (typeof this.#adapters.reconcile === "function") {
+      return this.#adapters.reconcile();
+    }
+    const report = await reconcileStartup(this.#adapters.reconcile);
+    const activeDispatches = report.filter(({ state }) => state !== "completed").length;
+    return activeDispatches === 0
+      ? []
+      : [Object.freeze({
+          component: "reconciliation" as const,
+          code: "reconciliation_incomplete" as const,
+          activeRuns: 0,
+          activeDispatches
+        })];
   }
 
   #recordDiagnostic(diagnostic: GatewayDiagnostic): void {

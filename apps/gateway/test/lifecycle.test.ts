@@ -109,6 +109,45 @@ describe("Gateway lifecycle", () => {
     ]);
   });
 
+  it("runs structured startup reconciliation before opening command ingress", async () => {
+    // Break caught: lifecycle can invoke one opaque hook and open HTTP before claims, cursors, locks, and Outbox are recovered.
+    const events: string[] = [];
+    const adapters: RuntimeAdapters = { ...runtime(events), reconcile: {
+      store: {
+        async recoverOutboxClaims() { events.push("claims.recovered"); },
+        async listNonterminalDispatches() {
+          events.push("dispatches.listed");
+          return [{ dispatchId: "dispatch-1", receipt: { id: "start-1" } }];
+        }
+      },
+      channels: { async resumeCursors() { events.push("cursors.resumed"); } },
+      orca: {
+        async inspectDispatch() { events.push("orca.inspected"); return { kind: "running" as const }; }
+      },
+      locks: { async reviewExpired() { events.push("locks.reviewed"); } },
+      outbox: { async drain() { events.push("outbox.drained"); } }
+    } };
+    const gateway = await createGateway(config, adapters);
+
+    await gateway.start();
+
+    expect(events).toEqual([
+      "config.valid",
+      "db.migrated",
+      "orca.checked",
+      "claims.recovered",
+      "cursors.resumed",
+      "dispatches.listed",
+      "orca.inspected",
+      "locks.reviewed",
+      "outbox.drained",
+      "http.started",
+      "outbox.started",
+      "slack.started",
+      "telegram.started"
+    ]);
+  });
+
   it("continues in degraded mode when one channel fails after durable recovery", async () => {
     // Break caught: one external channel outage either prevents safe ingress from other channels or leaks provider details.
     const events: string[] = [];

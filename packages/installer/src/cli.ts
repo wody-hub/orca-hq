@@ -5,6 +5,12 @@ import { fileURLToPath } from "node:url";
 
 import { createDoctor, doctorExitCode, type DoctorPorts } from "./doctor.js";
 import { createMacosHostAdapters, type HostAdapters } from "./host.js";
+import {
+  createLaunchdOperations,
+  createNodeLaunchdPort,
+  defaultLaunchdPaths,
+  type LaunchdOperations
+} from "./launchd.js";
 import { createTerminalPrompt, type GuidedPromptPort } from "./prompt.js";
 import { createSetup, type SetupPorts } from "./setup.js";
 
@@ -19,6 +25,7 @@ export interface CliDependencies {
   readonly stdout?: Pick<typeof process.stdout, "write">;
   readonly host?: HostAdapters;
   readonly prompt?: GuidedPromptPort;
+  readonly launchd?: LaunchdOperations;
 }
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
@@ -60,6 +67,29 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       return 1;
     } finally {
       prompt.close();
+    }
+  }
+  if (selected === "start" || selected === "stop" || selected === "status") {
+    const launchd = dependencies.launchd
+      ?? createLaunchdOperations(defaultLaunchdPaths(), createNodeLaunchdPort());
+    try {
+      if (selected === "start") {
+        await launchd.install();
+        await launchd.start();
+        write(output, "Orca HQ gateway started.");
+        return 0;
+      }
+      if (selected === "stop") {
+        await launchd.stop();
+        write(output, "Orca HQ gateway stopped.");
+        return 0;
+      }
+      const status = await launchd.status();
+      write(output, JSON.stringify(status));
+      return status.state === "stopped" ? 1 : 0;
+    } catch {
+      write(output, "Gateway service operation failed.");
+      return 1;
     }
   }
   write(output, `hq ${selected} is reserved for the private-pilot service adapter.`);

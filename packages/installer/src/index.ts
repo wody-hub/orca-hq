@@ -3,5 +3,6 @@ export * from "./config-files.js";
 export * from "./doctor.js";
 export * from "./host.js";
 export * from "./keychain.js";
+export * from "./launchd.js";
 export * from "./prompt.js";
 export * from "./setup.js";
