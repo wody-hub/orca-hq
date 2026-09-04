@@ -97,7 +97,7 @@ git diff --check
 
 ### TDD 기록
 
-RED는 `packages/observability/test/redaction.test.ts`의 `lets an external root TypeScript consumer resolve the public name to the source entry`로 시작했다. 이 테스트는 `packages/core/src/observability-consumer.ts`를 consumer 위치로 하여 루트 `tsconfig.json`을 실제 TypeScript resolver에 전달하고, 공개 패키지 이름이 source entry로 해석되는지를 검증한다. 구현 전 `pnpm test packages/observability/test/redaction.test.ts`는 예상대로 `expected undefined to be '/Users/j.jaeyo/orca/workspaces/orca-hq/hq-channels-agents/packages/observability/src/index.ts'`로 실패했다.
+RED는 `packages/observability/test/redaction.test.ts`의 `lets an external root TypeScript consumer resolve the public name to the source entry`로 시작했다. 이 테스트는 `packages/core/src/observability-consumer.ts`를 consumer 위치로 하여 루트 `tsconfig.json`을 실제 TypeScript resolver에 전달하고, 공개 패키지 이름이 source entry로 해석되는지를 검증한다. 구현 전 `pnpm test packages/observability/test/redaction.test.ts`는 예상대로 `expected undefined to be '/tmp/orca-hq-synthetic/packages/observability/src/index.ts'`로 실패했다.
 
 `tsconfig.json` paths와 `vitest.config.ts` alias에 `@orca-hq/observability`를 기존 워크스페이스 패키지와 같은 source entry 형식으로 각각 한 건씩 추가한 뒤 GREEN을 확인했다. 함께 추가한 `loads the public name at the Vitest runtime boundary`는 실제 dynamic import로 공개 이름의 Vitest runtime 로드를 검증하며, 설정 소스 문자열을 비교하지 않는다.
 

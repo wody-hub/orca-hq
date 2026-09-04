@@ -280,8 +280,8 @@ git commit -m "feat(persistence): add durable command store"
 
 ```ts
 it("selects an exact approved alias", () => {
-  const result = routeProject({ text: "리스크제로 백엔드 테스트해줘" }, entries);
-  expect(result).toEqual(expect.objectContaining({ kind: "selected", projectKey: "riskzero-api", score: 1 }));
+  const result = routeProject({ text: "샌드박스 백엔드 테스트해줘" }, entries);
+  expect(result).toEqual(expect.objectContaining({ kind: "selected", projectKey: "sandbox-api", score: 1 }));
 });
 
 it("asks when the winner margin is below 0.15", () => {
