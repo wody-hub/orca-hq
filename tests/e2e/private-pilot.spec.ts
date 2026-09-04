@@ -16,6 +16,9 @@ import {
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const acceptanceRunner = join(repositoryRoot, "scripts/run-pilot-acceptance.mjs");
+const coldAcceptanceProcessTimeoutMs = 30_000;
+const validationProcessTimeoutMs = 5_000;
+const repositoryBoundaryTestTimeoutMs = 45_000;
 
 describe("deterministic private-pilot acceptance", () => {
   it("maps every scripted criterion exactly once without claiming live readiness", async () => {
@@ -136,7 +139,11 @@ describe("deterministic private-pilot acceptance", () => {
         "1",
         "--output",
         output
-      ], { cwd: join(repositoryRoot, "apps"), encoding: "utf8" });
+      ], {
+        cwd: join(repositoryRoot, "apps"),
+        encoding: "utf8",
+        timeout: coldAcceptanceProcessTimeoutMs
+      });
       const report = JSON.parse(await readFile(output, "utf8")) as Record<string, unknown>;
       expect(report).toMatchObject({
         evidenceMode: "deterministic_simulation",
@@ -153,7 +160,11 @@ describe("deterministic private-pilot acceptance", () => {
         "1",
         "--output",
         repositoryOutput
-      ], { cwd: join(repositoryRoot, "apps"), encoding: "utf8" })).rejects.toMatchObject({
+      ], {
+        cwd: join(repositoryRoot, "apps"),
+        encoding: "utf8",
+        timeout: validationProcessTimeoutMs
+      })).rejects.toMatchObject({
         code: 2,
         stderr: "pilot_acceptance_invalid_arguments\n"
       });
@@ -164,7 +175,10 @@ describe("deterministic private-pilot acceptance", () => {
         "0",
         "--output",
         resolve(repositoryRoot, "pilot-report.json")
-      ], { encoding: "utf8" })).rejects.toMatchObject({
+      ], {
+        encoding: "utf8",
+        timeout: validationProcessTimeoutMs
+      })).rejects.toMatchObject({
         code: 2,
         stderr: "pilot_acceptance_invalid_arguments\n"
       });
@@ -172,5 +186,5 @@ describe("deterministic private-pilot acceptance", () => {
       await rm(outputDirectory, { recursive: true, force: true });
       await rm(repositoryOutput, { force: true });
     }
-  }, 20_000);
+  }, repositoryBoundaryTestTimeoutMs);
 });
