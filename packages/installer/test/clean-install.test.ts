@@ -40,11 +40,15 @@ async function run(
 ): Promise<ProcessResult> {
   return await new Promise((resolvePromise, reject) => {
     execFile(command, [...arguments_], options, (error, stdout, stderr) => {
-      if (error !== null && typeof error.code !== "number") {
+      if (error === null) {
+        resolvePromise({ exitCode: 0, stdout, stderr });
+        return;
+      }
+      if (typeof error.code !== "number") {
         reject(error);
         return;
       }
-      resolvePromise({ exitCode: error === null ? 0 : error.code, stdout, stderr });
+      resolvePromise({ exitCode: error.code, stdout, stderr });
     });
   });
 }

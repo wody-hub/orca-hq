@@ -8,7 +8,7 @@
     "build": "pnpm -r build",
     "prepare": "pnpm --filter @orca-hq/core build && pnpm --filter @orca-hq/installer build",
     "typecheck": "tsc -p tsconfig.json --noEmit && pnpm typecheck:tests",
-    "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit",
+    "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit && pnpm -r --if-present run typecheck:test",
     "test": "vitest run",
     "test:watch": "vitest",
     "verify:clean": "node scripts/verify-clean-workspace.mjs"

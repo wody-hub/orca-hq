@@ -6,6 +6,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "test/clean-install.test.ts",
     "test/cli.test.ts",
     "test/launchd.test.ts",
     "test/lifecycle-commands.test.ts",
