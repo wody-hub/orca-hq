@@ -1,4 +1,4 @@
-import {readFile} from 'node:fs/promises';
+import {readFile,mkdir} from 'node:fs/promises';
 import {openDatabase} from '@orca-hq/persistence';
 import {homedir} from 'node:os';
 import {dirname,join} from 'node:path';
@@ -11,8 +11,9 @@ import {createOrcaObserver} from './managed-observe.js';
 import {createManagedCommands} from './managed-commands.js';
 import {startManagedService} from './managed-service.js';
 import {createLocalChannels} from './local-channels.js';
-import {createManagedConversation} from './managed-conversation.js';
-import {interpretConversation} from './conversation-ai.js';
+import {createAgentConversation,agentInstructions} from './agent-conversation.js';
+import {createCodexSessionClient} from './codex-session.js';
+import {createAgentTools} from './agent-tools.js';
 import {createProjectLocations} from './project-locations.js';
 
 export async function startManagedRuntime(){
@@ -28,7 +29,15 @@ export async function startManagedRuntime(){
  const engine=createOrcaRelay({databasePath:join(directory,'orca-relay.sqlite'),coordinatorHandle:coordinator.coordinatorHandle,onUpdate:async job=>{await service?.notify(job);}});
  const catalog=createProjectCatalog({directory,legacyRegistryPath:config.projectRegistryPath,defaultSensitivePaths:['.env','.env.*','**/*.pem'],isBusy:id=>engine.isBusy(id)});
  const commands=createManagedCommands({catalog,jobs:engine,observe:(project,intent)=>createOrcaObserver().observe(project,intent)});
- const conversation=createManagedConversation({directory,catalog,execute:input=>commands.execute(input),interpret:interpretConversation,locations:createProjectLocations()});
+ const locations=createProjectLocations();
+ const tools=createAgentTools({catalog,execute:input=>commands.execute(input),locations});
+ const agentDirectory=join(directory,'agent-workspace');await mkdir(agentDirectory,{recursive:true,mode:0o700});
+ const client=createCodexSessionClient({cwd:agentDirectory,instructions:agentInstructions,tools:tools.specs});
+ const conversation=createAgentConversation({directory,client,tools,confirmProject:async proposal=>{
+  const path=proposal.mode==='create'?await locations.create(proposal.path):proposal.path;
+  const project=await catalog.add(path);
+  return {projectId:project.id,text:`${project.name}을 Orca에 등록했습니다. 경로: ${project.absolutePath}`};
+ }});
  try{
   await catalog.list();
   const previous=openDatabase(config.databasePath);
@@ -39,6 +48,6 @@ export async function startManagedRuntime(){
   }}finally{previous.close();}
   service=await startManagedService({directory,databasePath:join(dirname(config.databasePath),'managed-control.sqlite'),initialCursors,owner,beforeReady:()=>engine.start(),getJob:id=>engine.getCached(id),execute:input=>conversation.execute(input),channelFactory:ports=>createLocalChannels({partialStart:true,
    slackAppToken:credentials['slack-app-token'],slackBotToken:credentials['slack-bot-token'],slackChannelId:credentials['slack-channel-id'],telegramBotToken:credentials['telegram-bot-token'],telegramChatId:credentials['telegram-allowed-chat-id'],...ports})});
-  return {async stop(){await service?.stop();await engine.close();conversation.close();}};
- }catch(e){await service?.stop();await engine.close();conversation.close();throw e;}
+  return {async stop(){await client.close();await service?.stop();await conversation.close();await engine.close();}};
+ }catch(e){await client.close();await service?.stop();await conversation.close();await engine.close();throw e;}
 }

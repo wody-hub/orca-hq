@@ -93,3 +93,16 @@ it('separates channel, owner, destination and thread conversations while retaini
   expect(seen.map(input=>input.conversationId)).toEqual(['["slack","owner","C1","thread1"]','["slack","owner","C1","thread1"]','["slack","owner","C1","thread2"]','["slack","owner","C2","thread1"]','["telegram","42","C1","thread1"]']);
  }finally{await service.stop();await rm(dir,{recursive:true,force:true});}
 });
+it('watches all jobs submitted by a multi-project conversation',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'hq-multi-watch-'));const sent:string[]=[];let receive!:(input:LocalTextMessage)=>Promise<void>;
+ const service=await startManagedService({directory:dir,databasePath:join(dir,'db.sqlite'),port:0,owner:{slackUserId:'owner',telegramUserId:'42'},execute:async()=>({text:'두 프로젝트 작업을 시작했어요.',jobId:'j2',jobIds:['j1','j2']}),getJob:id=>({...job('running'),id}),channelFactory:ports=>{receive=ports.onMessage;return {start:async()=>{},stop:async()=>{},send:async(_m,text)=>{sent.push(text);},status:()=>({slack:true,telegram:true})};}});
+ try{await receive(message('owner','multi'));await vi.waitFor(()=>expect(sent).toHaveLength(1),{timeout:2500});await service.notify({...job(),id:'j1'});await service.notify({...job(),id:'j2'});await vi.waitFor(()=>{expect(sent.some(t=>t.includes('작업 j1'))).toBe(true);expect(sent.some(t=>t.includes('작업 j2'))).toBe(true);},{timeout:2500});}
+ finally{await service.stop();await rm(dir,{recursive:true,force:true});}
+});
+
+it('forwards agent progress to the same private thread before the final answer',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'hq-progress-'));const sent:Array<{message:LocalTextMessage;text:string}>=[];let receive!:(input:LocalTextMessage)=>Promise<void>;
+ const service=await startManagedService({directory:dir,databasePath:join(dir,'db.sqlite'),port:0,owner:{slackUserId:'owner',telegramUserId:'42'},execute:async input=>{await input.onProgress?.('GH workspace를 확인하고 있습니다.');return {text:'법령 화면의 검토 결과를 찾았습니다.'};},getJob:()=>undefined,channelFactory:ports=>{receive=ports.onMessage;return {start:async()=>{},stop:async()=>{},send:async(message,text)=>{sent.push({message,text});},status:()=>({slack:true,telegram:true})};}});
+ try{await receive({...message('owner','progress'),threadId:'private-thread'});await vi.waitFor(()=>expect(sent).toHaveLength(2),{timeout:2500});expect(sent[0]?.text).toContain('확인하고');expect(sent[1]?.text).toContain('찾았습니다');expect(sent.every(s=>s.message.threadId==='private-thread')).toBe(true);}
+ finally{await service.stop();await rm(dir,{recursive:true,force:true});}
+});

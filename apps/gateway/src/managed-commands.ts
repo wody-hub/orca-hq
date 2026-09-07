@@ -7,8 +7,8 @@ export interface ManagedCommandPorts {
  observe?:(project:CommandProject,intent:'status'|'review')=>Promise<string>;
  jobs:{list():CommandJob[]|Promise<CommandJob[]>;get(id:string):CommandJob|Promise<CommandJob>;submit(input:{requestId:string;project:CommandProject;prompt:string;worktree?:string}):Promise<CommandJob>;stop(id:string):Promise<CommandJob>;retry(id:string,requestId:string):Promise<CommandJob>;followup(id:string,prompt:string,requestId:string):Promise<CommandJob>};
 }
-export interface ManagedCommandInput {id:string;text:string;source:'slack'|'telegram'|'terminal';userId:string;contextJobId?:string;conversationId?:string;sessionId?:string}
-export interface ManagedCommandResult {text:string;jobId?:string;projectId?:string}
+export interface ManagedCommandInput {id:string;text:string;source:'slack'|'telegram'|'terminal';userId:string;contextJobId?:string;conversationId?:string;sessionId?:string;onProgress?:(text:string)=>Promise<void>}
+export interface ManagedCommandResult {text:string;jobId?:string;jobIds?:string[];projectId?:string}
 const short=z.string().trim().min(1).max(512), prompt=z.string().trim().min(1).max(8000);
 const ActionSchema=z.discriminatedUnion('action',[
  z.object({action:z.enum(['projects.list','projects.sync','jobs.list'])}).strict(),

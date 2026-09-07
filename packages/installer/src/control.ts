@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const defaultTimeoutMs = 60_000;
+const defaultTimeoutMs = 240_000;
 const defaultMaxBodyBytes = 64 * 1024;
 
 export interface ControlResponse {
