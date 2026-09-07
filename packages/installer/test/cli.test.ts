@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import { runCli, type HostAdapters } from "../src/cli.js";
+import type { ControlClient } from "../src/control.js";
+import type { CredentialOperations } from "../src/credential.js";
 import type { DoctorPorts } from "../src/doctor.js";
 import type { LaunchdOperations, LaunchdStatus } from "../src/launchd.js";
 import type { LifecycleComposition } from "../src/lifecycle-host.js";
 import type { GuidedPromptPort } from "../src/prompt.js";
+import type { GatewayReadinessProbe } from "../src/readiness.js";
 
 function passingDoctor(): DoctorPorts {
   const pass = async () => "pass" as const;
@@ -69,19 +72,109 @@ function guidedPrompt(credentials: Readonly<Record<string, string>> = {}): Guide
   };
 }
 
-function launchd(status: LaunchdStatus = { state: "running", pid: 428 }): LaunchdOperations & { calls: string[] } {
+function launchd(statusInput: LaunchdStatus | readonly LaunchdStatus[] = { state: "running", pid: 428 }): LaunchdOperations & { calls: string[] } {
   const calls: string[] = [];
+  const statuses = Array.isArray(statusInput) ? statusInput : [statusInput];
+  let statusIndex = 0;
   return {
     calls,
     async install() { calls.push("install"); },
     async start() { calls.push("start"); },
     async stop() { calls.push("stop"); },
-    async status() { calls.push("status"); return status; },
+    async status() {
+      calls.push("status");
+      const status = statuses[Math.min(statusIndex, statuses.length - 1)]!;
+      statusIndex += 1;
+      return status;
+    },
     async uninstall() { calls.push("uninstall"); }
   };
 }
 
+function ready(result = true): GatewayReadinessProbe & { pids: number[] } {
+  const pids: number[] = [];
+  return {
+    pids,
+    async waitForRunning(pid) { pids.push(pid); return { ready: result }; }
+  };
+}
+
 describe("hq command-line contract", () => {
+  it.each([
+    [["projects"], { action: "projects.list" }],
+    [["projects", "list"], { action: "projects.list" }],
+    [["projects", "sync"], { action: "projects.sync" }],
+    [["projects", "add", "/Users/pilot/project"], { action: "projects.add", path: "/Users/pilot/project" }],
+    [["projects", "alias", "repo:orca", "본사"], { action: "projects.alias", project: "repo:orca", alias: "본사" }],
+    [["projects", "exclude", "repo:old"], { action: "projects.exclude", project: "repo:old" }],
+    [["projects", "restore", "repo:old"], { action: "projects.restore", project: "repo:old" }],
+    [["projects", "activity", "repo:orca"], { action: "projects.activity", project: "repo:orca" }],
+    [["projects", "review", "본사"], { action: "projects.review", project: "본사" }],
+    [["run", "--project", "본사", "--prompt", "테스트", "실행"], { action: "jobs.run", project: "본사", prompt: "테스트 실행" }],
+    [["run", "--project", "본사", "--prompt", "현재", "작업", "검토", "--worktree", "wt-native-42"],
+      { action: "jobs.run", project: "본사", prompt: "현재 작업 검토", worktree: "wt-native-42" }],
+    [["jobs"], { action: "jobs.list" }],
+    [["jobs", "list"], { action: "jobs.list" }],
+    [["jobs", "show", "job-1"], { action: "jobs.show", jobId: "job-1" }],
+    [["jobs", "stop", "job-1"], { action: "jobs.stop", jobId: "job-1" }],
+    [["jobs", "retry", "job-1"], { action: "jobs.retry", jobId: "job-1" }],
+    [["jobs", "followup", "job-1", "검증", "계속"], { action: "jobs.followup", jobId: "job-1", prompt: "검증 계속" }]
+  ])("serializes %j for the shared gateway parser", async (input, structured) => {
+    // Break caught: CLI aliases can drift from the gateway's single `/hq` JSON command grammar.
+    const stdout = output();
+    const texts: string[] = [];
+    const control: ControlClient = {
+      async send(text) { texts.push(text); return { text: "처리했습니다.", jobId: "job-42" }; }
+    };
+
+    await expect(runCli(input, { stdout, control })).resolves.toBe(0);
+
+    expect(texts).toEqual([`/hq ${JSON.stringify(structured)}`]);
+    expect(stdout.lines).toEqual(["처리했습니다.\n", "작업 ID: job-42\n"]);
+  });
+
+  it("passes hq ask text through without structured command encoding", async () => {
+    // Break caught: natural-language terminal questions could be mistaken for `/hq` administration commands.
+    const stdout = output();
+    const texts: string[] = [];
+    const control: ControlClient = { async send(text) { texts.push(text); return { text: "현재 깨끗합니다." }; } };
+
+    await expect(runCli(["ask", "현재", "상태는?"], { stdout, control })).resolves.toBe(0);
+
+    expect(texts).toEqual(["현재 상태는?"]);
+    expect(stdout.lines).toEqual(["현재 깨끗합니다.\n"]);
+  });
+
+  it.each([
+    ["ask"],
+    ["projects", "add", "relative/path"],
+    ["projects", "alias", "repo:orca"],
+    ["projects", "activity"],
+    ["projects", "review"],
+    ["run", "--project", "repo:orca"],
+    ["run", "--project", "repo:orca", "--prompt", "검토", "--worktree"],
+    ["jobs", "show"],
+    ["jobs", "followup", "job-1"]
+  ])("rejects invalid terminal command argv without contacting the gateway: %j", async (...input) => {
+    // Break caught: incomplete or unsafe argv could be dispatched as an ambiguous mutation.
+    const stdout = output();
+    const control: ControlClient = { async send() { throw new Error("gateway_must_not_be_called"); } };
+
+    await expect(runCli(input, { stdout, control })).resolves.toBe(2);
+
+    expect(stdout.lines.join("")).toContain("사용법:");
+  });
+
+  it("redacts control transport failures at the terminal boundary", async () => {
+    // Break caught: local socket paths or malformed gateway payloads could leak through raw exceptions.
+    const stdout = output();
+    const control: ControlClient = { async send() { throw new Error("secret socket diagnostic"); } };
+
+    await expect(runCli(["projects"], { stdout, control })).resolves.toBe(1);
+
+    expect(stdout.lines).toEqual(["Orca HQ 게이트웨이에 연결하지 못했습니다. `hq start`로 상태를 확인하세요.\n"]);
+  });
+
   it("dispatches update with an exact revision through the lifecycle composition", async () => {
     // Break caught: `pnpm hq update` could remain a reserved branch instead of invoking guarded lifecycle work.
     const stdout = output();
@@ -377,25 +470,70 @@ describe("hq command-line contract", () => {
     await expect(runCli(["logs"], { stdout })).resolves.toBe(1);
   });
 
+  it("dispatches only the explicit Slack bot credential account", async () => {
+    // Break caught: the CLI can accept arbitrary account names or bypass the narrow credential operation.
+    const stdout = output();
+    const accounts: string[] = [];
+    const credential: CredentialOperations = {
+      async run(account) { accounts.push(account); return true; }
+    };
+
+    await expect(runCli(["credential", "--account", "slack-bot-token"], { stdout, credential })).resolves.toBe(0);
+    await expect(runCli(["credential", "--account", "openai-api-key"], { stdout, credential })).resolves.toBe(2);
+
+    expect(accounts).toEqual(["slack-bot-token"]);
+    expect(stdout.lines.join("")).not.toContain("xoxb-");
+  });
+
   it("does not restart an already running LaunchAgent through the start surface", async () => {
     // Break caught: a repeated `hq start` interrupts healthy gateway work with a forced restart.
     const stdout = output();
     const service = launchd();
+    const readiness = ready();
 
-    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(0);
+    await expect(runCli(["start"], { stdout, launchd: service, readiness })).resolves.toBe(0);
 
-    expect(service.calls).toEqual(["install", "status"]);
+    expect(service.calls).toEqual(["status", "install", "status"]);
+    expect(readiness.pids).toEqual([428]);
     expect(stdout.lines).toEqual(["Orca HQ gateway started.\n"]);
+  });
+
+  it("waits for launchd to publish a pid before testing readiness", async () => {
+    const stdout = output();
+    const service = launchd([{ state: "loaded" }, { state: "loaded" }, { state: "loaded" }, { state: "running", pid: 429 }]);
+    await expect(runCli(["start"], { stdout, launchd: service, readiness: ready() })).resolves.toBe(0);
+    expect(service.calls).not.toContain("stop");
   });
 
   it("starts an installed but non-running LaunchAgent", async () => {
     // Break caught: avoiding a destructive restart must not leave a loaded, stopped service idle.
     const stdout = output();
-    const service = launchd({ state: "loaded" });
+    const service = launchd([{ state: "loaded" }, { state: "loaded" }, { state: "running", pid: 429 }]);
 
-    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(0);
+    await expect(runCli(["start"], { stdout, launchd: service, readiness: ready() })).resolves.toBe(0);
 
-    expect(service.calls).toEqual(["install", "status", "start"]);
+    expect(service.calls).toEqual(["status", "install", "status", "start", "status"]);
+  });
+
+  it("stops a newly started service when application readiness cannot be verified", async () => {
+    // Break caught: KeepAlive can loop a broken newly installed gateway after `hq start` reports failure.
+    const stdout = output();
+    const service = launchd([{ state: "stopped" }, { state: "running", pid: 430 }]);
+
+    await expect(runCli(["start"], { stdout, launchd: service, readiness: ready(false) })).resolves.toBe(1);
+
+    expect(service.calls).toEqual(["status", "install", "status", "stop"]);
+    expect(stdout.lines.join(" ")).toContain("readiness");
+  });
+
+  it("does not stop an already-running foreign or mismatched service after readiness failure", async () => {
+    // Break caught: a stale health response can make `hq start` boot out a service it did not create.
+    const stdout = output();
+    const service = launchd({ state: "running", pid: 431 });
+
+    await expect(runCli(["start"], { stdout, launchd: service, readiness: ready(false) })).resolves.toBe(1);
+
+    expect(service.calls).toEqual(["status", "install", "status"]);
   });
 
   it("stops and reports status through the exact LaunchAgent operations", async () => {
@@ -418,8 +556,9 @@ describe("hq command-line contract", () => {
     const service = launchd({ state: "loaded" });
     service.start = async () => { throw new Error("TOKEN=launchd-secret"); };
 
-    await expect(runCli(["start"], { stdout, launchd: service })).resolves.toBe(1);
+    await expect(runCli(["start"], { stdout, launchd: service, readiness: ready() })).resolves.toBe(1);
 
+    expect(service.calls).toEqual(["status", "install", "status", "stop"]);
     expect(stdout.lines.join("\n")).toContain("Gateway service operation failed.");
     expect(stdout.lines.join("\n")).not.toContain("launchd-secret");
   });

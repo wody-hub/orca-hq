@@ -77,6 +77,11 @@ afterEach(() => {
 });
 
 describe("Registry.load", () => {
+  it("reads validated metadata without requiring a current Orca discovery snapshot", () => {
+    // Break caught: dynamic consumers need legacy metadata even after Orca removes one of its old projects.
+    expect(Registry.read(registryFile(registryYaml()))).toEqual(entries);
+  });
+
   it("loads only approved discovered projects from a real YAML registry file", () => {
     const loaded = Registry.load(registryFile(registryYaml()), discoveredProjects);
 

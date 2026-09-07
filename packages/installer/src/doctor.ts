@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const DoctorCheckSchema = z.object({
   id: z.string(),
-  status: z.enum(["pass", "warn", "fail"]),
+  status: z.enum(["pass", "warn", "fail", "skip"]),
   message: z.string(),
   remediation: z.string().optional()
 }).strict();
@@ -54,6 +54,14 @@ function checkResult(
   definition: (typeof pilotCheckDefinitions)[number],
   status: CheckStatus
 ): DoctorCheck {
+  if (status === "skip") {
+    if (definition.key !== "openAiVoice") return checkResult(definition, "fail");
+    return {
+      id: definition.id,
+      status,
+      message: "OpenAI voice is disabled; text commands use Codex CLI authentication."
+    };
+  }
   if (definition.key === "pilotConfiguration") {
     return {
       id: definition.id,
@@ -88,21 +96,28 @@ async function runCheck(
 async function registryCheck(registry: RegistryReviewPort): Promise<DoctorCheck> {
   try {
     const review = await registry.review();
-    const status: CheckStatus = review.status === "fail"
+    const status: CheckStatus = (review.status === "fail" || review.status === "skip" || review.curatedProjects < 1)
       ? "fail"
-      : review.curatedProjects === 5 ? review.status : "warn";
+      : review.status;
+    const count = review.curatedProjects;
     return {
-      id: "registry.five-project-curation",
+      id: "registry.projects-ready",
       status,
-      message: status === "pass" ? "Five pilot projects are curated." : "Five pilot projects need review.",
-      ...(status === "pass" ? {} : { remediation: "Curate exactly five approved pilot projects." })
+      message: status === "pass"
+        ? `${count} registered ${count === 1 ? "project is" : "projects are"} ready. Orca discovers local repositories automatically.`
+        : status === "warn"
+          ? `${count} registered ${count === 1 ? "project needs" : "projects need"} review. Orca discovers local repositories automatically.`
+          : "Registered projects are unavailable or not ready.",
+      ...(status === "pass" ? {} : {
+        remediation: "Run hq projects sync to discover Orca projects automatically, then review the Registry."
+      })
     };
   } catch {
     return {
-      id: "registry.five-project-curation",
+      id: "registry.projects-ready",
       status: "fail",
-      message: "Five pilot projects need review.",
-      remediation: "Curate exactly five approved pilot projects."
+      message: "Registered projects are unavailable or not ready.",
+      remediation: "Run hq projects sync to discover Orca projects automatically, then review the Registry."
     };
   }
 }

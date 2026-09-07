@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 
+import type { Readable } from "node:stream";
+import { runChat } from "./chat.js";
 import { realpathSync } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createCredentialCommand, credentialAccounts, type CredentialOperations } from "./credential.js";
 import { createDoctor, doctorExitCode, type DoctorPorts } from "./doctor.js";
-import { createMacosHostAdapters, type HostAdapters } from "./host.js";
+import {
+  configurationPath,
+  createMacosHostAdapters,
+  createNodeMachine,
+  type HostAdapters,
+  type HostMachinePort
+} from "./host.js";
 import {
   createLaunchdOperations,
   createNodeLaunchdPort,
@@ -12,12 +22,17 @@ import {
   type LaunchdOperations
 } from "./launchd.js";
 import { createDefaultLifecycleHostComposition, type LifecycleComposition } from "./lifecycle-host.js";
-import { createTerminalPrompt, type GuidedPromptPort } from "./prompt.js";
+import { createSecretPrompt, createTerminalPrompt, type GuidedPromptPort, type SecretPromptPort } from "./prompt.js";
+import { createHttpReadinessProbe, type GatewayReadinessProbe } from "./readiness.js";
 import { createSetup, type SetupPorts } from "./setup.js";
+import { createControlClient, validSessionId, type ControlClientOptions, type ControlClient } from "./control.js";
 
 export type { HostAdapters } from "./host.js";
 
-const commandNames = ["setup", "doctor", "start", "stop", "status", "logs", "update", "uninstall"] as const;
+const commandNames = [
+  "setup", "credential", "doctor", "start", "stop", "status", "logs", "update", "uninstall",
+  "ask", "chat", "projects", "run", "jobs"
+] as const;
 type CommandName = (typeof commandNames)[number];
 
 export interface CliDependencies {
@@ -27,8 +42,15 @@ export interface CliDependencies {
   readonly host?: HostAdapters;
   readonly prompt?: GuidedPromptPort;
   readonly launchd?: LaunchdOperations;
+  readonly readiness?: GatewayReadinessProbe;
+  readonly credential?: CredentialOperations;
+  readonly credentialMachine?: HostMachinePort;
+  readonly credentialPrompt?: SecretPromptPort;
   readonly lifecycle?: LifecycleComposition;
   readonly lifecycleFactory?: () => Promise<LifecycleComposition>;
+  readonly control?: ControlClient;
+  readonly controlFactory?: (options: ControlClientOptions) => ControlClient;
+  readonly stdin?: Readable;
 }
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
@@ -44,6 +66,74 @@ function command(input: readonly string[]): CommandName | undefined {
   return commandNames.includes(candidate as CommandName) ? candidate as CommandName : undefined;
 }
 
+type StructuredControlCommand = Readonly<{
+  action: string;
+  project?: string;
+  path?: string;
+  alias?: string;
+  jobId?: string;
+  prompt?: string;
+  worktree?: string;
+}>;
+
+function structuredControlCommand(input: readonly string[]): StructuredControlCommand | undefined {
+  if (input[0] === "projects") {
+    if (input.length === 1 || (input.length === 2 && input[1] === "list")) return { action: "projects.list" };
+    if (input.length === 2 && input[1] === "sync") return { action: "projects.sync" };
+    if (input.length === 3 && input[1] === "add" && input[2] !== undefined && isAbsolute(input[2])) {
+      return { action: "projects.add", path: input[2] };
+    }
+    if (input.length === 4 && input[1] === "alias" && input[2] !== undefined && input[3] !== undefined) {
+      return { action: "projects.alias", project: input[2], alias: input[3] };
+    }
+    if (input.length === 3 && (input[1] === "exclude" || input[1] === "restore") && input[2] !== undefined) {
+      return { action: `projects.${input[1]}`, project: input[2] };
+    }
+    if (input.length === 3 && (input[1] === "activity" || input[1] === "review") && input[2] !== undefined) {
+      return { action: `projects.${input[1]}`, project: input[2] };
+    }
+    return undefined;
+  }
+  if (input[0] === "run") {
+    if (input.length >= 5 && input[1] === "--project" && input[2] !== undefined && input[3] === "--prompt") {
+      const tail = input.slice(4);
+      const worktreeFlag = tail.indexOf("--worktree");
+      if (worktreeFlag >= 0) {
+        const worktree = tail[worktreeFlag + 1];
+        const prompt = tail.slice(0, worktreeFlag).join(" ").trim();
+        if (worktreeFlag === tail.length - 2 && worktree !== undefined && worktree.trim() !== "" && prompt !== "") {
+          return { action: "jobs.run", project: input[2], prompt, worktree };
+        }
+        return undefined;
+      }
+      const prompt = tail.join(" ").trim();
+      if (prompt !== "") return { action: "jobs.run", project: input[2], prompt };
+    }
+    return undefined;
+  }
+  if (input[0] === "jobs") {
+    if (input.length === 1 || (input.length === 2 && input[1] === "list")) return { action: "jobs.list" };
+    if (input.length === 3 && ["show", "stop", "retry"].includes(input[1] ?? "") && input[2] !== undefined) {
+      return { action: `jobs.${input[1]}`, jobId: input[2] };
+    }
+    if (input.length >= 4 && input[1] === "followup" && input[2] !== undefined
+      && input.slice(3).join(" ").trim() !== "") {
+      return { action: "jobs.followup", jobId: input[2], prompt: input.slice(3).join(" ") };
+    }
+  }
+  return undefined;
+}
+
+function terminalUsage(selected: "ask" | "chat" | "projects" | "run" | "jobs"): string {
+  if (selected === "ask") return "사용법: hq ask [--session ID] <질문>";
+  if (selected === "chat") return "사용법: hq chat [--session ID]";
+  if (selected === "projects") {
+    return "사용법: hq projects [list|sync|add <절대경로>|alias <프로젝트> <별칭>|exclude <프로젝트>|restore <프로젝트>|activity <프로젝트>|review <프로젝트>]";
+  }
+  if (selected === "run") return "사용법: hq run --project <프로젝트> --prompt <요청> [--worktree <Orca 작업 공간 ID>]";
+  return "사용법: hq jobs [list|show <ID>|stop <ID>|retry <ID>|followup <ID> <요청>]";
+}
+
 export async function runCli(input: readonly string[], dependencies: CliDependencies = {}): Promise<number> {
   const output = dependencies.stdout ?? process.stdout;
   const host = dependencies.host ?? createMacosHostAdapters();
@@ -51,6 +141,52 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
   if (selected === undefined) {
     write(output, `Usage: hq ${commandNames.join("|")}`);
     return 2;
+  }
+  let sessionId: string | undefined;
+  let questionArguments = input.slice(1);
+  if (selected === "ask" || selected === "chat") {
+    if (questionArguments[0] === "--session") {
+      sessionId = questionArguments[1];
+      if (sessionId === undefined || !validSessionId(sessionId)) {
+        write(output, terminalUsage(selected));
+        return 2;
+      }
+      questionArguments = questionArguments.slice(2);
+    }
+    if (selected === "chat" && questionArguments.length !== 0) {
+      write(output, terminalUsage(selected));
+      return 2;
+    }
+  }
+  const controlFactory = dependencies.controlFactory
+    ?? ((options: ControlClientOptions) => dependencies.control ?? createControlClient(options));
+  if (selected === "chat") {
+    try {
+      await runChat({ input: dependencies.stdin ?? process.stdin, output, controlFactory,
+        ...(sessionId === undefined ? {} : { sessionId }) });
+      return 0;
+    } catch {
+      write(output, "Orca HQ 게이트웨이에 연결하지 못했습니다. `hq start`로 상태를 확인하세요.");
+      return 1;
+    }
+  }
+  if (selected === "ask" || selected === "projects" || selected === "run" || selected === "jobs") {
+    const naturalText = selected === "ask" ? questionArguments.join(" ").trim() : undefined;
+    const structured = selected === "ask" ? undefined : structuredControlCommand(input);
+    if ((selected === "ask" && naturalText === "") || (selected !== "ask" && structured === undefined)) {
+      write(output, terminalUsage(selected));
+      return 2;
+    }
+    try {
+      const control = controlFactory(sessionId === undefined ? {} : { sessionId });
+      const result = await control.send(naturalText ?? `/hq ${JSON.stringify(structured)}`);
+      write(output, result.text);
+      if (result.jobId !== undefined) write(output, `작업 ID: ${result.jobId}`);
+      return 0;
+    } catch {
+      write(output, "Orca HQ 게이트웨이에 연결하지 못했습니다. `hq start`로 상태를 확인하세요.");
+      return 1;
+    }
   }
   if (selected === "doctor") {
     if (input.length !== 3 || input[1] !== "--format" || input[2] !== "json") {
@@ -75,13 +211,57 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       prompt.close();
     }
   }
+  if (selected === "credential") {
+    const account = input.length === 3 && input[1] === "--account" ? input[2] : undefined;
+    if (account === undefined || !credentialAccounts.includes(account as (typeof credentialAccounts)[number])) {
+      write(output, "사용법: hq credential --account slack-bot-token");
+      return 2;
+    }
+    const machine = dependencies.credentialMachine ?? createNodeMachine();
+    const configPath = configurationPath(machine);
+    const credential = dependencies.credential ?? createCredentialCommand({
+      configPath,
+      readConfig: async () => machine.readText(configPath),
+      writeConfig: async (text) => {
+        await machine.createDirectory(dirname(configPath));
+        await machine.writeText(configPath, text);
+      },
+      storeSecret: async (service, credentialAccount, value) => {
+        await machine.storeKeychainSecret(service, credentialAccount, value);
+      },
+      prompt: dependencies.credentialPrompt ?? createSecretPrompt(),
+      output: { write: (text) => write(output, text) }
+    });
+    return await credential.run(account) ? 0 : 1;
+  }
   if (selected === "start" || selected === "stop" || selected === "status") {
     const launchd = dependencies.launchd
       ?? createLaunchdOperations(defaultLaunchdPaths(), createNodeLaunchdPort());
+    let stopAfterFailedStart = false;
     try {
       if (selected === "start") {
+        const before = await launchd.status();
         await launchd.install();
-        if ((await launchd.status()).state !== "running") await launchd.start();
+        stopAfterFailedStart = before.state !== "running";
+        let current = await launchd.status();
+        if (current.state !== "running") {
+          await launchd.start();
+          current = await launchd.status();
+        }
+        const processDeadline = Date.now() + 5000;
+        while (current.state === "loaded" && Date.now() < processDeadline) {
+          await new Promise<void>(resolve => setTimeout(resolve, 100));
+          current = await launchd.status();
+        }
+        const pid = current.state === "running" ? current.pid : undefined;
+        const readiness = dependencies.readiness ?? createHttpReadinessProbe();
+        if (pid === undefined || !(await readiness.waitForRunning(pid)).ready) {
+          if (stopAfterFailedStart) {
+            try { await launchd.stop(); } catch { /* Preserve the readiness diagnostic. */ }
+          }
+          write(output, "Gateway application readiness verification failed.");
+          return 1;
+        }
         write(output, "Orca HQ gateway started.");
         return 0;
       }
@@ -94,6 +274,9 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
       write(output, JSON.stringify(status));
       return status.state === "stopped" ? 1 : 0;
     } catch {
+      if (selected === "start" && stopAfterFailedStart) {
+        try { await launchd.stop(); } catch { /* Preserve the operation diagnostic. */ }
+      }
       write(output, "Gateway service operation failed.");
       return 1;
     }

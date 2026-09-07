@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Readable } from "node:stream";
 
 import { expect, it } from "vitest";
 
@@ -74,7 +75,16 @@ function fakeLifecycle(calls: string[]): LifecycleComposition {
 }
 
 function fakeDependencies(calls: string[], lines: string[]): CliDependencies {
+  const control = {
+    async send(text: string) {
+      calls.push(`control:${text}`);
+      return { text: "synthetic control response" };
+    }
+  };
   return {
+    stdin: Readable.from([]),
+    control,
+    controlFactory: () => control,
     stdout: {
       write(text) {
         lines.push(text);
@@ -82,6 +92,7 @@ function fakeDependencies(calls: string[], lines: string[]): CliDependencies {
       }
     },
     doctor: passingDoctor(),
+    credential: { run: async account => { calls.push(`credential:${account}`); return true; } },
     prompt: {
       collectSetupAnswers: async () => { throw new Error("synthetic setup probe"); },
       confirm: async () => false,
@@ -94,6 +105,7 @@ function fakeDependencies(calls: string[], lines: string[]): CliDependencies {
       status: async () => ({ state: "running", pid: 4242 }),
       uninstall: async () => undefined
     },
+    readiness: { waitForRunning: async () => ({ ready: true }) },
     lifecycle: fakeLifecycle(calls)
   };
 }
@@ -166,6 +178,20 @@ it("validates every documented hq command's full argv without external side effe
   const uninstall = await probe(["uninstall", "--remove-data", "--confirm", dataPhrase]);
   expect(uninstall.exitCode).toBe(0);
   expect(uninstall.calls).toEqual([`uninstall:true:${dataPhrase}`]);
+});
+
+it("probes chat through EOF and session questions through the synthetic transport", async () => {
+  // Break caught: documented chat starts waiting on real stdin or ask opens the live gateway.
+  for (const argv of [["chat"], ["chat", "--session", "documented-session"]]) {
+    const chat = await probe(argv);
+    expect(chat.exitCode).toBe(0);
+    expect(chat.calls).toEqual([]);
+    expect(chat.output).toContain("hq chat --session");
+  }
+  const ask = await probe(["ask", "--session", "documented-session", "프로젝트", "찾아줘"]);
+  expect(ask.exitCode).toBe(0);
+  expect(ask.calls).toEqual(["control:프로젝트 찾아줘"]);
+  expect(ask.output).toContain("synthetic control response");
 });
 
 it("rejects misspelled or trailing flags with usage and exit 2", async () => {

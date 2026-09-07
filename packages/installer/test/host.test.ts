@@ -12,6 +12,9 @@ class RecordingMachine implements HostMachinePort {
   constructor(private readonly options: Readonly<{
     config?: "current" | "legacy" | "missing" | "malformed" | "arbitrary";
     legacyAccounts?: readonly string[];
+    voiceMode?: "disabled" | "openai";
+    missingVoiceKey?: boolean;
+    projectCount?: number;
   }> = {}) {}
 
   platform(): string { this.requests.push("platform"); return "darwin"; }
@@ -21,7 +24,7 @@ class RecordingMachine implements HostMachinePort {
   configDirectory(): string { this.requests.push("configDirectory"); return "/temporary/config"; }
   async command(executable: string, arguments_: readonly string[]): Promise<{ ok: boolean; stdout: string }> {
     this.requests.push(`command:${executable}:${arguments_.join(" ")}`);
-    return { ok: true, stdout: "[]" };
+    return { ok: !(this.options.missingVoiceKey && arguments_.includes("openai-api-key")), stdout: "[]" };
   }
   async readText(path: string): Promise<string | undefined> {
     this.requests.push(`read:${path}`);
@@ -36,6 +39,7 @@ class RecordingMachine implements HostMachinePort {
           ? ["stale-account"]
           : this.options.legacyAccounts ?? ["slack-app-token", "slack-channel-id", "telegram-bot-token", "telegram-allowed-chat-id", "openai-api-key"]
       };
+      if (this.options.voiceMode !== undefined) snapshot.voiceMode = this.options.voiceMode;
       if (config === "arbitrary") snapshot.unexpected = "not-a-legacy-config";
       if (config === "current") {
         snapshot.databasePath = "/temporary/home/Library/Application Support/orca-hq/control.sqlite";
@@ -43,7 +47,7 @@ class RecordingMachine implements HostMachinePort {
       return JSON.stringify(snapshot);
     }
     return path === "/temporary/projects.yaml"
-      ? "projects:\n  - one\n  - two\n  - three\n  - four\n  - five\n"
+      ? `projects:\n${Array.from({ length: this.options.projectCount ?? 5 }, (_, index) => `  - project-${index + 1}`).join("\n")}\n`
       : undefined;
   }
   async directoryWritable(path: string): Promise<boolean> { this.requests.push(`access:${path}`); return true; }
@@ -56,6 +60,68 @@ class RecordingMachine implements HostMachinePort {
 }
 
 describe("macOS host adapters", () => {
+  it("saves a fresh text-only setup without an OpenAI credential", async () => {
+    // Break caught: optional speech must not prevent saving valid text channel credentials.
+    const machine = new RecordingMachine({ config: "missing", missingVoiceKey: true });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = {
+      registryPath: "/temporary/projects.yaml",
+      credentials: {
+        "slack-app-token": "synthetic-slack", "slack-channel-id": "C123",
+        "telegram-bot-token": "synthetic-telegram", "telegram-allowed-chat-id": "123"
+      }
+    };
+    const result = await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers);
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(machine.writtenConfig ?? "{}")).toMatchObject({
+      voiceMode: "disabled",
+      credentialAccounts: ["slack-app-token", "slack-channel-id", "telegram-allowed-chat-id", "telegram-bot-token"]
+    });
+    expect(machine.mutations).not.toContain("keychain:openai-api-key");
+    expect(machine.requests.some((request) => request.includes("openai-api-key"))).toBe(false);
+  });
+
+  it("reports disabled voice explicitly without probing its Keychain credential", async () => {
+    // Break caught: disabled speech must neither require a key nor claim speech is ready.
+    const machine = new RecordingMachine({ voiceMode: "disabled", missingVoiceKey: true });
+    const result = await createDoctor(createMacosHostAdapters(machine).doctor).run({ format: "json" });
+    expect(result.ok).toBe(true);
+    expect(result.checks.find((check) => check.id === "openai.voice")).toMatchObject({
+      status: "skip", message: "OpenAI voice is disabled; text commands use Codex CLI authentication."
+    });
+    expect(machine.requests.some((request) => request.includes("openai-api-key"))).toBe(false);
+  });
+
+  it.each([undefined, "openai"] as const)("still rejects missing voice keys for existing %s voice configuration", async (voiceMode) => {
+    // Break caught: optional voice must not hide a broken previously enabled installation.
+    const machine = new RecordingMachine({ ...(voiceMode === undefined ? {} : { voiceMode }), missingVoiceKey: true });
+    const adapters = createMacosHostAdapters(machine);
+    const result = await createDoctor(adapters.doctor).run({ format: "json" });
+    expect(result.ok).toBe(false);
+    expect(result.checks.find((check) => check.id === "openai.voice")?.status).toBe("fail");
+    const answers = { credentials: {}, registryPath: "" };
+    expect((await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers)).ok).toBe(false);
+    expect(machine.mutations).toEqual([]);
+  });
+
+  it("preserves disabled voice during setup even when an old OpenAI account remains", async () => {
+    const machine = new RecordingMachine({ voiceMode: "disabled", missingVoiceKey: true });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials: {}, registryPath: "" };
+    expect((await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers)).ok).toBe(true);
+    expect(JSON.parse(machine.writtenConfig ?? "{}").voiceMode).toBe("disabled");
+    expect(machine.mutations.filter((mutation) => mutation.startsWith("keychain:"))).toEqual([]);
+  });
+
+  it("enables speech when a new OpenAI key is supplied to a text-only setup", async () => {
+    const machine = new RecordingMachine({ voiceMode: "disabled" });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials: { "openai-api-key": "synthetic-voice" }, registryPath: "" };
+    expect((await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers)).ok).toBe(true);
+    expect(JSON.parse(machine.writtenConfig ?? "{}").voiceMode).toBe("openai");
+    expect(machine.mutations).toContain("keychain:openai-api-key");
+  });
+
   it("accepts bounded project-discovery output larger than 64 KiB", async () => {
     // Break caught: Orca repo metadata can include icons and legitimately exceed Node's small execFile buffer.
     const machine = createNodeMachine();
@@ -204,6 +270,28 @@ describe("macOS host adapters", () => {
     expect(machine.requests).toContain("access:/temporary/config");
   });
 
+  it("treats one Registry project as ready for dynamic managed discovery", async () => {
+    // Break caught: host-level Registry review could keep the legacy exactly-five restriction after doctor changes.
+    const machine = new RecordingMachine({ projectCount: 1 });
+
+    const result = await createDoctor(createMacosHostAdapters(machine).doctor).run({ format: "json" });
+
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")?.status).toBe("pass");
+    expect(result.ok).toBe(true);
+  });
+
+  it("blocks setup when the Registry has no project", async () => {
+    // Break caught: setup could accept an empty Registry because warnings do not block preflight.
+    const machine = new RecordingMachine({ projectCount: 0 });
+    const adapters = createMacosHostAdapters(machine);
+    const answers = { credentials: {}, registryPath: "/temporary/projects.yaml" };
+
+    const result = await createSetup(adapters.setup({ write: () => undefined }, async () => true, answers)).run(answers);
+
+    expect(result.ok).toBe(false);
+    expect(machine.mutations).toEqual([]);
+  });
+
   it("diagnoses a legacy config as migration-needed while preserving credential and Registry checks", async () => {
     // Break caught: dropping legacy fields during parsing makes healthy Keychain accounts and Registry look unavailable.
     const machine = new RecordingMachine({ config: "legacy" });
@@ -215,7 +303,7 @@ describe("macOS host adapters", () => {
     expect(result.checks.find((check) => check.id === "slack.socket-mode")?.status).toBe("pass");
     expect(result.checks.find((check) => check.id === "telegram.allowlisted-chat")?.status).toBe("pass");
     expect(result.checks.find((check) => check.id === "openai.voice")?.status).toBe("pass");
-    expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("pass");
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")?.status).toBe("pass");
     expect(machine.mutations).toEqual([]);
     expect(machine.requests.filter((request) => request.startsWith("command:security:find-generic-password"))).toHaveLength(5);
     expect(machine.requests.join("\n")).not.toContain(" -w ");
@@ -231,7 +319,7 @@ describe("macOS host adapters", () => {
       expect(result.ok).toBe(false);
       expect(result.checks.find((check) => check.id === "config.pilot-schema")?.status).toBe("fail");
       expect(result.checks.find((check) => check.id === "slack.socket-mode")?.status).toBe("fail");
-      expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("fail");
+      expect(result.checks.find((check) => check.id === "registry.projects-ready")?.status).toBe("fail");
       expect(machine.mutations).toEqual([]);
     }
   });
@@ -287,7 +375,7 @@ describe("macOS host adapters", () => {
     expect(result.ok).toBe(false);
     expect(machine.mutations).toEqual([]);
     expect(output.lines).toEqual([
-      "Setup stopped before configuration; failed checks: slack.socket-mode, telegram.allowlisted-chat, openai.voice. Resolve them with hq doctor."
+      "Setup stopped before configuration; failed checks: slack.socket-mode, telegram.allowlisted-chat. Resolve them with hq doctor."
     ]);
   });
 
@@ -331,6 +419,7 @@ describe("macOS host adapters", () => {
       ]);
       expect(JSON.parse(machine.writtenConfig ?? "{}")).toEqual({
         schema: "orca-hq.private-pilot.v1",
+        voiceMode: "openai",
         databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
         projectRegistryPath: "/temporary/projects.yaml",
         credentialAccounts: [
@@ -382,6 +471,7 @@ describe("macOS host adapters", () => {
     expect(machine.requests.join("\n")).not.toContain(" -w ");
     expect(JSON.parse(machine.writtenConfig ?? "{}")).toEqual({
       schema: "orca-hq.private-pilot.v1",
+      voiceMode: "openai",
       databasePath: "/temporary/home/Library/Application Support/orca-hq/control.sqlite",
       projectRegistryPath: "/temporary/projects.yaml",
       credentialAccounts: ["openai-api-key", "slack-app-token", "slack-channel-id", "telegram-allowed-chat-id", "telegram-bot-token"]

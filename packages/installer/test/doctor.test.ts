@@ -32,6 +32,16 @@ class ReadOnlyMachine {
 }
 
 describe("read-only private-pilot doctor", () => {
+  it("never permits required host or Registry checks to be skipped", async () => {
+    const machine = ports();
+    machine.checks.codexAuthentication = async () => "skip";
+    machine.registry = { review: async () => ({ status: "skip", curatedProjects: 5 }) };
+    const result = await createDoctor(machine).run({ format: "json" });
+    expect(result.checks.find((check) => check.id === "codex.authentication")?.status).toBe("fail");
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")?.status).toBe("fail");
+    expect(result.ok).toBe(false);
+  });
+
   it("does not mutate machine state and emits a validated JSON report", async () => {
     // Break caught: a diagnostic run must never install services, alter credentials, or create files.
     const machine = ports();
@@ -54,6 +64,35 @@ describe("read-only private-pilot doctor", () => {
 
     await expect(doctorExitCode(warning)).resolves.toBe(0);
     await expect(doctorExitCode(failed)).resolves.toBe(1);
+  });
+
+  it("accepts one registered project and explains automatic Orca discovery", async () => {
+    // Break caught: the legacy pilot's exactly-five gate can reject a valid managed installation with one project.
+    const machine = ports();
+    machine.registry = { review: async () => ({ status: "pass", curatedProjects: 1 }) };
+
+    const result = await createDoctor(machine).run({ format: "json" });
+
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")).toEqual({
+      id: "registry.projects-ready",
+      status: "pass",
+      message: "1 registered project is ready. Orca discovers local repositories automatically."
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("fails Registry readiness when no project is registered", async () => {
+    // Break caught: zero projects could remain a warning and allow setup to create an unusable managed service.
+    const machine = ports();
+    machine.registry = { review: async () => ({ status: "warn", curatedProjects: 0 }) };
+
+    const result = await createDoctor(machine).run({ format: "json" });
+
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")).toMatchObject({
+      status: "fail",
+      remediation: "Run hq projects sync to discover Orca projects automatically, then review the Registry."
+    });
+    expect(result.ok).toBe(false);
   });
 
   it("reports legacy pilot configuration with a fixed migration warning", async () => {
@@ -79,7 +118,7 @@ describe("read-only private-pilot doctor", () => {
 
     const result = await createDoctor(machine).run({ format: "json" });
 
-    expect(result.checks.find((check) => check.id === "registry.five-project-curation")?.status).toBe("fail");
+    expect(result.checks.find((check) => check.id === "registry.projects-ready")?.status).toBe("fail");
     await expect(doctorExitCode(result)).resolves.toBe(1);
   });
 

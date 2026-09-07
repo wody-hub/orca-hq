@@ -8,6 +8,7 @@
     "src/**/*.ts",
     "test/clean-install.test.ts",
     "test/cli.test.ts",
+    "test/control.test.ts",
     "test/launchd.test.ts",
     "test/lifecycle-commands.test.ts",
     "test/lifecycle-host.test.ts"

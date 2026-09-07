@@ -15,12 +15,18 @@ export interface TerminalPromptOptions {
   readonly output?: NodeJS.WritableStream;
 }
 
+export interface SecretPromptPort {
+  askSecret(question: string): Promise<string>;
+  confirm(question: string): Promise<boolean>;
+  close(): void;
+}
+
 const credentialPrompts = Object.freeze([
   ["slack-app-token", "Slack app token (required on first install; leave blank during migration to keep the existing Keychain account): "],
   ["slack-channel-id", "Slack channel ID (required on first install; leave blank during migration to keep the existing Keychain account): "],
   ["telegram-bot-token", "Telegram bot token (required on first install; leave blank during migration to keep the existing Keychain account): "],
   ["telegram-allowed-chat-id", "Telegram allowlisted chat ID (required on first install; leave blank during migration to keep the existing Keychain account): "],
-  ["openai-api-key", "OpenAI API key (required on first install; leave blank during migration to keep the existing Keychain account): "]
+  ["openai-api-key", "OpenAI API key (optional for voice; leave blank on first install for text-only mode, or during migration to keep existing voice settings): "]
 ] as const);
 
 /** Terminal-only input boundary. Values are passed straight to Keychain and are never echoed. */
@@ -52,7 +58,9 @@ export function createTerminalPrompt(options: TerminalPromptOptions = {}): Guide
   }
   return {
     async collectSetupAnswers(): Promise<SetupAnswers> {
-      const registryPath = (await prompt.question("Pilot project Registry path: ")).trim();
+      const registryPath = (await prompt.question(
+        "Legacy project Registry path (existing entries are preserved; Orca discovers projects automatically): "
+      )).trim();
       const credentials: Record<string, string> = {};
       for (const [account, question] of credentialPrompts) {
         const value = await askSecret(question);
@@ -70,4 +78,44 @@ export function createTerminalPrompt(options: TerminalPromptOptions = {}): Guide
       }
     }
   };
+}
+
+/** Creates a narrow no-echo prompt for one-off credential enrollment. */
+export function createSecretPrompt(options: TerminalPromptOptions = {}): SecretPromptPort {
+  const input = options.input ?? stdin;
+  const output = options.output ?? stdout;
+  let muted = false;
+  const readlineOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      if (!muted) output.write(chunk);
+      callback();
+    }
+  });
+  Object.assign(readlineOutput, {
+    isTTY: true,
+    columns: (output as { readonly columns?: number }).columns ?? 80
+  });
+  const prompt = createInterface({ input, output: readlineOutput, terminal: true });
+  let closed = false;
+  return Object.freeze({
+    async askSecret(question: string): Promise<string> {
+      output.write(question);
+      muted = true;
+      try {
+        return await prompt.question("");
+      } finally {
+        muted = false;
+        output.write("\n");
+      }
+    },
+    async confirm(question: string): Promise<boolean> {
+      return (await prompt.question(question)).trim().toLowerCase() === "y";
+    },
+    close(): void {
+      if (!closed) {
+        closed = true;
+        prompt.close();
+      }
+    }
+  });
 }

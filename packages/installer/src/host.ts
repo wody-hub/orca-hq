@@ -15,7 +15,7 @@ import { parse } from "yaml";
 import type { ConfigFilePort } from "./config-files.js";
 import type { DoctorPorts, CheckStatus } from "./doctor.js";
 import { ORCA_HQ_KEYCHAIN_SERVICE, type KeychainPort } from "./keychain.js";
-import type { SetupAnswers, SetupOutputPort, SetupPorts } from "./setup.js";
+import { resolveSetupVoiceMode, type SetupAnswers, type SetupOutputPort, type SetupPorts } from "./setup.js";
 
 export type HostCommandRunner = (
   executable: string,
@@ -142,7 +142,7 @@ async function registryReviewAt(machine: HostReadPort, registryPath: string): Pr
       ? (parsed as { projects?: unknown }).projects
       : undefined;
     return Array.isArray(projects)
-      ? { status: projects.length === 5 ? "pass" : "warn", curatedProjects: projects.length }
+      ? { status: projects.length >= 1 ? "pass" : "fail", curatedProjects: projects.length }
       : { status: "fail", curatedProjects: 0 };
   } catch {
     return { status: "fail", curatedProjects: 0 };
@@ -175,7 +175,12 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
       tailscaleTailnet: async () => commandPass(machine, "tailscale", ["status", "--json"]),
       slackSocketMode: async () => credentialReady(machine, ["slack-app-token", "slack-channel-id"]),
       telegramAllowlistedChat: async () => credentialReady(machine, ["telegram-bot-token", "telegram-allowed-chat-id"]),
-      openAiVoice: async () => credentialReady(machine, ["openai-api-key"]),
+      openAiVoice: async () => {
+        const inspected = await configuration(machine);
+        return inspected.status === "current" && inspected.config.voiceMode === "disabled"
+          ? "skip"
+          : credentialReady(machine, ["openai-api-key"], inspected);
+      },
       keychain: async () => commandPass(machine, "security", ["list-keychains"]),
       sqliteDirectory: async () => await machine.directoryWritable(dirname(dirname(configPath))) ? "pass" : "fail",
       launchd: async () => commandPass(machine, "launchctl", ["print-disabled", `user/${process.getuid?.() ?? 0}`]),
@@ -211,7 +216,12 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
           },
           slackSocketMode: async () => pendingCredentialReady(machine, pending, ["slack-app-token", "slack-channel-id"], await inspected),
           telegramAllowlistedChat: async () => pendingCredentialReady(machine, pending, ["telegram-bot-token", "telegram-allowed-chat-id"], await inspected),
-          openAiVoice: async () => pendingCredentialReady(machine, pending, ["openai-api-key"], await inspected)
+          openAiVoice: async () => {
+            const snapshot = await inspected;
+            return resolveSetupVoiceMode(pending.credentials, readableConfig(snapshot)) === "disabled"
+              ? "skip"
+              : pendingCredentialReady(machine, pending, ["openai-api-key"], snapshot);
+          }
         },
         registry: {
           review: async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createLaunchdOperations,
+  defaultLaunchdPaths,
   renderLaunchAgent,
   type LaunchdPaths,
   type LaunchdPort
@@ -15,7 +16,14 @@ const paths: LaunchdPaths = {
   gatewayEntryPath: "/Users/pilot/orca-hq/apps/gateway/dist/entry.js",
   workingDirectory: "/Users/pilot/orca-hq",
   standardOutPath: "/Users/pilot/Library/Logs/orca-hq/gateway.log",
-  standardErrorPath: "/Users/pilot/Library/Logs/orca-hq/gateway.error.log"
+  standardErrorPath: "/Users/pilot/Library/Logs/orca-hq/gateway.error.log",
+  environmentVariables: {
+    PATH: "/opt/homebrew/bin:/usr/bin:/bin",
+    HOME: "/Users/pilot",
+    XDG_CONFIG_HOME: "/Users/pilot/.config",
+    CODEX_HOME: "/Users/pilot/.codex",
+    GATEWAY_EXTERNAL_ADAPTERS: "/Users/pilot/private-adapters.mjs"
+  }
 };
 
 class FakeLaunchd implements LaunchdPort {
@@ -71,8 +79,53 @@ describe("launchd supervision", () => {
     expect(plist).toContain("<key>RunAtLoad</key>");
     expect(plist).toContain("<string>/opt/homebrew/bin/node</string>");
     expect(plist).toContain("<string>/Users/pilot/orca-hq/apps/gateway/dist/entry.js</string>");
+    expect(plist).toContain("<key>PATH</key>\n    <string>/opt/homebrew/bin:/usr/bin:/bin</string>");
+    expect(plist).toContain("<key>HOME</key>\n    <string>/Users/pilot</string>");
+    expect(plist).toContain("<key>GATEWAY_EXTERNAL_ADAPTERS</key>");
     expect(plist).not.toContain("~");
     expect(plist).not.toContain("TOKEN");
+  });
+
+  it("builds an allowlisted environment from the observed user process without credential variables", () => {
+    // Break caught: launchd starts with a sparse PATH, or inherited credential env values leak into the plist.
+    const resolved = defaultLaunchdPaths({
+      homeDirectory: "/Users/pilot",
+      userId: 501,
+      nodePath: "/custom/node/bin/node",
+      workspaceRoot: "/Users/pilot/orca-hq",
+      env: {
+        PATH: "/usr/local/bin:/usr/bin:relative",
+        XDG_CONFIG_HOME: "/Users/pilot/.config",
+        CODEX_HOME: "/Users/pilot/.codex",
+        GATEWAY_EXTERNAL_ADAPTERS: "/Users/pilot/adapters.mjs",
+        SLACK_BOT_TOKEN: "must-not-escape"
+      }
+    });
+
+    expect(resolved.environmentVariables).toEqual({
+      PATH: "/custom/node/bin:/usr/local/bin:/usr/bin",
+      HOME: "/Users/pilot",
+      XDG_CONFIG_HOME: "/Users/pilot/.config",
+      CODEX_HOME: "/Users/pilot/.codex",
+      GATEWAY_EXTERNAL_ADAPTERS: "/Users/pilot/adapters.mjs"
+    });
+    expect(renderLaunchAgent(resolved)).not.toContain("must-not-escape");
+  });
+
+  it("rejects non-allowlisted or malformed explicit LaunchAgent environment values", () => {
+    // Break caught: callers can bypass default filtering and inject credential names or invalid plist values.
+    expect(() => renderLaunchAgent({
+      ...paths,
+      environmentVariables: { ...paths.environmentVariables, SLACK_BOT_TOKEN: "secret" }
+    })).toThrow("launchd environment variable is invalid");
+    expect(() => renderLaunchAgent({
+      ...paths,
+      environmentVariables: { ...paths.environmentVariables, HOME: "relative-home" }
+    })).toThrow("launchd environment variable is invalid");
+    expect(() => renderLaunchAgent({
+      ...paths,
+      environmentVariables: { ...paths.environmentVariables, GATEWAY_EXTERNAL_ADAPTERS: "token-like-value" }
+    })).toThrow("launchd environment variable is invalid");
   });
 
   it("installs and controls only the exact user-domain LaunchAgent", async () => {

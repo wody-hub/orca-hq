@@ -18,7 +18,16 @@ export type LaunchdPaths = Readonly<{
   workingDirectory: string;
   standardOutPath: string;
   standardErrorPath: string;
+  environmentVariables?: Readonly<Record<string, string>>;
 }>;
+
+const launchdEnvironmentAllowlist = new Set([
+  "PATH",
+  "HOME",
+  "XDG_CONFIG_HOME",
+  "CODEX_HOME",
+  "GATEWAY_EXTERNAL_ADAPTERS"
+]);
 
 export type LaunchdStatus = Readonly<
   | { state: "running"; pid?: number }
@@ -59,6 +68,16 @@ function xml(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
+function isExplicitModulePath(value: string): boolean {
+  if (isAbsolute(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === "file:" && isAbsolute(fileURLToPath(url));
+  } catch {
+    return false;
+  }
+}
+
 function validatePaths(paths: LaunchdPaths): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$/.test(paths.label)) {
     throw new TypeError("launchd label is invalid");
@@ -78,6 +97,28 @@ function validatePaths(paths: LaunchdPaths): void {
       throw new TypeError("launchd paths must be explicit absolute paths");
     }
   }
+  for (const [name, value] of Object.entries(paths.environmentVariables ?? {})) {
+    const pathValue = name === "PATH"
+      ? value.split(":").length > 0 && value.split(":").every((entry) => isAbsolute(entry))
+      : name === "GATEWAY_EXTERNAL_ADAPTERS" ? isExplicitModulePath(value) : isAbsolute(value);
+    if (!launchdEnvironmentAllowlist.has(name)
+      || value.length === 0
+      || /[\0\r\n]/.test(value)
+      || !pathValue) {
+      throw new TypeError("launchd environment variable is invalid");
+    }
+  }
+}
+
+function renderEnvironment(environment: Readonly<Record<string, string>>): string {
+  const entries = Object.entries(environment);
+  if (entries.length === 0) return "";
+  return [
+    "  <key>EnvironmentVariables</key>",
+    "  <dict>",
+    ...entries.flatMap(([name, value]) => [`    <key>${xml(name)}</key>`, `    <string>${xml(value)}</string>`]),
+    "  </dict>"
+  ].join("\n");
 }
 
 /** Renders a secret-free LaunchAgent definition using only explicit host paths. */
@@ -92,6 +133,7 @@ export function renderLaunchAgent(paths: LaunchdPaths): string {
     .replaceAll("{{NODE_PATH}}", xml(paths.nodePath))
     .replaceAll("{{GATEWAY_ENTRY_PATH}}", xml(paths.gatewayEntryPath))
     .replaceAll("{{WORKING_DIRECTORY}}", xml(paths.workingDirectory))
+    .replaceAll("{{ENVIRONMENT_VARIABLES}}", renderEnvironment(paths.environmentVariables ?? {}))
     .replaceAll("{{STANDARD_OUT_PATH}}", xml(paths.standardOutPath))
     .replaceAll("{{STANDARD_ERROR_PATH}}", xml(paths.standardErrorPath));
 }
@@ -236,10 +278,13 @@ export function defaultLaunchdPaths(input: Readonly<{
   userId?: number;
   nodePath?: string;
   workspaceRoot?: string;
+  env?: Readonly<Record<string, string | undefined>>;
 }> = {}): LaunchdPaths {
   const homeDirectory = resolve(input.homeDirectory ?? homedir());
   const workspaceRoot = resolve(input.workspaceRoot ?? join(moduleDirectory, "../../.."));
   const userId = input.userId ?? process.getuid?.();
+  const nodePath = resolve(input.nodePath ?? process.execPath);
+  const environment = input.env ?? process.env;
   if (userId === undefined || !Number.isSafeInteger(userId) || userId < 0) {
     throw new TypeError("launchd user id is unavailable");
   }
@@ -247,10 +292,22 @@ export function defaultLaunchdPaths(input: Readonly<{
     label: "com.orcahq.gateway",
     domain: `gui/${userId}`,
     plistPath: join(homeDirectory, "Library/LaunchAgents/com.orcahq.gateway.plist"),
-    nodePath: resolve(input.nodePath ?? process.execPath),
+    nodePath,
     gatewayEntryPath: join(workspaceRoot, "apps/gateway/dist/entry.js"),
     workingDirectory: workspaceRoot,
     standardOutPath: join(homeDirectory, "Library/Logs/orca-hq/gateway.log"),
-    standardErrorPath: join(homeDirectory, "Library/Logs/orca-hq/gateway.error.log")
+    standardErrorPath: join(homeDirectory, "Library/Logs/orca-hq/gateway.error.log"),
+    environmentVariables: Object.freeze({
+      PATH: [...new Set([
+        dirname(nodePath),
+        ...(environment.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(":").filter((entry) => isAbsolute(entry))
+      ])].join(":"),
+      HOME: homeDirectory,
+      ...(environment.XDG_CONFIG_HOME === undefined ? {} : { XDG_CONFIG_HOME: environment.XDG_CONFIG_HOME }),
+      ...(environment.CODEX_HOME === undefined ? {} : { CODEX_HOME: environment.CODEX_HOME }),
+      ...(environment.GATEWAY_EXTERNAL_ADAPTERS === undefined
+        ? {}
+        : { GATEWAY_EXTERNAL_ADAPTERS: environment.GATEWAY_EXTERNAL_ADAPTERS })
+    })
   });
 }

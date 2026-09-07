@@ -84,15 +84,18 @@ function assertApprovedImports(
 }
 
 export class Registry {
-  static load(path: string, discoveredProjects: readonly DiscoveredProject[] = []): ProjectRegistryEntry[] {
+  static read(path: string): ProjectRegistryEntry[] {
     const document = ProjectRegistryDocumentSchema.parse(parse(readFileSync(path, "utf8")));
-    const discovered = DiscoveredProjectSchema.array().parse(discoveredProjects);
-
     assertUniqueRegistryIdentities(document.projects);
     assertUniqueAliases(document.projects);
-    assertApprovedImports(document.projects, discovered);
-
     return document.projects;
+  }
+
+  static load(path: string, discoveredProjects: readonly DiscoveredProject[] = []): ProjectRegistryEntry[] {
+    const entries = Registry.read(path);
+    const discovered = DiscoveredProjectSchema.array().parse(discoveredProjects);
+    assertApprovedImports(entries, discovered);
+    return entries;
   }
 }
 

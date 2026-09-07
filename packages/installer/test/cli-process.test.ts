@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,12 +82,12 @@ async function runInteractiveSetup(
   timeoutMs = 15_000
 ): Promise<ProcessResult & { readonly timedOut: boolean }> {
   const prompts = [
-    "Pilot project Registry path: ",
+    "Legacy project Registry path (existing entries are preserved; Orca discovers projects automatically): ",
     "Slack app token (required on first install; leave blank during migration to keep the existing Keychain account): ",
     "Slack channel ID (required on first install; leave blank during migration to keep the existing Keychain account): ",
     "Telegram bot token (required on first install; leave blank during migration to keep the existing Keychain account): ",
     "Telegram allowlisted chat ID (required on first install; leave blank during migration to keep the existing Keychain account): ",
-    "OpenAI API key (required on first install; leave blank during migration to keep the existing Keychain account): ",
+    "OpenAI API key (optional for voice; leave blank on first install for text-only mode, or during migration to keep existing voice settings): ",
     "Apply this setup? [y/N] "
   ];
   return await new Promise((resolvePromise, reject) => {
@@ -166,6 +166,37 @@ describe("pnpm hq doctor process contract", () => {
 });
 
 describe.sequential("hq setup process safety", () => {
+  it("saves and diagnoses a fresh text-only install through the actual CLI without echoing secrets", async () => {
+    // Break caught: unit setup succeeds but the built prompt/config boundary still requires voice.
+    const host = await createHostFixture();
+    const configPath = join(host.env.XDG_CONFIG_HOME!, "orca-hq", "pilot.json");
+    await rm(configPath);
+    await writeCommand(host.bin, "security", 'if [ "$1" = "-i" ]; then cat >/dev/null; fi\nexit 0');
+    try {
+      const result = await runInteractiveSetup(host.env, [
+        host.registryPath, "xapp-TEXTSECRET", "C123", "telegram-TEXTSECRET", "123", "", "y"
+      ]);
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).not.toContain("TEXTSECRET");
+      expect(result.stderr).toBe("");
+      const configText = await readFile(configPath, "utf8");
+      expect(configText).not.toContain("TEXTSECRET");
+      expect(JSON.parse(configText)).toMatchObject({
+        voiceMode: "disabled",
+        credentialAccounts: ["slack-app-token", "slack-channel-id", "telegram-allowed-chat-id", "telegram-bot-token"]
+      });
+      const doctor = await run("pnpm", ["hq", "doctor", "--format", "json"], { cwd: repositoryRoot, env: host.env });
+      expect(doctor.exitCode).toBe(0);
+      expect(JSON.parse(doctor.stdout).checks).toContainEqual({
+        id: "openai.voice", status: "skip",
+        message: "OpenAI voice is disabled; text commands use Codex CLI authentication."
+      });
+    } finally {
+      await rm(host.fixture, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("exits after failed preflight without waiting on an open readline handle", async () => {
     // Break caught: preflight returns before confirm, so CLI-level prompt ownership must still release stdin.
     const host = await createHostFixture();

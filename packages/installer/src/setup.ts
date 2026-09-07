@@ -20,6 +20,7 @@ export interface SetupPorts extends DoctorPorts {
   readonly existingConfig?: () => Promise<Readonly<{
     projectRegistryPath: string;
     credentialAccounts: readonly string[];
+    voiceMode?: "disabled" | "openai";
   }> | undefined>;
   /** Called only after the non-secret plan and config destination were displayed. */
   confirm(): Promise<boolean>;
@@ -36,6 +37,15 @@ export interface SetupResult {
 }
 
 export type { PilotCheckPorts, RegistryReviewPort };
+
+/** Blank input opts a fresh install into text-only mode; existing voice settings are preserved. */
+export function resolveSetupVoiceMode(
+  credentials: Readonly<Record<string, string>>,
+  existing?: Readonly<{ credentialAccounts: readonly string[]; voiceMode?: "disabled" | "openai" }>
+): "disabled" | "openai" {
+  if ((credentials["openai-api-key"]?.length ?? 0) > 0) return "openai";
+  return existing?.voiceMode ?? (existing === undefined ? "disabled" : "openai");
+}
 
 function credentialAccounts(
   credentials: Readonly<Record<string, string>>,
@@ -74,7 +84,8 @@ export function createSetup(ports: SetupPorts): Readonly<{
         schema: "orca-hq.private-pilot.v1",
         databasePath: ports.databasePath,
         projectRegistryPath: registryPath,
-        credentialAccounts: accounts
+        credentialAccounts: accounts,
+        voiceMode: resolveSetupVoiceMode(answers.credentials, existing)
       });
       ports.output.write(`Planned configuration: ${ports.configFile.path}`);
       ports.output.write("Planned changes: save non-secret pilot configuration and store selected credentials in Keychain.");

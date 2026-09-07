@@ -7,6 +7,7 @@ const AbsolutePathSchema = z.string().trim().min(1).refine(isAbsolute, "must be 
 export const PilotConfigSchema = z.object({
   schema: z.literal("orca-hq.private-pilot.v1"),
   databasePath: AbsolutePathSchema,
+  voiceMode: z.enum(["disabled", "openai"]).optional(),
   projectRegistryPath: AbsolutePathSchema,
   credentialAccounts: z.array(z.string().trim().min(1))
 }).strict();

@@ -10,7 +10,8 @@ features:
 oauth_config:
   scopes:
     bot:
-      - channels:history
+      - groups:history
+      - groups:read
       - chat:write
 settings:
   socket_mode_enabled: true
@@ -18,6 +19,6 @@ settings:
     is_enabled: true
   event_subscriptions:
     bot_events:
-      - message.channels
+      - message.groups
   org_deploy_enabled: false
   token_rotation_enabled: false

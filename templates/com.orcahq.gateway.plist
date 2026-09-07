@@ -11,6 +11,7 @@
   </array>
   <key>WorkingDirectory</key>
   <string>{{WORKING_DIRECTORY}}</string>
+{{ENVIRONMENT_VARIABLES}}
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
