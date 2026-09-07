@@ -16,7 +16,7 @@
 
 Orca HQ setup은 외부 계정을 대신 만들거나 권한을 변경하지 않습니다. 다음 작업을 각 provider의 공식 UI/CLI에서 먼저 마칩니다.
 
-1. **Orca, Codex, Claude Code**: 각 도구를 설치하고 자신의 계정으로 인증합니다. `doctor`는 `orca --version`, `orca capabilities --format json`, `orca projects list --format json`, `codex login status`, `claude auth status`를 read-only로 확인합니다.
+1. **Orca, Codex, Claude Code**: 각 도구를 설치하고 자신의 계정으로 인증합니다. `doctor`는 `orca status --json`, `orca repo list --json`, `codex login status`, `claude auth status`를 read-only로 확인합니다.
 2. **Slack**: Slack의 새 App 생성 화면에서 [`templates/slack-app-manifest.yaml`](../../templates/slack-app-manifest.yaml)을 가져옵니다. Socket Mode를 사용하고 app token을 발급하며, App을 workspace에 설치하고 전용 channel에 초대합니다. setup에 넣을 app token과 channel ID를 준비합니다.
 3. **Telegram**: BotFather에서 개인 pilot bot을 만들고 bot token을 받습니다. bot과 대화할 user/chat을 정한 뒤 allowlist에 쓸 chat ID를 준비합니다. Telegram은 L0/L1 요청만 가능하며 L2/L3 승인은 항상 거부됩니다.
 4. **Tailscale**: 자신의 계정으로 승인된 tailnet에 Mac을 연결합니다. dashboard는 Tailscale Serve 전용이며 Funnel 또는 public bind를 사용하지 않습니다.
@@ -27,17 +27,19 @@ Orca HQ setup은 외부 계정을 대신 만들거나 권한을 변경하지 않
 원하는 program directory의 상위 위치에서 실행합니다.
 
 ```bash
-git clone https://github.com/wody-hub/orca-hq.git
+git clone --branch dev --single-branch https://github.com/wody-hub/orca-hq.git
 cd orca-hq
 git remote get-url origin
+git branch --show-current
 corepack enable
 pnpm install --frozen-lockfile
 ```
 
-`git remote get-url origin`의 출력은 다음과 같아야 합니다.
+invitation-only pilot 동안 `git remote get-url origin`과 `git branch --show-current`의 출력은 각각 다음과 같아야 합니다.
 
 ```text
 https://github.com/wody-hub/orca-hq.git
+dev
 ```
 
 다른 remote이거나 lockfile이 바뀌면 진행을 멈추고 repository owner에게 확인합니다. public npm 설치나 Homebrew 설치로 대체하지 마세요.
@@ -48,7 +50,7 @@ https://github.com/wody-hub/orca-hq.git
 
 각 entry에는 최소한 다음 값을 검토합니다.
 
-- `projectKey`, `orcaProjectId`, 실제 `absolutePath`, 필요하면 `canonicalRemote`와 `defaultBaseRef`
+- `projectKey`, `orca repo list --json`이 반환한 repo `id`를 넣는 `orcaProjectId`, 실제 `absolutePath`, 필요하면 `canonicalRemote`와 `defaultBaseRef`
 - 사람이 확인한 `aliases`, `component`, `instructionsFiles`, `sensitivePaths`
 - `setupPolicy`, `allowedOperations`, 실행 가능한 `requiredChecks`, 충돌 단위인 `lockKey`
 
@@ -111,7 +113,7 @@ pnpm hq status
 
 ## 20분 완료 확인
 
-- origin이 `https://github.com/wody-hub/orca-hq.git`이고 frozen install이 성공했습니다.
+- origin이 `https://github.com/wody-hub/orca-hq.git`이고 branch가 `dev`이며 frozen install이 성공했습니다.
 - pilot JSON에 secret 값이 없고 credential은 Keychain에 있습니다.
 - `doctor` JSON의 `ok`가 `true`이고 필수 check가 `fail`이 아닙니다.
 - `status`가 `running` 또는 `loaded`입니다.

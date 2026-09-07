@@ -169,9 +169,7 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
       pilotConfiguration: async () => configurationStatus(await configuration(machine)),
       macosCpu: async () => machine.platform() === "darwin" && ["arm64", "x64"].includes(machine.architecture()) ? "pass" : "fail",
       nodePnpm: async () => machine.nodeVersion().startsWith("v22.") && (await commandPass(machine, "pnpm", ["--version"])) === "pass" ? "pass" : "fail",
-      orcaCapabilities: async () => (await Promise.all([
-        commandPass(machine, "orca", ["--version"]), commandPass(machine, "orca", ["capabilities", "--format", "json"])
-      ])).every((status) => status === "pass") ? "pass" : "fail",
+      orcaCapabilities: async () => commandPass(machine, "orca", ["status", "--json"]),
       codexAuthentication: async () => commandPass(machine, "codex", ["login", "status"]),
       claudeAuthentication: async () => commandPass(machine, "claude", ["auth", "status"]),
       tailscaleTailnet: async () => commandPass(machine, "tailscale", ["status", "--json"]),
@@ -181,7 +179,7 @@ export function createMacosHostAdapters(machine: HostMachinePort = createNodeMac
       keychain: async () => commandPass(machine, "security", ["list-keychains"]),
       sqliteDirectory: async () => await machine.directoryWritable(dirname(dirname(configPath))) ? "pass" : "fail",
       launchd: async () => commandPass(machine, "launchctl", ["print-disabled", `user/${process.getuid?.() ?? 0}`]),
-      projectDiscovery: async () => commandPass(machine, "orca", ["projects", "list", "--format", "json"])
+      projectDiscovery: async () => commandPass(machine, "orca", ["repo", "list", "--json"])
     },
     registry: { review: async () => registryReview(machine) }
   };
@@ -245,7 +243,7 @@ export function createNodeMachine(
     configDirectory: () => process.env.XDG_CONFIG_HOME,
     async command(executable, arguments_) {
       try {
-        const result = await runCommand(executable, arguments_, { timeout: 5_000, maxBuffer: 64 * 1024 });
+        const result = await runCommand(executable, arguments_, { timeout: 5_000, maxBuffer: 1024 * 1024 });
         return { ok: true, stdout: result.stdout };
       } catch {
         return { ok: false, stdout: "" };

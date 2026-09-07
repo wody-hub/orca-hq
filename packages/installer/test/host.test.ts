@@ -56,6 +56,19 @@ class RecordingMachine implements HostMachinePort {
 }
 
 describe("macOS host adapters", () => {
+  it("accepts bounded project-discovery output larger than 64 KiB", async () => {
+    // Break caught: Orca repo metadata can include icons and legitimately exceed Node's small execFile buffer.
+    const machine = createNodeMachine();
+
+    const result = await machine.command(process.execPath, [
+      "-e",
+      "process.stdout.write('x'.repeat(80_000))"
+    ]);
+
+    expect(result.ok).toBe(true);
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBe(80_000);
+  });
+
   it("stores exact Keychain bytes through one bounded security batch command", async () => {
     // Break caught: using `-w` re-enters getpass, exposes plaintext, or lets a hung security process wait forever.
     const secret = "quote:'\ncontrol:\t\u0000한글😀";
@@ -180,6 +193,10 @@ describe("macOS host adapters", () => {
 
     expect(result.ok).toBe(true);
     expect(machine.mutations).toEqual([]);
+    expect(machine.requests).toContain("command:orca:status --json");
+    expect(machine.requests).toContain("command:orca:repo list --json");
+    expect(machine.requests).not.toContain("command:orca:capabilities --format json");
+    expect(machine.requests).not.toContain("command:orca:projects list --format json");
     expect(machine.requests).toContain("command:tailscale:status --json");
     expect(machine.requests).toContain("command:security:list-keychains");
     expect(machine.requests).toContain("read:/temporary/config/orca-hq/pilot.json");
