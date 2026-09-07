@@ -368,3 +368,10 @@ it("shows the most recent retry delivery warning alongside unchanged native stat
   expect(observed.relayWarning).toContain("retry transport unavailable");
   await e.close();
 });
+it('lists durable cached jobs without contacting Orca when the runtime is slow or offline',async()=>{
+ const {openDatabase}=await import('@orca-hq/persistence');const directory=mkdtempSync(join(tmpdir(),'hq-cached-jobs-'));const path=join(directory,'relay.sqlite');let calls=0;
+ let relay=createOrcaRelay({databasePath:path,coordinatorHandle:'term_test',run:async()=>{calls++;throw Error('offline');}});
+ await relay.close();const db=openDatabase(path);db.prepare('INSERT INTO orca_relay_snapshots VALUES(?,?)').run('task-cached',JSON.stringify({id:'task-cached',state:'running',updatedAt:'2026-09-07'}));db.close();
+ relay=createOrcaRelay({databasePath:path,coordinatorHandle:'term_test',run:async()=>{calls++;throw Error('offline');}});
+ try{expect(relay.listCached()).toMatchObject([{id:'task-cached',state:'running'}]);expect(calls).toBe(0);}finally{await relay.close();}
+});

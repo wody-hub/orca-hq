@@ -32,4 +32,6 @@
 
 ## 검증 기록
 
-2026-09-07: 69 files / 921 tests, 전체 typecheck, 전체 build 통과. 실제 Codex dynamic tool 호출과 새 프로세스 resume 문맥 유지 확인. GH folder workspace의 법령개정이력 터미널을 조회하여 수정·검증·미커밋 상태 요약 성공. 설치본 반영과 doctor 14 pass / voice 1 skip / fail 0 확인. 보호 로드맵 미접근.
+2026-09-07: 69 files / 923 tests, 전체 typecheck, 전체 build 통과. 실제 Codex dynamic tool 호출과 새 프로세스 resume 문맥 유지 확인. GH folder workspace의 법령개정이력 터미널을 조회하여 수정·검증·미커밋 상태 요약 성공. 설치본 반영과 doctor 14 pass / voice 1 skip / fail 0 확인. 보호 로드맵 미접근.
+
+후속 보완: 전역 작업 목록 갱신이 대화 deadline을 소모한 실제 사례를 확인하여, 대화의 jobs.list는 최근 20개 저장 snapshot을 시점 표시와 함께 제공한다. 특정 작업의 현재 상태는 native 조회로 확인한다. 조회 CLI에는 SIGKILL timeout을 적용한다.

@@ -30,7 +30,7 @@ export async function startManagedRuntime(){
  const catalog=createProjectCatalog({directory,legacyRegistryPath:config.projectRegistryPath,defaultSensitivePaths:['.env','.env.*','**/*.pem'],isBusy:id=>engine.isBusy(id)});
  const commands=createManagedCommands({catalog,jobs:engine,observe:(project,intent)=>createOrcaObserver().observe(project,intent)});
  const locations=createProjectLocations();
- const tools=createAgentTools({catalog,execute:input=>commands.execute(input),locations});
+ const tools=createAgentTools({catalog,execute:input=>commands.execute(input),locations,listJobs:()=>engine.listCached()});
  const agentDirectory=join(directory,'agent-workspace');await mkdir(agentDirectory,{recursive:true,mode:0o700});
  const client=createCodexSessionClient({cwd:agentDirectory,instructions:agentInstructions,tools:tools.specs});
  const conversation=createAgentConversation({directory,client,tools,confirmProject:async proposal=>{

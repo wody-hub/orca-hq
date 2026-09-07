@@ -778,6 +778,7 @@ export function createOrcaRelay(options: OrcaRelayOptions) {
     list,
     get,
     getCached,
+    listCached: (): NativeJob[] => (db.prepare("SELECT body FROM orca_relay_snapshots ORDER BY rowid DESC LIMIT 20").all() as {body:string}[]).map(row => JSON.parse(row.body) as NativeJob),
     followup,
     stop,
     retry,
