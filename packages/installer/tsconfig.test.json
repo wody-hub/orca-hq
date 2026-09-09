@@ -6,6 +6,11 @@
   },
   "include": [
     "src/**/*.ts",
+    "test/chat.test.ts",
+    "test/chat-pty.test.ts",
+    "test/progress-client.test.ts",
+    "test/progress-window.test.ts",
+    "test/watch.test.ts",
     "test/clean-install.test.ts",
     "test/cli.test.ts",
     "test/control.test.ts",

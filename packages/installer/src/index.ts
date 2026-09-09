@@ -12,3 +12,7 @@ export * from "./prompt.js";
 export * from "./setup.js";
 export * from "./uninstall.js";
 export * from "./update.js";
+export * from "./progress-client.js";
+export * from "./progress-window.js";
+export * from "./watch.js";
+export * from "./chat.js";

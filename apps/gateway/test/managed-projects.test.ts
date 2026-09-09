@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createProjectCatalog,
+  selectOrcaCliExecutable,
+  selectOrcaCliEnvironment,
   type OrcaProject
 } from "../src/managed-projects.js";
 
@@ -35,6 +37,32 @@ afterEach(async () => {
 });
 
 describe("managed project catalog", () => {
+  it.each([
+    [{ ORCA_CLI_COMMAND: "/custom/orca" }, "darwin", "/custom/orca"],
+    [{ ORCA_DEV_REPO_ROOT: "/workspace/orca" }, "darwin", "orca-dev"],
+    [{}, "linux", "orca-ide"],
+    [{}, "darwin", "orca"]
+  ] as const)("selects the shared Orca executable for environment %j on %s", (environment, hostPlatform, expected) => {
+    expect(selectOrcaCliExecutable(environment, hostPlatform)).toBe(expected);
+  });
+
+  it("preserves runtime connection context while excluding unrelated process secrets", () => {
+    expect(selectOrcaCliEnvironment({
+      PATH: "/bin",
+      ORCA_CLI_COMMAND: "/custom/orca",
+      ORCA_ENVIRONMENT: "saved-environment",
+      ORCA_PAIRING_CODE: "pairing-context",
+      ORCA_USER_DATA_PATH: "/profile/orca",
+      UNRELATED_SECRET: "must-not-propagate"
+    })).toEqual({
+      PATH: "/bin",
+      ORCA_CLI_COMMAND: "/custom/orca",
+      ORCA_ENVIRONMENT: "saved-environment",
+      ORCA_PAIRING_CODE: "pairing-context",
+      ORCA_USER_DATA_PATH: "/profile/orca"
+    });
+  });
+
   it("lists every Orca project and preserves legacy execution protections", async () => {
     const directory = await temporaryDirectory();
     const legacyRegistryPath = join(directory, "projects.yaml");

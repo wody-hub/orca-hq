@@ -91,11 +91,31 @@ function normalizedAbsolutePath(value: unknown): string {
   return normalize(path);
 }
 
-function orcaExecutable(): string {
-  const configured = process.env.ORCA_CLI_COMMAND?.trim();
+export function selectOrcaCliExecutable(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  hostPlatform: string = platform()
+): string {
+  const configured = environment.ORCA_CLI_COMMAND?.trim();
   if (configured !== undefined && configured.length > 0) return configured;
-  if (process.env.ORCA_DEV_REPO_ROOT !== undefined) return "orca-dev";
-  return platform() === "linux" ? "orca-ide" : "orca";
+  if (environment.ORCA_DEV_REPO_ROOT !== undefined) return "orca-dev";
+  return hostPlatform === "linux" ? "orca-ide" : "orca";
+}
+
+const ORCA_CLI_ENVIRONMENT_KEYS = [
+  "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "USER", "LOGNAME", "SHELL",
+  "ORCA_CLI_COMMAND", "ORCA_DEV_REPO_ROOT", "ORCA_ENVIRONMENT", "ORCA_PAIRING_CODE",
+  "ORCA_REMOTE_PAIRING", "ORCA_USER_DATA_PATH", "ORCA_CLI_CWD", "ORCA_TERMINAL_HANDLE",
+  "ORCA_PANE_KEY", "ORCA_WORKSPACE_ID", "ORCA_WORKTREE_ID"
+] as const;
+
+export function selectOrcaCliEnvironment(
+  environment: Readonly<Record<string, string | undefined>> = process.env
+): NodeJS.ProcessEnv {
+  const selected: NodeJS.ProcessEnv = {};
+  for (const key of ORCA_CLI_ENVIRONMENT_KEYS) {
+    if (environment[key] !== undefined) selected[key] = environment[key];
+  }
+  return selected;
 }
 
 function parseOrcaProject(value: unknown): OrcaProject {
@@ -112,7 +132,8 @@ function parseOrcaProject(value: unknown): OrcaProject {
 }
 
 async function defaultDiscover(): Promise<readonly OrcaProject[]> {
-  const result = await execute(orcaExecutable(), ["repo", "list", "--json"], {
+  const result = await execute(selectOrcaCliExecutable(), ["repo", "list", "--json"], {
+    env: selectOrcaCliEnvironment(),
     encoding: "utf8",
     timeout: 10_000,
     maxBuffer: 2 * 1024 * 1024
@@ -128,7 +149,8 @@ async function defaultDiscover(): Promise<readonly OrcaProject[]> {
 }
 
 async function defaultAddToOrca(absolutePath: string): Promise<OrcaProject> {
-  const result = await execute(orcaExecutable(), ["repo", "add", "--path", absolutePath, "--json"], {
+  const result = await execute(selectOrcaCliExecutable(), ["repo", "add", "--path", absolutePath, "--json"], {
+    env: selectOrcaCliEnvironment(),
     encoding: "utf8",
     timeout: 20_000,
     maxBuffer: 2 * 1024 * 1024

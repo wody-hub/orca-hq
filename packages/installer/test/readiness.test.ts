@@ -3,6 +3,22 @@ import { describe, expect, it } from "vitest";
 import { createHttpReadinessProbe } from "../src/readiness.js";
 
 describe("gateway readiness", () => {
+  it("allows persisted native recovery to finish after twenty seconds with the default startup budget", async () => {
+    let elapsed = 0;
+    const readiness = createHttpReadinessProbe({
+      now: () => elapsed,
+      sleep: async milliseconds => { elapsed += milliseconds; },
+      request: async () => ({
+        ok: true,
+        json: async () => ({
+          service: "orca-hq", mode: "managed", pid: 428,
+          state: elapsed >= 20_000 ? "running" : "starting"
+        })
+      })
+    });
+    await expect(readiness.waitForRunning(428)).resolves.toEqual({ ready: true });
+  });
+
   it("accepts the exact local text health contract for the launchd pid", async () => {
     // Break caught: a generic HTTP 200 or stale gateway process can be reported as ready.
     const urls: string[] = [];

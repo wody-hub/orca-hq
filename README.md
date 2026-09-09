@@ -6,6 +6,24 @@ Orca HQ는 Slack, Telegram, Tailscale web에서 받은 작업을 한 대의 Mac�
 
 새 설치는 [20분 invitation-only pilot 설치 가이드](docs/installation/private-pilot.md)에서 시작하세요. 공개 Git repository를 `git clone`한 뒤 `pnpm install`과 `pnpm hq setup`을 실행합니다. public npm 또는 Homebrew package와 production/general-availability support는 제공하지 않습니다. repository에는 아직 license가 없으므로 공개 열람 가능 상태를 open-source 사용·수정·재배포 허가로 해석하지 마세요.
 
+## 터미널에서 업무 지시하기
+
+```bash
+hq chat
+# 기존 대화 재개
+hq chat --session <세션-ID>
+# 자동 진행 창 없이 사용
+hq chat --progress-window=off
+# 특정 업무의 진행 상황 다시 보기
+hq watch --context <맥락-ID>
+```
+
+지시를 접수하면 다음 입력을 바로 받을 수 있습니다. 대화형 macOS 터미널에서는 새 업무마다 별도 Terminal 진행 창을 열고, 같은 업무의 후속 지시는 기존 맥락과 살아 있는 창을 재사용합니다. 독립 업무는 최대 **5개**까지 동시에 실행하며 여섯 번째부터 순서대로 대기합니다. 같은 작업 폴더를 수정하는 등 자원 충돌이 있으면 실행 슬롯이 남아 있어도 대기할 수 있습니다.
+
+전체 작업 목록 조회, 인사, 도움말은 새 업무를 만들지 않고 HQ 입력창에 답합니다. 따라서 “지금 돌아가고 있는 작업 목록 보여줘”에는 별도 진행 창이 열리지 않습니다. 개발·분석·검토를 요청해 업무 맥락이 배정되면 진행 창이 열립니다.
+
+`/context <맥락-ID>`로 후속 지시의 대상을 지정하고, `/request <요청-ID>`로 접수 상태를 조회합니다. `/new`는 새 대화를 시작하고 `/exit`는 입력창에서 나갑니다. 진행 창의 Ctrl+C나 대화 종료는 실행 중인 업무를 취소하지 않습니다. 창이 열리지 않으면 표시된 `hq watch` 명령으로 관찰할 수 있습니다. Slack·Telegram 지시는 자동 터미널 창을 열지 않습니다.
+
 ## 문서
 
 | 독자 | 문서 | 목적 |

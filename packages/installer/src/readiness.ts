@@ -37,10 +37,10 @@ function isExpectedHealth(value: unknown, expectedPid: number): boolean {
     && health.channels.telegram === true;
 }
 
-/** Polls the loopback health endpoint for at most 15 seconds and verifies launchd PID ownership. */
+/** Allows native recovery up to 60 seconds by default and verifies launchd PID ownership. */
 export function createHttpReadinessProbe(options: HttpReadinessOptions = {}): GatewayReadinessProbe {
   const url = options.url ?? defaultHealthUrl;
-  const timeoutMs = options.timeoutMs ?? 15_000;
+  const timeoutMs = options.timeoutMs ?? 60_000;
   const pollIntervalMs = options.pollIntervalMs ?? 250;
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? (async (milliseconds) => await new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));

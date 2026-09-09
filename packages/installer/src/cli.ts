@@ -2,6 +2,9 @@
 
 import type { Readable } from "node:stream";
 import { runChat } from "./chat.js";
+import { createProgressClient, validProgressIdentifier, type ProgressClient } from "./progress-client.js";
+import { runWatch } from "./watch.js";
+import type { ProgressWindowManager, ProgressWindowMode } from "./progress-window.js";
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +34,7 @@ export type { HostAdapters } from "./host.js";
 
 const commandNames = [
   "setup", "credential", "doctor", "start", "stop", "status", "logs", "update", "uninstall",
-  "ask", "chat", "projects", "run", "jobs"
+  "ask", "chat", "watch", "projects", "run", "jobs"
 ] as const;
 type CommandName = (typeof commandNames)[number];
 
@@ -51,6 +54,9 @@ export interface CliDependencies {
   readonly control?: ControlClient;
   readonly controlFactory?: (options: ControlClientOptions) => ControlClient;
   readonly stdin?: Readable;
+  readonly progress?: ProgressClient;
+  readonly progressWindows?: ProgressWindowManager;
+  readonly signal?: AbortSignal;
 }
 
 function write(output: Pick<typeof process.stdout, "write">, text: string): void {
@@ -124,9 +130,10 @@ function structuredControlCommand(input: readonly string[]): StructuredControlCo
   return undefined;
 }
 
-function terminalUsage(selected: "ask" | "chat" | "projects" | "run" | "jobs"): string {
+function terminalUsage(selected: "ask" | "chat" | "watch" | "projects" | "run" | "jobs"): string {
   if (selected === "ask") return "사용법: hq ask [--session ID] <질문>";
-  if (selected === "chat") return "사용법: hq chat [--session ID]";
+  if (selected === "chat") return "사용법: hq chat [--session ID] [--progress-window=auto|off]";
+  if (selected === "watch") return "사용법: hq watch --context ID [--viewer-instance ID --lease-token TOKEN]";
   if (selected === "projects") {
     return "사용법: hq projects [list|sync|add <절대경로>|alias <프로젝트> <별칭>|exclude <프로젝트>|restore <프로젝트>|activity <프로젝트>|review <프로젝트>]";
   }
@@ -144,30 +151,81 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
   }
   let sessionId: string | undefined;
   let questionArguments = input.slice(1);
-  if (selected === "ask" || selected === "chat") {
-    if (questionArguments[0] === "--session") {
-      sessionId = questionArguments[1];
-      if (sessionId === undefined || !validSessionId(sessionId)) {
-        write(output, terminalUsage(selected));
-        return 2;
+  let progressWindow: ProgressWindowMode = "auto";
+  if (selected === "ask" && questionArguments[0] === "--session") {
+    sessionId = questionArguments[1];
+    if (sessionId === undefined || !validSessionId(sessionId)) { write(output, terminalUsage(selected)); return 2; }
+    questionArguments = questionArguments.slice(2);
+  }
+  if (selected === "chat") {
+    const seen = new Set<string>();
+    for (let index = 0; index < questionArguments.length; index += 1) {
+      const flag = questionArguments[index]!;
+      if (flag === "--session" && !seen.has("session")) {
+        seen.add("session"); sessionId = questionArguments[++index];
+        if (sessionId !== undefined && validSessionId(sessionId)) continue;
+      } else if ((flag.startsWith("--progress-window=") || flag === "--progress-window") && !seen.has("window")) {
+        seen.add("window");
+        const value = flag === "--progress-window" ? questionArguments[++index] : flag.slice("--progress-window=".length);
+        if (value === "auto" || value === "off") { progressWindow = value; continue; }
       }
-      questionArguments = questionArguments.slice(2);
+      write(output, terminalUsage(selected)); return 2;
     }
-    if (selected === "chat" && questionArguments.length !== 0) {
-      write(output, terminalUsage(selected));
-      return 2;
+  }
+  if (selected === "watch") {
+    const flags = new Map<string, string>();
+    for (let index = 1; index < input.length; index += 2) {
+      const key = input[index]!;
+      const value = input[index + 1];
+      if (!["--context", "--viewer-instance", "--lease-token"].includes(key) || flags.has(key) || !validProgressIdentifier(value)) {
+        write(output, terminalUsage(selected)); return 2;
+      }
+      flags.set(key, value);
+    }
+    const contextId = flags.get("--context");
+    const viewerInstanceId = flags.get("--viewer-instance");
+    const leaseToken = flags.get("--lease-token");
+    if (contextId === undefined || (viewerInstanceId === undefined) !== (leaseToken === undefined)) {
+      write(output, terminalUsage(selected)); return 2;
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+    for (const signal of signals) process.on(signal, abort);
+    dependencies.signal?.addEventListener("abort", abort, { once: true });
+    if (dependencies.signal?.aborted) abort();
+    try {
+      return (await runWatch({ client: dependencies.progress ?? createProgressClient(), contextId, output, signal: controller.signal,
+        ...(viewerInstanceId === undefined || leaseToken === undefined ? {} : { viewer: { viewerInstanceId, leaseToken } }) })).exitCode;
+    } catch {
+      write(output, "진행 정보를 조회하지 못했습니다. 작업은 계속됩니다. `hq start`로 연결 상태를 확인하세요.");
+      return 1;
+    } finally {
+      for (const signal of signals) process.removeListener(signal, abort);
+      dependencies.signal?.removeEventListener("abort", abort);
     }
   }
   const controlFactory = dependencies.controlFactory
     ?? ((options: ControlClientOptions) => dependencies.control ?? createControlClient(options));
   if (selected === "chat") {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+    for (const signal of signals) process.on(signal, abort);
+    dependencies.signal?.addEventListener("abort", abort, { once: true });
+    if (dependencies.signal?.aborted) abort();
     try {
-      await runChat({ input: dependencies.stdin ?? process.stdin, output, controlFactory,
+      await runChat({ input: dependencies.stdin ?? process.stdin, output, progressWindow, signal: controller.signal,
+        ...(dependencies.progress === undefined ? {} : { client: dependencies.progress }),
+        ...(dependencies.progressWindows === undefined ? {} : { windows: dependencies.progressWindows }),
         ...(sessionId === undefined ? {} : { sessionId }) });
       return 0;
     } catch {
       write(output, "Orca HQ 게이트웨이에 연결하지 못했습니다. `hq start`로 상태를 확인하세요.");
       return 1;
+    } finally {
+      for (const signal of signals) process.removeListener(signal, abort);
+      dependencies.signal?.removeEventListener("abort", abort);
     }
   }
   if (selected === "ask" || selected === "projects" || selected === "run" || selected === "jobs") {
