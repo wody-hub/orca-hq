@@ -7,8 +7,8 @@ import { createRelayCoordinator } from "../src/relay-coordinator.js";
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(p => rm(p, { recursive: true, force: true }))); });
 const workspace = "repo-hq::/safe/hq";
-const terminal = (handle = "term_new", tabId = "tab-hq") => ({
-  handle, tabId, worktreeId: workspace, title: "Orca HQ Relay",
+const terminal = (handle = "term_new", tabId = "tab-hq", title: string | null = "Orca HQ Relay") => ({
+  handle, tabId, worktreeId: workspace, title,
   connected: true, writable: true, orphaned: false,
 });
 async function fixture() {
@@ -52,6 +52,12 @@ it("recovers a restored HQ tab and rebinds the existing Run without creating a t
   expect(f.owner()).toBe("term_new");
   expect(f.calls.some(a => a[1] === "create")).toBe(false);
   expect(JSON.parse(await readFile(join(f.directory, "relay-coordinator.json"), "utf8")).coordinatorHandle).toBe("term_new");
+});
+
+it("accepts a live Orca terminal whose optional title is null", async () => {
+  const f = await fixture(); f.setTerminals([terminal("term_old", "tab-hq", null)]);
+  expect(await createRelayCoordinator(f).resolve()).toBe("term_old");
+  expect(f.calls.some(a => a[1] === "create")).toBe(false);
 });
 
 it("creates only one dedicated terminal for concurrent recovery and survives a second runtime restart", async () => {

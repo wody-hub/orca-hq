@@ -15,7 +15,7 @@ const Terminal = z.object({
   handle: Handle,
   worktreeId: z.string().min(1),
   tabId: z.string().min(1),
-  title: z.string().optional(),
+  title: z.string().nullable().optional(),
   connected: z.boolean().optional(),
   writable: z.boolean().optional(),
   orphaned: z.boolean().optional(),
