@@ -105,6 +105,27 @@ describe("operations API", () => {
     await expect(api.tasks("run-1")).resolves.toMatchObject(body);
   });
 
+  it("accepts worker-list projections that omit releaseState from a released resource", async () => {
+    const body = {
+      source: "orca",
+      workers: [{
+        dispatchId: "dispatch-1",
+        projection: {
+          dispatchId: "dispatch-1",
+          taskId: "task-1",
+          runId: "run-1",
+          liveness: { verdict: "exited" },
+          resource: { state: "released" },
+        },
+      }],
+      page: { hasMore: false, nextCursor: null },
+      scope: { source: "bound" },
+      evidence: { source: "orca_cli", observedAt, verification: "observed" },
+    };
+    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(200, body)), store());
+    await expect(api.workers()).resolves.toMatchObject(body);
+  });
+
   it("passes read abort signals through to fetch", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation((_path, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))));
     const controller = new AbortController();
