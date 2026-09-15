@@ -8,7 +8,14 @@ export type { GatewayHostFactory } from "./host.js";
 /** Starts the repository-owned host; tests inject only external/secret boundaries. */
 export async function run(bootstrap: GatewayHostFactory = createGatewayHost) {
   const host = await bootstrap();
-  return startProductionGateway(host.config, host.dependencies);
+  return startProductionGateway(host.config, {
+    ...host.dependencies,
+    nativeAdmissionRequired: true,
+    dispatchControl: {
+      stop: input => host.dependencies.dispatchControl.stop(input),
+      retry: async () => { throw Error("native_admission_required"); }
+    }
+  });
 }
 
 export async function runInstalledGateway(options: {

@@ -27,7 +27,15 @@ export interface CommandJob {
   createdAt: string;
   updatedAt: string;
 }
+export interface NativeCommandAction {
+  kind: "submit" | "retry" | "followup" | "review";
+  project: CommandProject;
+  prompt: string;
+  job?: CommandJob;
+  worktree?: string;
+}
 export interface ManagedCommandPorts {
+  nativeExecute?: (input: ManagedCommandInput, action: NativeCommandAction) => Promise<ManagedCommandResult>;
   catalog: {
     list(): Promise<CommandProject[]>;
     resolve(selector: string): Promise<CommandProject>;
@@ -79,6 +87,12 @@ export interface ManagedCommandInput {
     phase: "started" | "completed" | "failed",
     callId: string,
   ) => void;
+  nativeScope?: {
+    projectId: string;
+    worktreeId: string;
+    access: "read" | "write";
+    resources: Array<{ resourceKey: string; mode: "read" | "write" }>;
+  };
   execution?: {
     contextId: string;
     requestId: string;
@@ -259,6 +273,10 @@ export function createManagedCommands(ports: ManagedCommandPorts) {
       if (decoded === undefined) {
         if (input.contextJobId) {
           await checkCurrent(input.contextJobId);
+          if (ports.nativeExecute) {
+            const job = await ports.jobs.get(input.contextJobId);
+            return ports.nativeExecute(input, { kind: "followup", job, project: await ports.catalog.resolve(job.projectId), prompt: text });
+          }
           const job = await ports.jobs.followup(
             input.contextJobId,
             text,
@@ -275,6 +293,17 @@ export function createManagedCommands(ports: ManagedCommandPorts) {
         };
       }
       const action = ActionSchema.parse(decoded);
+      if (ports.nativeExecute && ["jobs.run", "jobs.retry", "jobs.followup", "projects.review"].includes(action.action)) {
+        const job = "jobId" in action ? await ports.jobs.get(action.jobId) : undefined;
+        if (job) await checkCurrent(job.id);
+        const project = await ports.catalog.resolve(job?.projectId ?? (action as { project: string }).project);
+        if (!project.enabled) throw Error("HQ 사용에서 제외된 프로젝트입니다. 먼저 복원해주세요.");
+        return ports.nativeExecute(input, {
+          kind: action.action === "jobs.run" ? "submit" : action.action === "jobs.retry" ? "retry" : action.action === "jobs.followup" ? "followup" : "review",
+          project, prompt: "prompt" in action ? action.prompt : action.action === "projects.review" ? "프로젝트 코드를 읽고 검토해 주세요." : job!.prompt,
+          ...(job ? { job } : {}), ...("worktree" in action && action.worktree ? { worktree: action.worktree } : {})
+        });
+      }
       const execution = input.execution
         ? {
             contextId: input.execution.contextId,

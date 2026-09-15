@@ -1,3 +1,5 @@
+import type { NativeDelivery, NativeMessage } from "./native-coordinator.js";
+import type { WorkerResourceVerdict } from "./worker-admission.js";
 import { execFile } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { randomUUID } from "node:crypto";
@@ -88,6 +90,8 @@ export interface OrcaRelayOptions {
   >;
   resolveNativeProject?: (projectId: string) => Promise<RelayProject>;
   nativeRetentionPolicy?: NativeRetentionPolicy;
+  nativeOnly?: boolean;
+  assertNativeCoordinator?: () => void;
   now?: () => Date;
   run?: (argv: readonly string[]) => Promise<unknown>;
   pollIntervalMs?: number;
@@ -177,7 +181,7 @@ function protectPrompt(prompt: string) {
     );
 }
 function taskSpec(project: RelayProject, prompt: string): string {
-  return `필수 보호 규칙: ${protectedRelative} 및 ${join(homedir(), "Project/ETC/orca-hq", protectedRelative)} 파일은 읽기·hash·diff·stage·restore·수정 대상에서 제외합니다. 해당 파일을 포함할 수 있는 광범위 Git/파일 명령도 실행하지 마세요.\n프로젝트 민감 경로(내용이 아닌 경로 규칙): ${JSON.stringify(project.sensitivePaths)}. 비밀 값을 읽거나 결과/로그에 출력하지 마세요.\n작업은 Orca가 지정한 작업 공간에서 수행하고 native Dispatch의 worker_done 규칙을 따르세요.\n\n사용자 지시:\n${prompt}`;
+  return `필수 보호 규칙: ${protectedRelative} 및 ${join(homedir(), "Project/ETC/orca-hq", protectedRelative)} 파일은 읽기·hash·diff·stage·restore·수정 대상에서 제외합니다. 해당 파일을 포함할 수 있는 광범위 Git/파일 명령도 실행하지 마세요.\n프로젝트 민감 경로(내용이 아닌 경로 규칙): ${JSON.stringify(project.sensitivePaths)}. 비밀 값을 읽거나 결과/로그에 출력하지 마세요.\n작업은 Orca가 지정한 작업 공간에서 수행하고 native Dispatch의 worker_done 규칙을 따르세요. 독립적으로 하위 worker/agent를 실행하지 마세요. 병렬 작업이 필요하면 HQ에 fanout 계획을 보고하고 현재 planner 작업을 먼저 완료하세요. fanout은 worker_done payload의 fanout 배열에 {id, objective, access, dependsOn} 형태로 보고하며 모든 자원은 현재 승인 범위 이내여야 합니다.\n\n사용자 지시:\n${prompt}`;
 }
 const object = (v: unknown): Json =>
   v && typeof v === "object" ? (v as Json) : {};
@@ -1576,8 +1580,103 @@ export function createOrcaRelay(options: OrcaRelayOptions) {
     );
     return work;
   };
+  const nativeFence = () => {
+    if (closed || closing || !options.nativeAdmission) throw Error("native_admission_required");
+    options.assertNativeCoordinator?.();
+  };
+  const exactNative = (receipt: NativeWorkerReceipt) => {
+    nativeFence();
+    const entry = nativeLaunch(receipt.attemptId);
+    if (!entry?.receipt || !isDeepStrictEqual(entry.receipt, receipt)) throw Error("native_receipt_mismatch");
+    return entry;
+  };
+  const effectRecord = (id: string): Json | undefined => {
+    const row = db.prepare("SELECT body FROM orca_relay_meta WHERE id=?").get("native-effect:" + id) as { body: string } | undefined;
+    return row ? JSON.parse(row.body) : undefined;
+  };
+  const saveEffect = (id: string, value: Json) => db.prepare("INSERT OR REPLACE INTO orca_relay_meta VALUES(?,?)").run("native-effect:" + id, JSON.stringify(value));
+  const durableNativeEffect = async (id: string, command: string, args: string[], from = true): Promise<Json> => {
+    nativeFence();
+    let record = effectRecord(id);
+    if (record && (record.command !== command || !isDeepStrictEqual(record.args, args))) throw Error("native_effect_collision");
+    if (record?.result) return record.result;
+    if (record) {
+      if (!record.requestId) throw Error("native_effect_recovery_required");
+      const observed = await call("request-show", ["--request", record.requestId], true);
+      if (!["completed", "pending"].includes(String(observed.state ?? observed.status))) throw Error("native_effect_recovery_required");
+    } else { record = { command, args }; saveEffect(id, record); }
+    try {
+      const response = await callReceipt(command, [...args, ...(record.requestId ? ["--retry-request", record.requestId] : [])], from, nativeFence);
+      saveEffect(id, { ...record, requestId: response.requestId, result: response.result });
+      return response.result;
+    } catch (error) {
+      const receipt = object(error).receipt;
+      const requestId = receipt?.error?.data?.orchestrationRequestId;
+      saveEffect(id, { ...record, ...(typeof requestId === "string" ? { requestId } : {}), recovery: receipt?.error?.data });
+      throw error;
+    }
+  };
+  /**
+   * The authoritative fleet row for one Dispatch. `worker-list` is scoped to the receipt's own Run and
+   * paged; the row is matched by exact Dispatch id, and an exhausted listing means "no proof", never
+   * "not running".
+   */
+  const nativeFleetRow = async (receipt: NativeWorkerReceipt): Promise<Json | undefined> => {
+    nativeFence();
+    let cursor: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const result = await call("worker-list", ["--run", receipt.runId, "--limit", "100", ...(cursor ? ["--cursor", cursor] : [])]);
+      const found = rows(result.workers).find(row => row.dispatchId === receipt.dispatchId);
+      if (found) return found;
+      const next = object(result.page).nextCursor;
+      if (typeof next !== "string" || next === "") return undefined;
+      cursor = next;
+    }
+    return undefined;
+  };
+  const cleanupNative = async (receipt: NativeWorkerReceipt, policy: NativeRetentionPolicy): Promise<{ verdict: WorkerResourceVerdict; recovery?: unknown }> => {
+    const entry = exactNative(receipt);
+    const observed = await call("worker-show", ["--dispatch", receipt.dispatchId]);
+    nativeFence();
+    const resource = object(observed.terminalResource);
+    if (observed.dispatch?.id !== receipt.dispatchId || observed.dispatch?.task_id !== receipt.taskId ||
+      resource.terminalHandle !== receipt.terminalHandle || resource.ownerDispatchId !== receipt.dispatchId) return { verdict: "unknown", recovery: observed };
+    if (resource.releaseState === "released") return { verdict: "released" };
+    if (!["owned", "retained"].includes(String(resource.ownershipState))) return { verdict: "unknown", recovery: observed };
+    if (observed.observation?.exactWorker !== true || observed.terminal?.handle !== receipt.terminalHandle ||
+      (observed.terminal?.incarnationId ?? observed.terminal?.ptyId) !== entry.terminalSessionId) return { verdict: "unknown", recovery: observed };
+    // Only the accepted result's exact settled Dispatch can authorize cleanup.
+    if (!["worker_done", "completed", "succeeded", "failed", "stopped"].includes(String(observed.dispatch?.state ?? observed.dispatch?.status))) return { verdict: "unknown", recovery: observed };
+    try {
+      if (policy === "retain") {
+        if (resource.releaseState !== "retained") await durableNativeEffect(`retain:${receipt.dispatchId}`, "worker-retain", ["--dispatch", receipt.dispatchId], false);
+        const idle = object(await run(["terminal", "wait", "--terminal", receipt.terminalHandle, "--for", "tui-idle", "--timeout-ms", "1000", "--json"]));
+        nativeFence();
+        if (idle.ok !== true) return { verdict: "unknown", recovery: idle.result };
+        const retained = await call("worker-show", ["--dispatch", receipt.dispatchId]);
+        if (retained.terminalResource?.releaseState !== "retained" || retained.terminalResource?.ownerDispatchId !== receipt.dispatchId ||
+          retained.terminal?.handle !== receipt.terminalHandle || (retained.terminal?.incarnationId ?? retained.terminal?.ptyId) !== entry.terminalSessionId) return { verdict: "unknown", recovery: retained };
+        return { verdict: "retained_idle" };
+      }
+      const result = await durableNativeEffect(`release:${receipt.dispatchId}`, "worker-release", ["--dispatch", receipt.dispatchId], false);
+      if (result.state === "released" && (!result.dispatchId || result.dispatchId === receipt.dispatchId)) return { verdict: "released" };
+      return { verdict: "unknown", recovery: result };
+    } catch (error) { return { verdict: "unknown", recovery: object(error).receipt ?? effectRecord(`${policy}:${receipt.dispatchId}`) }; }
+  };
+  const parseDelivery = (result: Json): NativeDelivery | undefined => {
+    if (!result.deliveryId) return undefined;
+    if (typeof result.runId !== "string" || !Array.isArray(result.messages)) throw Error("native_delivery_invalid");
+    return { runId: result.runId, deliveryId: result.deliveryId, messages: result.messages.map((raw: Json): NativeMessage => {
+      const payload = typeof raw.payload === "string" ? object(JSON.parse(raw.payload)) : object(raw.payload);
+      return { id: String(raw.id), type: String(raw.type), body: redactRelayText(String(raw.body ?? "")),
+        ...(typeof payload.taskId === "string" ? { taskId: payload.taskId } : {}),
+        ...(typeof payload.dispatchId === "string" ? { dispatchId: payload.dispatchId } : {}),
+        ...(payload.outcome ? { outcome: payload.outcome } : {}),
+        ...(Array.isArray(payload.fanout) ? { fanout: payload.fanout } : {}) };
+    }) };
+  };
   return {
-    submit,
+    submit: (...args: Parameters<typeof submit>) => options.nativeOnly ? Promise.reject(Error("native_admission_required")) : submit(...args),
     list,
     get,
     applyLegacyCompletionPolicy,
@@ -1604,9 +1703,80 @@ export function createOrcaRelay(options: OrcaRelayOptions) {
           )
           .all() as { body: string }[]
       ).map((row) => JSON.parse(row.body) as NativeJob),
-    followup,
+    followup: (...args: Parameters<typeof followup>) => options.nativeOnly ? Promise.reject(Error("native_admission_required")) : followup(...args),
     stop,
-    retry,
+    retry: (...args: Parameters<typeof retry>) => options.nativeOnly ? Promise.reject(Error("native_admission_required")) : retry(...args),
+    cleanupNative,
+    /**
+     * Read-only liveness proof for one exact owned Dispatch. A bound receipt only proves the launch
+     * happened, and a connected PTY is not evidence of a live agent: `worker-show`'s
+     * `observation.status` is terminal liveness only, while `worker-list`'s `projection.liveness` is
+     * the authoritative fleet verdict for the agent itself. Restart therefore restores guidance only
+     * when the receipt still exactly owns its terminal resource in both views **and** that verdict is
+     * `live`. An `exited`/`unverifiable`/absent verdict, a missing row, a foreign owner or
+     * incarnation, and a retained/released/settled Dispatch all report `live: false`, which keeps the
+     * slot occupied rather than relaunching or releasing on ambiguous evidence.
+     */
+    async observeNativeWorker(receipt: NativeWorkerReceipt) {
+      let entry: NativeLaunchJournalEntry;
+      try { entry = exactNative(receipt); } catch (error) { return { live: false, recovery: object(error).receipt }; }
+      const observed = await call("worker-show", ["--dispatch", receipt.dispatchId]);
+      nativeFence();
+      const resource = object(observed.terminalResource);
+      // Exact ownership first: without it the fleet verdict below describes somebody else's worker.
+      const owned = observed.dispatch?.id === receipt.dispatchId && observed.dispatch?.task_id === receipt.taskId &&
+        resource.terminalHandle === receipt.terminalHandle && resource.ownerDispatchId === receipt.dispatchId &&
+        resource.ownershipState === "owned" && resource.releaseState !== "released" && resource.releaseState !== "retained" &&
+        observed.observation?.exactWorker === true && observed.terminal?.handle === receipt.terminalHandle &&
+        observed.terminal?.connected === true &&
+        (observed.terminal?.incarnationId ?? observed.terminal?.ptyId) === entry.terminalSessionId &&
+        !["worker_done", "completed", "succeeded", "failed", "stopped"].includes(String(observed.dispatch?.state ?? observed.dispatch?.status));
+      if (!owned) return { live: false, recovery: observed };
+      const projected = await nativeFleetRow(receipt);
+      nativeFence();
+      if (!projected) return { live: false, recovery: observed };
+      const fleetResource = object(projected.resource);
+      const liveness = object(object(projected.projection).liveness);
+      // The authoritative agent verdict, read from a row that must still name this exact receipt.
+      const live = projected.taskId === receipt.taskId && projected.runId === receipt.runId &&
+        projected.agentTerminalHandle === receipt.terminalHandle &&
+        fleetResource.ownerDispatchId === receipt.dispatchId && fleetResource.ownershipState === "owned" &&
+        projected.terminalState === "active" && liveness.verdict === "live";
+      return live ? { live: true } : { live: false, recovery: { observed, projected } };
+    },
+    async stopNative(receipt: NativeWorkerReceipt) {
+      exactNative(receipt);
+      try { await durableNativeEffect(`stop:${receipt.dispatchId}`, "worker-stop", ["--dispatch", receipt.dispatchId], false); }
+      catch { /* A lost response requires an exact read, never another new stop mutation. */ }
+      const observed = await call("worker-show", ["--dispatch", receipt.dispatchId]);
+      return observed.dispatch?.id === receipt.dispatchId && observed.dispatch?.task_id === receipt.taskId &&
+        (observed.dispatch?.status === "stopped" || observed.worker?.state === "stopped");
+    },
+    async checkDelivery() {
+      nativeFence();
+      const handle = await coordinator();
+      return parseDelivery(await call("check", ["--terminal", handle, "--run", String(meta().runId)], false));
+    },
+    async acknowledgeDelivery(delivery: NativeDelivery) {
+      nativeFence();
+      if (delivery.runId !== meta().runId) throw Error("native_delivery_run_mismatch");
+      const handle = await coordinator();
+      await callReceipt("check", ["--terminal", handle, "--run", delivery.runId, "--ack", delivery.deliveryId], false, nativeFence);
+      // check may return the next batch; it remains unacknowledged and is replayed by the next check.
+    },
+    async sendNativeGuidance(receipt: NativeWorkerReceipt, text: string, id: string) {
+      exactNative(receipt); protectPrompt(text);
+      const project = await options.resolveNativeProject!(receipt.worktreeId.slice(0, receipt.worktreeId.indexOf("::")));
+      const result = await durableNativeEffect(`guidance:${id}`, "send", ["--run", receipt.runId, "--to", `dispatch:${receipt.dispatchId}`, "--type", "status", "--subject", "HQ 후속 지시", "--body", taskSpec(project, text)]);
+      const messageId = result.message?.id ?? result.messageId ?? result.id;
+      if (typeof messageId !== "string") throw Error("native_message_receipt_unknown");
+      return { messageId };
+    },
+    async replyNativeQuestion(receipt: NativeWorkerReceipt, messageId: string, text: string, id: string) {
+      exactNative(receipt); protectPrompt(text);
+      await durableNativeEffect(`reply:${id}`, "reply", ["--id", messageId, "--body", text]);
+      return { messageId };
+    },
     isBusy: async (projectId: string) =>
       (await list()).some(
         (j) =>

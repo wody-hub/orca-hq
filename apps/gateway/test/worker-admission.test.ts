@@ -439,3 +439,12 @@ it("keeps a persisted launching attempt behind the restart barrier until exact r
   second.finishReconciliation();
   expect(second.claimNext()?.attemptId).toBe("next");
 });
+it("checks the legacy execution fence inside admission before claiming any resources", () => {
+  const { store } = fixture();
+  const admission = createWorkerAdmission({ store });
+  const work = item(store, "legacy-conflict"); admission.enqueue(work);
+  expect(admission.claimNext(() => false)).toBeUndefined();
+  expect(admission.snapshot()).toEqual({ active: 0, queued: 1 });
+  expect(admission.claimNext(() => true)?.attemptId).toBe(work.attemptId);
+  admission.close();
+});

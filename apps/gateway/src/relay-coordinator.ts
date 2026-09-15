@@ -26,11 +26,13 @@ type Receipt = { ok?: boolean; result?: Record<string, unknown>; error?: { code?
 
 export function createRelayCoordinator(options: {
   directory: string;
+  assertActive?: () => void;
   run: (args: readonly string[]) => Promise<unknown>;
 }) {
   const path = join(options.directory, "relay-coordinator.json");
   let serial = Promise.resolve();
   const rpc = async (args: string[]): Promise<Receipt> => {
+    options.assertActive?.();
     const receipt = await options.run([...args, "--json"]);
     if (!receipt || typeof receipt !== "object") throw Error("HQ coordinator: Orca 응답을 확인할 수 없습니다");
     return receipt as Receipt;
@@ -41,8 +43,10 @@ export function createRelayCoordinator(options: {
     return receipt.result;
   };
   const save = async (state: State) => {
+    options.assertActive?.();
     const temporary = `${path}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(state) + "\n", { mode: 0o600 });
+    options.assertActive?.();
     await rename(temporary, path);
   };
   const show = async (handle: string): Promise<TerminalInfo | undefined> => {

@@ -623,3 +623,15 @@ it("reserves declared real checkout before native mutation and fences stale gene
   ).rejects.toThrow("stale");
   expect(s.execute).toHaveBeenCalledOnce();
 });
+it("preserves all observed native resource claims without taking a legacy context reservation", async () => {
+  const s = setup();
+  const tools = createAgentTools({ ...s, nativeExecution: true });
+  const reserve = vi.fn(async () => {}), beforeNative = vi.fn(async () => {});
+  const current = { ...input, source: "slack" as const, userId: "U123", execution: { contextId: "ctx", requestId: "req", generation: 1, assertActive() {}, reserve, beforeNative, async onNative() {} } };
+  await tools.call("orca_workspaces", {}, current);
+  await tools.call("orca_execute", { action: "jobs.run", project: "gh", prompt: "work", worktree: "gh::/projects/gh", access: "write", resources: [{ workspace: "scsms::/projects/scsms", mode: "read" }], externalResources: ["external:service:test"] }, current);
+  expect(reserve).not.toHaveBeenCalled(); expect(beforeNative).not.toHaveBeenCalled();
+  expect(s.execute.mock.calls[0]?.[0]).toMatchObject({ source: "slack", userId: "U123", nativeScope: { resources: [
+    { resourceKey: "checkout:/projects/gh", mode: "write" }, { resourceKey: "checkout:/projects/scsms", mode: "read" }, { resourceKey: "external:service:test", mode: "write" }
+  ] } });
+});

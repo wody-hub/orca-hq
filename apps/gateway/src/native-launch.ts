@@ -216,16 +216,16 @@ export function observedNativeWorkerReceipt(
   const verifiedRequested = item.resumeTerminalHandle ? record(journal.requested) : requested;
   const verifiedEffective = item.resumeTerminalHandle ? record(journal.effective) : effective;
   const dispatchId = text(dispatch.id);
-  const terminalHandle = text(worker.agent_terminal_handle ?? terminal.handle);
+  const terminalHandle = text(worker.agentTerminalHandle ?? worker.agent_terminal_handle ?? terminal.handle);
   if (
     !journal.taskId ||
     !dispatchId ||
     dispatchId !== journal.dispatchId ||
-    text(dispatch.task_id) !== journal.taskId ||
-    (text(dispatch.run_id) !== undefined && text(dispatch.run_id) !== journal.runId) ||
+    text(dispatch.taskId ?? dispatch.task_id) !== journal.taskId ||
+    (text(dispatch.runId ?? dispatch.run_id) !== undefined && text(dispatch.runId ?? dispatch.run_id) !== journal.runId) ||
     worker.state !== "ready" ||
     worker.stage !== "input_accepted" ||
-    worker.worktree_id !== item.worktreeId ||
+    (worker.worktreeId ?? worker.worktree_id) !== item.worktreeId ||
     !terminalHandle ||
     terminal.handle !== terminalHandle ||
     terminal.worktreeId !== item.worktreeId ||

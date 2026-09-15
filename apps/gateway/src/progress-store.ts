@@ -1,3 +1,4 @@
+import { createNativeJournal, type NativeJournal } from "./native-journal.js";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -30,6 +31,8 @@ import type {
  * callers never pass an HTTP-supplied owner key to individual operations.
  */
 export interface ProgressStore {
+  nativeJournal(): NativeJournal;
+  reconcileNativeAssignment(input: { contextId: string; requestId: string; generation: number; outcome: AssignmentOutcome }): boolean;
   createWorkerAdmission(options: WorkerAdmissionOptions): WorkerAdmission;
   acceptRequest(input: SubmitProgressRequest): ProgressRequestAcceptance;
   claimNextRequest(claimantId: string): ClaimedProgressRequest | undefined;
@@ -458,6 +461,30 @@ export class SqliteProgressStore implements ProgressStore {
     }
     this.migrate();
     migrateWorkerAdmission(this.database);
+  }
+
+  reconcileNativeAssignment(input: { contextId: string; requestId: string; generation: number; outcome: AssignmentOutcome }): boolean {
+    return this.database.transaction(() => {
+      if (this.getRequest(input.requestId)?.state !== "recovery_required" ||
+          this.getContextAgent(input.contextId)?.generation !== input.generation) return false;
+      const rows = this.database.prepare("SELECT state, item_json FROM hq_worker_attempts WHERE owner_key=? AND request_id=? AND context_id=?").all(this.options.ownerKey, input.requestId, input.contextId) as Array<{ state: string; item_json: string }>;
+      if (!rows.length || rows.some(row => row.state !== "settled" || JSON.parse(row.item_json).generation !== input.generation)) return false;
+      for (const assignment of this.listRequestAssignments(input.requestId).filter(a => a.contextId === input.contextId)) {
+        if (assignment.outcome && assignment.outcome.state !== "recovery_required") continue;
+        this.database.prepare("UPDATE request_contexts SET outcome_json=? WHERE request_id=? AND part_id=?").run(JSON.stringify(input.outcome), input.requestId, assignment.partId);
+        this.appendEvent({ requestId: input.requestId, contextId: input.contextId, eventKey: `native-reconciled:${input.requestId}:${assignment.partId}`,
+          kind: input.outcome.state === "completed" ? "request.completed" : "request.failed", source: "orca", payload: { text: input.outcome.text, partId: assignment.partId } });
+      }
+      this.updateContext({ contextId: input.contextId, state: input.outcome.state, summary: input.outcome.text });
+      const outcomes = this.listRequestAssignments(input.requestId).map(a => a.outcome);
+      if (outcomes.every(o => o && o.state !== "recovery_required")) this.completeRequest({ requestId: input.requestId, eventKey: `native-reconciled:${input.requestId}`,
+        state: outcomes.every(o => o!.state === "completed") ? "completed" : "failed", text: outcomes.map(o => o!.text).join("\n") });
+      return true;
+    }).immediate();
+  }
+
+  nativeJournal(): NativeJournal {
+    return createNativeJournal(this.database, this.options.ownerKey);
   }
 
   createWorkerAdmission(options: WorkerAdmissionOptions): WorkerAdmission {

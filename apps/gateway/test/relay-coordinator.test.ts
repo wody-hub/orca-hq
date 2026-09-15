@@ -114,3 +114,10 @@ it("keeps an explicit terminal-create failure journaled because a failed respons
   await expect(createRelayCoordinator(f).resolve("run-existing")).rejects.toThrow();
   expect(f.calls.some(a => a[1] === "create")).toBe(false);
 });
+
+it("fences a stale scheduler before coordinator terminal creation or Run rebinding", async () => {
+  const f = await fixture();
+  const coordinator = createRelayCoordinator({ ...f, assertActive() { throw Error("coordinator_fenced"); } });
+  await expect(coordinator.resolve("run-existing")).rejects.toThrow("coordinator_fenced");
+  expect(f.calls.some(a => a[1] === "create" || a[1] === "run-use")).toBe(false);
+});

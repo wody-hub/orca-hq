@@ -9,7 +9,7 @@ import { createLocalSessionService } from "@orca-hq/tailscale-adapter";
 import { ExecutionService } from "@orca-hq/worker-routing";
 import { describe, expect, it } from "vitest";
 
-import { run } from "../src/entry.js";
+import { run, runInstalledGateway } from "../src/entry.js";
 import {
   createGatewayHost,
   type GatewayExternalBoundaries
@@ -129,6 +129,10 @@ describe("gateway production entry", () => {
       const composition = await run(() => createGatewayHost(async () => externalBoundaries(directory, events)));
       expect(composition.gateway.status.kind).toBe("running");
       expect(composition.services.execution).toBeInstanceOf(ExecutionService);
+      for (const method of ["start", "recordWorkerMessage", "recordVerificationReport", "recordLaunchFailure"] as const) {
+        await expect(composition.services.execution[method]({} as never)).rejects.toThrow("native_admission_required");
+      }
+
       expect(composition.services.outbox).toBeInstanceOf(OutboxDispatcher);
       expect(events).toEqual(["config.valid", "orca.checked", "channels.resumed", "slack.started", "telegram.started"]);
       await composition.gateway.stop();
@@ -197,4 +201,30 @@ describe("gateway production entry", () => {
       }
     }
   );
+});
+
+
+it("selects external-adapter hosting with native execution fenced and read-only services available", async () => {
+  const prior = process.env.GATEWAY_EXTERNAL_ADAPTERS;
+  process.env.GATEWAY_EXTERNAL_ADAPTERS = "file:///isolated-test-adapter.js";
+  const directory = await mkdtemp(join(tmpdir(), "external-native-fence-"));
+  let composition: Awaited<ReturnType<typeof run>> | undefined;
+  try {
+    const runtime = await runInstalledGateway({
+      local: async () => { throw Error("wrong composition"); },
+      external: async () => {
+        composition = await run(() => createGatewayHost(async () => externalBoundaries(directory, [])));
+        return { stop: async () => { await composition!.gateway.stop(); } };
+      }
+    });
+    expect(composition!.services.store.listTasks()).toEqual([]);
+    for (const method of ["start", "recordWorkerMessage", "recordVerificationReport", "recordLaunchFailure"] as const) {
+      await expect(composition!.services.execution[method]({} as never)).rejects.toThrow("native_admission_required");
+    }
+    await runtime.stop();
+  } finally {
+    if (prior === undefined) delete process.env.GATEWAY_EXTERNAL_ADAPTERS;
+    else process.env.GATEWAY_EXTERNAL_ADAPTERS = prior;
+    await rm(directory, { recursive: true, force: true });
+  }
 });

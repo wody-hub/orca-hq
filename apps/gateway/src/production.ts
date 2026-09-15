@@ -81,6 +81,7 @@ export interface GatewayExecutionComposition {
  * their public concrete implementations exactly once.
  */
 export interface GatewayProductionDependencies {
+  readonly nativeAdmissionRequired?: boolean;
   readonly config: GatewayConfigPort;
   /** A real Orca client is external I/O and may be injected; options construct the default client. */
   readonly orca: OrcaClientOptions | Pick<OrcaClient, "health" | "execute">;
@@ -656,6 +657,14 @@ export async function createProductionGateway(
               ? {}
               : { workerLaunchPolicy: dependencies.execution.workerLaunchPolicy })
           });
+          if (dependencies.nativeAdmissionRequired) {
+            const blocked = async (): Promise<never> => { throw Error("native_admission_required"); };
+            // These four public entry points cover root, verifier, fix, and launch retry paths.
+            execution.start = blocked;
+            execution.recordWorkerMessage = blocked;
+            execution.recordVerificationReport = blocked;
+            execution.recordLaunchFailure = blocked;
+          }
           const outbox = new OutboxDispatcher({ ...dependencies.outbox, store });
           outboxDriver = new GatewayOutboxDriver({
             dispatcher: outbox,

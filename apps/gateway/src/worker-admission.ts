@@ -54,7 +54,7 @@ export type WorkerReconciliation =
   | { state: "settled"; dispatchId: string; outcome: WorkerOutcome; resourceVerdict: WorkerResourceVerdict };
 export interface WorkerAdmission {
   enqueue(item: NativeWorkItem): void;
-  claimNext(): NativeWorkItem | undefined;
+  claimNext(canClaim?: (item: NativeWorkItem) => boolean): NativeWorkItem | undefined;
   /** Fenced mutation-boundary assertion immediately before native effects. */
   assertLaunchAuthorized(attemptId: string): NativeWorkItem;
   bindReceipt(receipt: NativeWorkerReceipt): void;
@@ -238,7 +238,7 @@ export function createSqliteWorkerAdmission(database: Database, ownerKey: string
         ).run(item.attemptId, ownerKey, item.requestId, item.contextId, JSON.stringify(item), now().toISOString());
       });
     },
-    claimNext() {
+    claimNext(canClaim) {
       return mutate(() => {
         if (coordinator()?.ready !== 1) return undefined;
         const count = database.prepare(`SELECT COUNT(*) AS n FROM hq_worker_attempts WHERE state IN ${OCCUPIED}`).get() as { n: number };
@@ -250,6 +250,7 @@ export function createSqliteWorkerAdmission(database: Database, ownerKey: string
         for (const candidate of queue) {
           const item = parseItem(candidate);
           if (!authorized(item)) continue;
+          if (canClaim && !canClaim(item)) { waiting.push(...claimResources(item)); continue; }
           if (!item.dependsOn.every(id => { const parent = row(id); return parent?.state === "settled" && parent.outcome === "succeeded"; })) continue;
           const resources = claimResources(item);
           const conflict = resources.some(resource =>

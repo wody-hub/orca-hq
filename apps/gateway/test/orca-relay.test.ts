@@ -1549,3 +1549,160 @@ it("delivers known-worker guidance while unrelated native creation is stalled", 
     await relay.close();
   }
 });
+
+it("accepts the current CLI camelCase worker receipt and cleans only exact settled ownership", async () => {
+  const transport = nativeLaunchTransport();
+  const admission = nativeAdmission();
+  let settled = false, retained = false;
+  const run = async (args: readonly string[]) => {
+    const value = await transport.run(args);
+    const response = value as { ok: boolean; result: Record<string, any> };
+    if (args[1] === "worker-show" && response.result.worker) {
+      const worker = response.result.worker;
+      worker.worktreeId = worker.worktree_id; delete worker.worktree_id;
+      worker.agentTerminalHandle = worker.agent_terminal_handle; delete worker.agent_terminal_handle;
+      response.result.dispatch.status = settled ? "completed" : "dispatched";
+      if (retained) response.result.terminalResource.releaseState = "retained";
+    }
+    if (args[1] === "worker-retain") { retained = true; response.result = { state: "retained" }; }
+    return response;
+  };
+  const relay = createOrcaRelay({ databasePath: ":memory:", coordinatorHandle: "term-coordinator", run,
+    nativeAdmission: admission.port, resolveNativeProject: async () => project, nativeRetentionPolicy: "retain", nativeOnly: true });
+  try {
+    await relay.start();
+    const launched = await relay.startNativeWork(nativeItem);
+    expect(launched.state).toBe("ready");
+    if (launched.state !== "ready") throw Error("receipt missing");
+    expect(await relay.cleanupNative(launched.receipt, "retain")).toMatchObject({ verdict: "unknown" });
+    settled = true;
+    expect(await relay.cleanupNative(launched.receipt, "retain")).toMatchObject({ verdict: "retained_idle" });
+    expect(await relay.cleanupNative(launched.receipt, "retain")).toMatchObject({ verdict: "retained_idle" });
+    expect(transport.calls.filter(a => a[1] === "worker-retain")).toHaveLength(1);
+    expect(transport.calls.some(a => a[0] === "terminal" && a[1] === "close")).toBe(false);
+    await expect(relay.submit({ requestId: "bypass", project, prompt: "work" })).rejects.toThrow("native_admission_required");
+    await expect(relay.retry("task-native", "retry")).rejects.toThrow("native_admission_required");
+    await expect(relay.followup("task-native", "work", "follow")).rejects.toThrow("native_admission_required");
+  } finally { await relay.close(); }
+});
+
+it.each(["released", "release_unknown"])("records exact native release outcome %s without raw terminal close", async state => {
+  const transport = nativeLaunchTransport(); const admission = nativeAdmission();
+  const run = async (args: readonly string[]) => {
+    const response = await transport.run(args) as { ok: boolean; result: Record<string, any> };
+    if (args[1] === "worker-show") response.result.dispatch.status = "completed";
+    if (args[1] === "worker-release") response.result = { state, dispatchId: "dispatch-native", recovery: { nextAction: "worker-show" } };
+    return response;
+  };
+  const relay = createOrcaRelay({ databasePath: ":memory:", coordinatorHandle: "term-coordinator", run, nativeAdmission: admission.port, resolveNativeProject: async () => project, nativeRetentionPolicy: "release" });
+  try {
+    await relay.start(); const launched = await relay.startNativeWork(nativeItem);
+    if (launched.state !== "ready") throw Error("receipt missing");
+    expect(await relay.cleanupNative(launched.receipt, "release")).toMatchObject({ verdict: state === "released" ? "released" : "unknown" });
+    await relay.cleanupNative(launched.receipt, "release");
+    expect(transport.calls.filter(a => a[1] === "worker-release")).toHaveLength(1);
+    expect(transport.calls.some(a => a[0] === "terminal" && a[1] === "close")).toBe(false);
+  } finally { await relay.close(); }
+});
+
+it("reactivates a restart only on an exactly owned receipt plus an authoritative live agent verdict", async () => {
+  const transport = nativeLaunchTransport();
+  const admission = nativeAdmission();
+  const calls: string[][] = [];
+  // `worker-show.observation.status` is PTY liveness; `worker-list.projection.liveness` is the
+  // authoritative agent verdict. The fixture keeps the PTY live in every case below so only the
+  // authoritative row can explain a `live: false`.
+  const fleetRow = (over: Record<string, any> = {}) => ({
+    dispatchId: "dispatch-native", taskId: "task-native", runId: "run-native",
+    workerState: "ready", dispatchStatus: "dispatched",
+    agentTerminalHandle: "term-native", terminalState: "active",
+    resource: { ownershipState: "owned", releaseState: "not_requested", terminalHandle: "term-native", ownerDispatchId: "dispatch-native" },
+    projection: { liveness: { verdict: "live", observedAt: 1789433036441, source: "agent_status" } },
+    ...over
+  });
+  let pages: Record<string, any>[][] = [[fleetRow()]];
+  let editShown: (shown: Record<string, any>) => void = () => {};
+  const run = async (args: readonly string[]) => {
+    calls.push([...args]);
+    if (args[1] === "worker-list") {
+      const cursor = args.indexOf("--cursor");
+      const page = cursor >= 0 ? Number(args[cursor + 1]) : 0;
+      const more = page + 1 < pages.length;
+      return { id: `list-${page}`, ok: true, result: { workers: pages[page] ?? [], counts: {},
+        page: { limit: 100, total: pages.flat().length, hasMore: more, nextCursor: more ? String(page + 1) : null },
+        scope: { run: "run-native", source: "flag" } } };
+    }
+    const response = await transport.run(args) as { ok: boolean; result: Record<string, any> };
+    if (args[1] === "worker-show" && response.result.dispatch?.id === "dispatch-native") editShown(response.result);
+    return response;
+  };
+  const shows = () => calls.filter(a => a[1] === "worker-show").length;
+  const relay = createOrcaRelay({ databasePath: ":memory:", coordinatorHandle: "term-coordinator", run,
+    nativeAdmission: admission.port, resolveNativeProject: async () => project, nativeRetentionPolicy: "retain", nativeOnly: true });
+  try {
+    await relay.start();
+    const launched = await relay.startNativeWork(nativeItem);
+    if (launched.state !== "ready") throw Error("receipt missing");
+    const receipt = launched.receipt;
+
+    // Exact ownership plus an authoritative `live` verdict is the only reactivating combination.
+    expect(await relay.observeNativeWorker(receipt)).toEqual({ live: true });
+    expect(calls.filter(a => a[1] === "worker-list")[0]).toEqual(
+      expect.arrayContaining(["worker-list", "--run", "run-native", "--limit", "100"]));
+
+    // The authoritative row may be on a later page; an exhausted listing is absence, not death.
+    pages = [[fleetRow({ dispatchId: "dispatch-other", taskId: "task-other" })], [fleetRow()]];
+    expect(await relay.observeNativeWorker(receipt)).toEqual({ live: true });
+    pages = [[fleetRow({ dispatchId: "dispatch-other", taskId: "task-other" })]];
+    expect(await relay.observeNativeWorker(receipt)).toMatchObject({ live: false });
+
+    // A live PTY with a non-live agent must never reactivate, whichever absence the fleet reports.
+    for (const verdict of ["exited", "unverifiable", "unknown"]) {
+      pages = [[fleetRow({ projection: { liveness: { verdict, observedAt: 1, reason: "probe" } } })]];
+      const observation = await relay.observeNativeWorker(receipt);
+      expect(observation).toMatchObject({ live: false, recovery: { projected: { projection: { liveness: { verdict } } } } });
+      expect(observation).not.toMatchObject({ live: true });
+    }
+    // An older host that never reports a verdict is absence too, never an implied `live`.
+    pages = [[fleetRow({ projection: {} })]];
+    expect(await relay.observeNativeWorker(receipt)).toMatchObject({ live: false });
+    pages = [[fleetRow({ projection: { liveness: { verdict: "live" } }, taskId: "task-other" })]];
+    expect(await relay.observeNativeWorker(receipt)).toMatchObject({ live: false });
+
+    // A live agent on a row this receipt no longer exactly owns is somebody else's worker.
+    for (const row of [{ resource: { ownershipState: "owned", ownerDispatchId: "dispatch-other", terminalHandle: "term-native" } },
+      { resource: { ownershipState: "transferred", ownerDispatchId: "dispatch-native", terminalHandle: "term-native" } },
+      { agentTerminalHandle: "term-other" }, { runId: "run-other" },
+      { terminalState: "retained" }, { terminalState: "released" }, { terminalState: "release_pending" }])
+      { pages = [[fleetRow(row)]]; expect(await relay.observeNativeWorker(receipt)).toMatchObject({ live: false }); }
+
+    pages = [[fleetRow()]];
+    expect(await relay.observeNativeWorker(receipt)).toEqual({ live: true });
+
+    // A settled, retained or reincarnated Dispatch fails on the exactness gate, before any fleet read.
+    for (const edit of [(shown: Record<string, any>) => { shown.dispatch.status = "completed"; },
+      (shown: Record<string, any>) => { shown.terminalResource.releaseState = "retained"; },
+      (shown: Record<string, any>) => { shown.terminalResource.ownerDispatchId = "dispatch-other"; },
+      (shown: Record<string, any>) => { shown.terminal.incarnationId = "session-reincarnated"; },
+      (shown: Record<string, any>) => { shown.observation.exactWorker = false; },
+      (shown: Record<string, any>) => { shown.terminal.connected = false; }]) {
+      editShown = edit;
+      const before = calls.filter(a => a[1] === "worker-list").length;
+      expect(await relay.observeNativeWorker(receipt)).toMatchObject({ live: false });
+      expect(calls.filter(a => a[1] === "worker-list")).toHaveLength(before);
+    }
+    editShown = () => {};
+
+    // A receipt that is not the journaled one is refused without observing anything at all.
+    const observedShows = shows();
+    expect(await relay.observeNativeWorker({ ...receipt, dispatchId: "dispatch-other" })).toMatchObject({ live: false });
+    expect(shows()).toBe(observedShows);
+
+    // Observation is read-only: it never relaunches, stops, retains, releases or closes a terminal.
+    expect(calls.filter(a => a[1] === "worker-start")).toHaveLength(1);
+    expect(calls.filter(a => ["worker-stop", "worker-retain", "worker-release", "worker-abandon", "send", "dispatch"].includes(String(a[1])))).toHaveLength(0);
+    expect(calls.some(a => a[0] === "terminal" && a[1] === "close")).toBe(false);
+    expect(admission.receipts).toHaveLength(1);
+    expect(admission.unknown()).toBe(0);
+  } finally { await relay.close(); }
+});

@@ -54,6 +54,9 @@ export interface ProgressRuntimeOptions {
   ) => Promise<ManagedCommandResult>;
   readJobs?: (requestId: string) => Promise<ManagedCommandResult>;
   hasLegacyConflict?: (resources: readonly ResourceAccess[]) => boolean;
+  nativeExecution?: boolean;
+  pendingNativeQuestions?: () => Array<{ id: string; body: string; attemptId: string }>;
+  answerNativeQuestion?: (messageId: string, text: string, requestId: string) => Promise<void>;
   maxContexts?: number;
   pollMs?: number;
 }
@@ -64,6 +67,7 @@ const stable = (...parts: string[]) =>
 export function createProgressRuntime(options: ProgressRuntimeOptions) {
   const store = options.store;
   const executor = createContextExecutor({
+    ...(options.nativeExecution ? { mode: "native" as const } : {}),
     ...(options.maxContexts === undefined
       ? {}
       : { maxContexts: options.maxContexts }),
@@ -215,6 +219,7 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
     return true;
   }
   async function notify(job: CommandJob) {
+    if (options.nativeExecution && store.nativeJournal().list<{ items: Array<{ requestId: string }> }>("plan").some(p => p.items.some(i => i.requestId === job.execution?.requestId))) return;
     if (
       job.execution &&
       (store.getContextAgent(job.execution.contextId)?.generation ?? 0) >
@@ -441,8 +446,7 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
         signal: cancellation.signal,
         id: request.requestId + "-" + partId,
         text: instruction,
-        source: "terminal",
-        userId: "local",
+        ...(store.nativeJournal().get<Pick<ManagedCommandInput, "source" | "userId" | "nativeScope">>("origin", request.requestId) ?? { source: "terminal" as const, userId: "local" }),
         sessionId: request.sessionId,
         conversationId: "context:" + contextId,
         onThread: (threadId) => store.updateContext({ contextId, threadId }),
@@ -536,6 +540,11 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
           text: "사용자 요청으로 업무 에이전트를 중지했습니다.",
           state: "failed",
         };
+      if (options.nativeExecution) {
+        store.updateContext({ contextId, summary: publicProgressText(result.text), state: result.state ?? "completed" });
+        store.setContextAgent({ contextId, agentId, state: result.state ?? "completed", generation: currentGeneration, currentRequestId: request.requestId });
+        return result;
+      }
       // Results can include read-only jobs.show; only the mutation callback owns a native slot.
       store.updateContext({
         contextId,
@@ -630,6 +639,13 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
           text: store.getRequestInput(e.requestId)?.text ?? "",
           question: String(e.payload.text ?? ""),
         }));
+      const nativeQuestions = options.pendingNativeQuestions?.() ?? [];
+      const answerId = request.text.match(/^\/answer\s+(\S+)\s+([\s\S]+)$/u);
+      if (answerId && nativeQuestions.some(q => q.id === answerId[1]) && options.answerNativeQuestion) {
+        await options.answerNativeQuestion(answerId[1]!, answerId[2]!, requestId);
+        complete({ requestId, eventKey: stable("native-answer", requestId), state: "completed", text: "Orca 작업자 질문에 답변을 저장했습니다." });
+        return;
+      }
       const priorAssignments = store.listRequestAssignments(requestId);
       const decision: RoutingDecision = priorAssignments.length
         ? {
@@ -996,7 +1012,12 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
           input.userId,
           input.conversationId ?? input.sessionId ?? "default",
         );
-      http.submit({ requestId, sessionId, text: input.text });
+      const origin = { source: input.source, userId: input.userId, ...(input.nativeScope ? { nativeScope: input.nativeScope } : {}) };
+      const previousOrigin = store.nativeJournal().get("origin", requestId);
+      if (previousOrigin && JSON.stringify(previousOrigin) !== JSON.stringify(origin)) throw Error("request_origin_collision");
+      store.nativeJournal().put("origin", requestId, origin);
+      const linkedContext = input.contextJobId ? store.listContextJobs().find(link => link.jobId === input.contextJobId)?.contextId : undefined;
+      http.submit({ requestId, sessionId, text: input.text, ...(linkedContext ? { contextHint: { mode: "continue" as const, contextId: linkedContext } } : {}) });
       let cursor = 0;
       for (;;) {
         if (stopping) throw new Error("progress_runtime_closed");
@@ -1052,7 +1073,7 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
           if (job) await notify(job);
         }
       for (const r of store.listExecutionReservations())
-        if (r.state !== "released") {
+        if (r.state !== "released" && !r.agentId.startsWith("attempt:")) {
           generation = Math.max(generation, r.generation);
           if (!store.getContext(r.contextId)?.jobIds.length) {
             options.reservations.retainForRecovery(reservationIdentity(r));
@@ -1066,7 +1087,7 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
       timer = setInterval(() => {
         drain();
         for (const r of store.listExecutionReservations())
-          if (r.state !== "released")
+          if (r.state !== "released" && !r.agentId.startsWith("attempt:"))
             try {
               options.reservations.heartbeat(reservationIdentity(r));
             } catch {

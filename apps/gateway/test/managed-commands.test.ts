@@ -47,3 +47,17 @@ describe('managed commands',()=>{
   const h=harness();await expect(h.commands.execute(input('/hq {"action":"projects.add"}'))).rejects.toThrow();expect(h.catalog.add).not.toHaveBeenCalled();expect(h.jobs.submit).not.toHaveBeenCalled();
  });
 });
+it('routes native submit, retry, followup and code review through one identity-preserving admission entry',async()=>{
+ const h=harness();
+ const nativeExecute=vi.fn(async()=>({text:'native result'}));
+ const commands=createManagedCommands({catalog:h.catalog,jobs:h.jobs,nativeExecute});
+ for(const action of [
+  {action:'jobs.run',project:'p1',prompt:'analyze'},
+  {action:'jobs.retry',jobId:'j1'},
+  {action:'jobs.followup',jobId:'j1',prompt:'continue'},
+  {action:'projects.review',project:'p1'}
+ ]) await commands.execute({...input('/hq '+JSON.stringify(action)),source:'slack',userId:'U123'});
+ expect(nativeExecute).toHaveBeenCalledTimes(4);
+ expect(nativeExecute.mock.calls.every(call=>(call as unknown as [{source:string;userId:string}])[0].source==='slack')).toBe(true);
+ expect(h.jobs.submit).not.toHaveBeenCalled();expect(h.jobs.retry).not.toHaveBeenCalled();expect(h.jobs.followup).not.toHaveBeenCalled();
+});

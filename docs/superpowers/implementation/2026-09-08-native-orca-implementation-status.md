@@ -1,10 +1,10 @@
 # HQ native Orca 구현 여부 확인
 
-> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1(실행 계약·계획기·native 이벤트 검증)을 구현했고 집중 테스트 48개와 소스 타입 검사를 통과했다. [Task 1 결과](2026-09-08-native-orca-task1-result.md)를 참조한다. 이후 Task 2(지속형 워커 진입 제어·리소스 점유·재시작 복구·코디네이터 소유권 검증)도 구현했고 관련 테스트 62개와 소스 타입 검사를 통과했다. [Task 2 결과](2026-09-08-native-orca-task2-result.md)를 참조한다. 이후 Task 3(명시적 모델·터미널 실행, 실행 기록·복구, 안전한 터미널 재사용)도 구현했고 관련 테스트 108개와 소스 타입 검사를 통과했다. [Task 3 결과](2026-09-08-native-orca-task3-result.md)를 참조한다. Task 4 이후와 운영 설치는 아직 완료되지 않았다.
+> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1(실행 계약·계획기·native 이벤트 검증)을 구현했고 집중 테스트 48개와 소스 타입 검사를 통과했다. [Task 1 결과](2026-09-08-native-orca-task1-result.md)를 참조한다. 이후 Task 2(지속형 워커 진입 제어·리소스 점유·재시작 복구·코디네이터 소유권 검증)도 구현했고 관련 테스트 62개와 소스 타입 검사를 통과했다. [Task 2 결과](2026-09-08-native-orca-task2-result.md)를 참조한다. 이후 Task 3(명시적 모델·터미널 실행, 실행 기록·복구, 안전한 터미널 재사용)도 구현했고 관련 테스트 108개와 소스 타입 검사를 통과했다. [Task 3 결과](2026-09-08-native-orca-task3-result.md)를 참조한다. Task 4(native runtime·durable Delivery·공통 admission·외부 실행 우회 차단)도 구현했고 188개 집중 테스트, `pnpm typecheck`, 전체 1191개 테스트를 통과했다. [Task 4 결과](2026-09-15-native-orca-task4-result.md)를 참조한다. Task 4 순차 독립 리뷰도 끝났고 blocker 1건과 후속 4건을 모두 수정했다. [Task 4 리뷰](2026-09-15-native-orca-task4-review.md)의 **Review resolutions** 절에 항목별 해소 내역, 근거 있는 부분 이견 1건, 그리고 재시작 생존 판정을 권위 있는 `worker-list projection.liveness`로 바로잡은 후속 보정이 있다. Task 5~7과 운영 설치는 남아 있다. 과거 기준점 `86e3845`의 typecheck·1165개 테스트·전체 빌드 통과와 이번 Task 4 새 검증을 구분한다.
 
 확인일: 2026-09-08. 기준: 최신 native Orca 설계 및 실행 계획. 동시 실행은 **초기 기본값 10, 양의 안전한 정수 또는 `"unlimited"`로 변경 가능**이라는 사용자 결정을 적용한다.
 
-## 저장소 판정
+## 구현 전 저장소 판정 (2026-09-08 기록)
 
 **새 계획의 완료 기준을 충족한 작업 0개, 기존 기반이 있는 부분 구현 6개, 미구현 1개.** 기존 HQ 전체가 미구현이라는 뜻이 아니다. 새 설계의 핵심 실행 경로와 전역 worker admission은 아직 구현되지 않았다.
 
@@ -21,7 +21,7 @@
 
 정확한 파일·라인 및 7개 작업별 분류: [source audit](2026-09-08-native-orca-source-status.md). 표의 경로는 gateway source 기준이다.
 
-## 이번 검증
+## 구현 전 검증 (2026-09-08 기록)
 
 설치 상태 검토에서도 관련 gateway·relay·installer 소스/빌드 파일이 작업 저장소와 byte-identical한 것으로 확인됐다. `hq status`는 running/PID 16888, doctor는 활성 검사 통과를 보고했다. 실제 서비스 실행 경로는 `/Users/j.jaeyo/Applications/orca-hq/apps/gateway/dist/entry.js`다. 즉 현재 설치는 정상 운영 상태지만 새 설계의 구현·설치 완료 상태는 아니다. 단순한 설치 파일 불일치로 설명되지 않는다. [installed audit](2026-09-08-native-orca-installed-status.md)에 비교 파일 목록과 근거가 있다.
 
@@ -48,6 +48,6 @@ Run: `run_8bb7664f144b`.
 
 두 검토 Task의 succeeded worker_done을 수신했고, 각각 worker-release로 해당 검토 터미널을 정리했다. 두 transcript는 Orca에 보관됐고 최종 Delivery를 확인·ack했다.
 
-## 다음 구현 순서
+## 현재 다음 순서 (2026-09-15)
 
-기존 기반을 보존하며 계획 Task 1(실행 계약·planner)부터 진행한다. 이후 공통 admission과 명시적 native launch를 구현하고 runtime을 연결한다. UI·migration 뒤에 실제 HQ endpoint와 native worker를 연결한 검증을 수행한다. 이번 작업은 구현 여부 확인 범위이며, 운영 코드 수정·설치·재시작·commit·push·외부 채널 메시지는 하지 않았다.
+Task 4 순차 리뷰와 그 수정이 끝났으므로 다음은 Task 5의 native worker 표시·설정 UX다. quarantine 기록의 운영자 표면도 Task 5 범위다. 이후 Task 6~7의 migration 및 실제 HQ endpoint/GUI 검증이 남는다. Task 4 구현은 기존 checkout에서 수행했고 설치·재시작·commit·push·외부 채널 메시지를 수행하지 않았다. 위 표와 설치 상태 서술은 구현 전 감사 기록이며 현재 소스 구현 판정으로 재사용하지 않는다.

@@ -327,6 +327,7 @@ interface Seen {
   runs: Map<string, Workspace>;
 }
 export interface AgentToolsOptions {
+  nativeExecution?: boolean;
   catalog: ManagedCommandPorts["catalog"];
   execute: (input: ManagedCommandInput) => Promise<ManagedCommandResult>;
   listJobs?: () => unknown;
@@ -813,9 +814,12 @@ export function createAgentTools(options: AgentToolsOptions) {
             };
             break;
           }
+          // The model types a selector; every downstream claim must carry the catalog id it resolves
+          // to, so an alias can never miss an identity match and reopen a wider default.
+          let resolvedProject: CommandProject | undefined;
           if ("project" in a) {
-            const p = await enabled(a.project, a.action === "projects.restore");
-            a.project = p.id;
+            resolvedProject = await enabled(a.project, a.action === "projects.restore");
+            a.project = resolvedProject.id;
           }
           if (a.action === "jobs.run" && a.worktree) {
             const w = await workspace(seen, a.worktree);
@@ -827,7 +831,7 @@ export function createAgentTools(options: AgentToolsOptions) {
               throw new Error("작업 공간과 프로젝트가 일치하지 않습니다.");
             a.worktree = String(w.metadata.id);
           }
-          if (input.execution) {
+          if (input.execution || options.nativeExecution) {
             if (a.action === "jobs.run") {
               if (
                 !a.worktree ||
@@ -838,7 +842,7 @@ export function createAgentTools(options: AgentToolsOptions) {
                 throw new Error(
                   "실행 전 작업 공간과 read/write 접근, 전체 checkout 및 외부 자원을 선언해주세요.",
                 );
-              await input.execution.beforeNative();
+              if (!options.nativeExecution) await input.execution!.beforeNative();
               const selected = await workspace(seen, a.worktree);
               const resources = [
                 { resourceKey: selected.path, mode: a.access },
@@ -853,17 +857,18 @@ export function createAgentTools(options: AgentToolsOptions) {
                   mode: "write" as const,
                 })),
               ];
-              await input.execution.reserve(
+              if (options.nativeExecution) input = { ...input, nativeScope: { projectId: resolvedProject!.id, worktreeId: a.worktree, access: a.access, resources: resources.map(r => ({ ...r, resourceKey: r.resourceKey.startsWith("external:") ? r.resourceKey : `checkout:${r.resourceKey}` })) } };
+              else await input.execution!.reserve(
                 resources,
                 ...(input.signal ? [input.signal] : []),
               );
-              input.execution.assertActive();
+              input.execution?.assertActive();
             } else if (
               a.action === "jobs.retry" ||
               a.action === "jobs.followup"
-            )
-              await input.execution.beforeNative(a.jobId);
-            else if (a.action.startsWith("projects."))
+            ) {
+              if (!options.nativeExecution) await input.execution!.beforeNative(a.jobId);
+            } else if (a.action.startsWith("projects.") && input.execution)
               await input.execution.reserve([
                 { resourceKey: "external:orca-project-catalog", mode: "write" },
               ]);
@@ -882,7 +887,7 @@ export function createAgentTools(options: AgentToolsOptions) {
                 }
               : a;
           if (input.signal?.aborted) throw new Error("context_turn_cancelled");
-          if (["jobs.run", "jobs.retry", "jobs.followup"].includes(a.action))
+          if (!options.nativeExecution && ["jobs.run", "jobs.retry", "jobs.followup"].includes(a.action))
             input.execution?.markNativeAttempt?.();
           result = await options.execute({
             ...input,
@@ -891,6 +896,7 @@ export function createAgentTools(options: AgentToolsOptions) {
           const resultJob = (result as ManagedCommandResult)?.jobId;
           if (
             resultJob &&
+            !options.nativeExecution &&
             input.execution &&
             ["jobs.run", "jobs.retry", "jobs.followup"].includes(a.action)
           )
