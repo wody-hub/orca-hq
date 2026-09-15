@@ -4,6 +4,7 @@ import type { Readable } from "node:stream";
 import { runChat } from "./chat.js";
 import { createProgressClient, validProgressIdentifier, type ProgressClient } from "./progress-client.js";
 import { runWatch } from "./watch.js";
+import { launchConsole, type ConsoleClaim } from "./console.js";
 import type { ProgressWindowManager, ProgressWindowMode } from "./progress-window.js";
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
@@ -34,7 +35,7 @@ export type { HostAdapters } from "./host.js";
 
 const commandNames = [
   "setup", "credential", "doctor", "start", "stop", "status", "logs", "update", "uninstall",
-  "ask", "chat", "watch", "projects", "run", "jobs"
+  "ask", "chat", "watch", "console", "projects", "run", "jobs"
 ] as const;
 type CommandName = (typeof commandNames)[number];
 
@@ -56,6 +57,7 @@ export interface CliDependencies {
   readonly stdin?: Readable;
   readonly progress?: ProgressClient;
   readonly progressWindows?: ProgressWindowManager;
+  readonly consoleLauncher?: () => Promise<ConsoleClaim>;
   readonly signal?: AbortSignal;
 }
 
@@ -148,6 +150,17 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
   if (selected === undefined) {
     write(output, `Usage: hq ${commandNames.join("|")}`);
     return 2;
+  }
+  if (selected === "console") {
+    if (input.length !== 1) { write(output, "Usage: hq console"); return 2; }
+    try {
+      await (dependencies.consoleLauncher ?? launchConsole)();
+      write(output, "브라우저에서 운영 콘솔을 열었습니다. 접수 상태와 권위 있는 완료 상태를 구분해 확인하세요.");
+      return 0;
+    } catch {
+      write(output, "운영 콘솔을 열지 못했습니다. `hq start`로 게이트웨이 상태를 확인하세요.");
+      return 1;
+    }
   }
   let sessionId: string | undefined;
   let questionArguments = input.slice(1);

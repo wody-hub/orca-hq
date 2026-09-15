@@ -1,0 +1,327 @@
+diff --git a/packages/orca-adapter/src/receipts.ts b/packages/orca-adapter/src/receipts.ts
+--- a/packages/orca-adapter/src/receipts.ts
++++ b/packages/orca-adapter/src/receipts.ts
+@@ -250,17 +250,81 @@
+   runId: BoundedIdSchema,
+   mutation: MutationSchema.optional()
+ }).passthrough();
++// Public Orca 1.4.203 reply receipt: message.thread_id identifies the replied-to message.
++const OperationsMessageSchema = InboxMessageSchema.extend({
++  type: BoundedIdSchema,
++  run_id: BoundedIdSchema,
++  from_handle: BoundedIdSchema,
++  to_handle: BoundedIdSchema,
++  thread_id: BoundedIdSchema.nullable(),
++  created_at: z.string().datetime()
++});
+ const MessageMutationResultSchema = z.object({
+-  message: InboxMessageSchema,
++  message: OperationsMessageSchema,
+   mutation: MutationSchema
+ }).passthrough();
++const ReplyQuestionSchema = z.object({
++  message_id: BoundedIdSchema,
++  run_id: BoundedIdSchema,
++  dispatch_id: BoundedIdSchema,
++  asker_handle: BoundedIdSchema,
++  status: z.literal("answered"),
++  answer_message_id: BoundedIdSchema,
++  answer_body: BoundedTextSchema,
++  answered_by_generation: z.number().int().positive(),
++  created_at: z.string().datetime(),
++  answered_at: z.string().datetime(),
++  closed_at: z.string().datetime().nullable()
++}).passthrough();
+ const ReplyMutationResultSchema = z.object({
++  message: OperationsMessageSchema.extend({ thread_id: BoundedIdSchema }),
++  question: ReplyQuestionSchema.nullish(),
++  duplicate: z.boolean(),
+   mutation: MutationSchema
+-}).passthrough().refine((result) => "reply" in result || "message" in result, "reply result is required");
++}).passthrough();
++const OperationsStateSchema = z.string().trim().min(1).max(512);
++const OperationsWorkerReadBaseSchema = z.object({
++  dispatchId: BoundedIdSchema,
++  cursor: CursorSchema,
++  status: z.object({ worker: OperationsStateSchema, terminal: OperationsStateSchema }).passthrough(),
++  warnings: z.array(BoundedTextSchema).max(100),
++  archived: z.boolean()
++}).passthrough();
++const OperationsWorkerReadResultSchema = z.discriminatedUnion("source", [
++  OperationsWorkerReadBaseSchema.extend({
++    source: z.literal("transcript"),
++    terminal: z.never().optional(),
++    transcript: z.object({
++      messages: z.array(z.object({
++        id: BoundedIdSchema,
++        role: OperationsStateSchema,
++        blocks: z.array(z.object({}).passthrough().refine(
++          (block) => JSON.stringify(block).length <= 64 * 1024,
++          "transcript block exceeds public text bound"
++        )).max(500),
++        timestamp: z.number().finite(),
++        source: OperationsStateSchema
++      }).passthrough()).max(500),
++      limited: z.boolean(),
++      nextCursor: CursorSchema,
++      returnedMessageCount: z.number().int().nonnegative().max(500)
++    }).passthrough()
++  }),
++  OperationsWorkerReadBaseSchema.extend({
++    source: z.literal("terminal"),
++    transcript: z.never().optional(),
++    terminal: z.object({
++      lines: z.array(BoundedTextSchema).max(500),
++      limited: z.boolean(),
++      nextCursor: CursorSchema
++    }).passthrough()
++  })
++]);
+ const WorkerMutationResultSchema = z.object({
+   dispatchId: BoundedIdSchema,
+-  state: OrcaStateSchema,
+-  verdict: OrcaStateSchema
++  state: OperationsStateSchema,
++  verdict: OperationsStateSchema,
++  mutation: MutationSchema.optional()
+ }).passthrough();
+ 
+ const operationsReceiptSchemas = {
+@@ -273,7 +337,7 @@
+     page: z.object({ limit: z.number().int().positive().max(100), hasMore: z.boolean(), nextCursor: NullableCursorSchema }).passthrough(),
+     scope: z.object({ source: OrcaStateSchema }).passthrough()
+   }).passthrough()),
+-  operations_worker_read: successReceiptSchema(OrcaWorkerReadResultSchema),
++  operations_worker_read: successReceiptSchema(OperationsWorkerReadResultSchema),
+   operations_inbox: successReceiptSchema(z.object({ messages: z.array(InboxMessageSchema).max(100), count: z.number().int().nonnegative() }).passthrough()),
+   operations_list_projects: successReceiptSchema(z.object({ projects: z.array(ProjectSchema).max(100) }).passthrough()),
+   list_project_setups: successReceiptSchema(z.object({ setups: z.array(SetupSchema).max(100) }).passthrough()),
+diff --git a/packages/orca-adapter/src/index.ts b/packages/orca-adapter/src/index.ts
+--- a/packages/orca-adapter/src/index.ts
++++ b/packages/orca-adapter/src/index.ts
+@@ -224,6 +224,20 @@
+     throw new OrcaInvalidReceiptError();
+   }
+   switch (operation.kind) {
++    case "operations_reply": {
++      const message = result.message as { id: string; thread_id: string };
++      const question = result.question as { message_id: string; answer_message_id: string } | null | undefined;
++      if (message.thread_id !== operation.messageId
++        || (question != null && (question.message_id !== operation.messageId || question.answer_message_id !== message.id))) {
++        throw new OrcaInvalidReceiptError();
++      }
++      break;
++    }
++    case "operations_send":
++      if ((result.message as { to_handle: string }).to_handle !== `dispatch:${operation.dispatchId}`) {
++        throw new OrcaInvalidReceiptError();
++      }
++      break;
+     case "operations_stop":
+     case "operations_retain":
+     case "operations_release":
+diff --git a/packages/orca-adapter/test/operations.test.ts b/packages/orca-adapter/test/operations.test.ts
+--- a/packages/orca-adapter/test/operations.test.ts
++++ b/packages/orca-adapter/test/operations.test.ts
+@@ -49,6 +49,90 @@
+     }
+   });
+ 
++  it("rejects nonempty malformed operation receipts", () => {
++    // Break caught: presence-only reply checks and blank lifecycle verdicts accept unusable receipts.
++    const receipt = (result: unknown) => ({ id: "receipt", ok: true, result });
++    expect(() => parseOrcaOperationsReceipt("operations_reply", receipt({ mutation: { requestId: "request", replayed: false }, reply: 42 }))).toThrow();
++  });
++
++  it("rejects blank lifecycle states and verdicts", () => {
++    // Break caught: a target identity alone cannot turn an empty verdict into a valid receipt.
++    const receipt = (result: unknown) => ({ id: "receipt", ok: true, result });
++    for (const kind of ["operations_stop", "operations_retain", "operations_release"] as const) {
++      expect(() => parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "   ", verdict: "stopped" }))).toThrow();
++      expect(() => parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "stopped", verdict: "   " }))).toThrow();
++      expect(parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "stopped", verdict: "stopped" }))).toBeDefined();
++    }
++  });
++
++  it("bounds worker output and requires source-matching content", () => {
++    // Break caught: the legacy permissive read union cannot be the public operations boundary.
++    const base = { dispatchId: "dispatch", cursor: "cursor", status: { worker: "ready", terminal: "ready" }, warnings: [], archived: false };
++    const terminal = { lines: ["safe"], limited: false, nextCursor: "next" };
++    const transcript = { messages: [{ id: "message", role: "assistant", blocks: [{ type: "text", text: "safe" }], timestamp: 1, source: "transcript" }], limited: false, nextCursor: "next", returnedMessageCount: 1 };
++    const parse = (result: unknown) => parseOrcaOperationsReceipt("operations_worker_read", { id: "receipt", ok: true, result });
++    expect(parse({ ...base, source: "terminal", terminal })).toBeDefined();
++    expect(parse({ ...base, source: "transcript", transcript })).toBeDefined();
++    for (const result of [
++      { ...base, source: "transcript", terminal },
++      { ...base, source: "terminal", transcript },
++      { ...base, source: "terminal", terminal, transcript },
++      { ...base, source: "transcript", transcript, terminal },
++      { ...base, source: "terminal" },
++      { ...base, source: "terminal", terminal: { ...terminal, lines: Array(501).fill("line") } },
++      { ...base, source: "terminal", terminal: { ...terminal, lines: ["x".repeat(65_537)] } },
++      { ...base, source: "transcript", transcript: { ...transcript, messages: Array(501).fill(transcript.messages[0]) } },
++      { ...base, source: "terminal", terminal, cursor: "x".repeat(2049) },
++      { ...base, source: "terminal", terminal, dispatchId: " " },
++      { ...base, source: "terminal", terminal, warnings: Array(101).fill("warning") },
++      { ...base, source: "transcript", transcript: { ...transcript, messages: [{ ...transcript.messages[0], blocks: [{ text: "x".repeat(65_537) }] }] } }
++    ]) expect(() => parse(result)).toThrow();
++  });
++
++  it("validates public reply/message structure and returned identities", async () => {
++    // Shape observed in Orca 1.4.203 reply to msg_af1d64d147f0 (coordinator evidence msg_5c6866844d09).
++    // Break caught: another message, question, Dispatch, or retry request cannot satisfy this invocation.
++    const message = { id: "answer", run_id: "run", from_handle: "run:run", to_handle: "dispatch:dispatch", subject: "Re: Question", body: "answer", type: "status", priority: "normal", thread_id: "wanted", payload: null, created_at: "2026-09-15T08:24:00Z", delivered_at: null, delivery_contract: "current_delivery" };
++    const question = { message_id: "wanted", run_id: "run", dispatch_id: "dispatch", asker_handle: "term", status: "answered", answer_message_id: "answer", answer_body: "answer", answered_by_generation: 1, created_at: "2026-09-15T08:23:00Z", answered_at: "2026-09-15T08:24:00Z", closed_at: null };
++    const mutation = { requestId: "request", replayed: false };
++    const result = { message, question, duplicate: false, mutation };
++    const receipt = (value: unknown) => ({ id: "receipt", ok: true, result: value });
++    expect(parseOrcaOperationsReceipt("operations_reply", receipt(result))).toBeDefined();
++    expect(parseOrcaOperationsReceipt("operations_reply", receipt({ message, duplicate: false, mutation }))).toBeDefined();
++    for (const value of [{ ...result, message: 42 }, { ...result, message: { ...message, thread_id: " " } }, { ...result, question: 42 }, { ...result, question: { ...question, message_id: " " } }]) {
++      expect(() => parseOrcaOperationsReceipt("operations_reply", receipt(value))).toThrow();
++    }
++    const fake = await createFakeOrca();
++    try {
++      const status = JSON.parse(await readFile(new URL("./fixtures/status-1.4.194.json", import.meta.url), "utf8")) as unknown;
++      await fake.enqueueJson(["status", "--json"], status);
++      for (const name of ["orca-cli", "orchestration"] as const) await fake.enqueueJson(["skills", "get", name, "--json"], { name, full: false, markdown: "public contract" });
++      const client = new OrcaClient({ executablePath: fake.executablePath, signal: new AbortController().signal, timeoutMs: 5_000, expectedVersionRange: ">=1.4.194" });
++      const reply = { kind: "operations_reply", messageId: "wanted", body: "answer", retryRequestId: "request" } as const;
++      for (const value of [
++        { ...result, message: { ...message, thread_id: "other" } },
++        { ...result, question: { ...question, message_id: "other" } },
++        { ...result, question: { ...question, answer_message_id: "other" } },
++        { ...result, mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(reply), "--json"], receipt(value));
++        await expect(client.execute(reply)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
++      await fake.enqueueJson([...operationArguments(reply), "--json"], receipt(result));
++      await expect(client.execute(reply)).resolves.toMatchObject({ result: { message: { thread_id: "wanted" } } });
++      const send = { kind: "operations_send", dispatchId: "dispatch", body: "answer", retryRequestId: "request" } as const;
++      for (const value of [
++        { message: { ...message, to_handle: "dispatch:other", thread_id: null }, mutation },
++        { message: { ...message, thread_id: null }, mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(send), "--json"], receipt(value));
++        await expect(client.execute(send)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
++      await fake.enqueueJson([...operationArguments(send), "--json"], receipt({ message: { ...message, thread_id: null }, mutation }));
++      await expect(client.execute(send)).resolves.toMatchObject({ result: { message: { to_handle: "dispatch:dispatch" } } });
++    } finally { await fake.cleanup(); }
++  });
++
+   it("rejects a mutation receipt for a different target", async () => {
+     // Break caught: a successful receipt for another Dispatch must not authorize the requested control.
+     const fake = await createFakeOrca();
+@@ -58,12 +142,25 @@
+       for (const name of ["orca-cli", "orchestration"] as const) {
+         await fake.enqueueJson(["skills", "get", name, "--json"], { name, full: false, markdown: "public contract" });
+       }
+-      await fake.enqueueJson(["orchestration", "worker-stop", "--dispatch", "wanted", "--retry-request", "request", "--json"], {
+-        id: "stop", ok: true, result: { dispatchId: "other", state: "stopped", verdict: "stopped" }
+-      });
+       const client = new OrcaClient({ executablePath: fake.executablePath, signal: new AbortController().signal, timeoutMs: 5_000, expectedVersionRange: ">=1.4.194" });
+-      await expect(client.execute({ kind: "operations_stop", dispatchId: "wanted", retryRequestId: "request" }))
+-        .rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      for (const kind of ["operations_stop", "operations_retain", "operations_release"] as const) {
++        const operation = { kind, dispatchId: "wanted", retryRequestId: "request" };
++        for (const result of [
++          { dispatchId: "other", state: "stopped", verdict: "stopped" },
++          { dispatchId: "wanted", state: "stopped", verdict: "stopped", mutation: { requestId: "other", replayed: false } }
++        ]) {
++          await fake.enqueueJson([...operationArguments(operation), "--json"], { id: "receipt", ok: true, result });
++          await expect(client.execute(operation)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++        }
++      }
++      const dispatch = { kind: "operations_dispatch", taskId: "task", terminalHandle: "term", retryRequestId: "request" } as const;
++      for (const result of [
++        { dispatchId: "dispatch", taskId: "other", runId: "run" },
++        { dispatchId: "dispatch", taskId: "task", runId: "run", mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(dispatch), "--json"], { id: "receipt", ok: true, result });
++        await expect(client.execute(dispatch)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
+     } finally {
+       await fake.cleanup();
+     }
+diff --git a/packages/core/test/operations.test.ts b/packages/core/test/operations.test.ts
+--- a/packages/core/test/operations.test.ts
++++ b/packages/core/test/operations.test.ts
+@@ -26,9 +26,9 @@
+     const base = { source: "hq", eventSource: "hq", seq: 1, eventKey: "event", requestId: "request", contextId: "context", kind: "hq.progress", occurredAt: "2026-09-15T00:00:00.000Z", payload: {} };
+     expect(HqEventPageSchema.parse({ events: [base], snapshots: [], cursor: "1", oldestSeq: 1, latestSeq: 1, compacted: false })).toMatchObject({ events: [base] });
+     expect(() => HqEventPageSchema.parse({ events: [{ ...base, dispatchId: "dispatch" }], snapshots: [], cursor: "1", oldestSeq: 1, latestSeq: 1, compacted: false })).toThrow();
+-    expect(() => HqEventPageSchema.parse({ events: [{ ...base, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }], cursor: "1", compacted: false })).toThrow();
+-    expect(HqEventPageSchema.parse({
+-      events: [{ ...base, kind: "worker.ready", agentId: "agent", generation: 1, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }],
++    expect(() => HqEventPageSchema.parse({ events: [{ ...base, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }], snapshots: [], oldestSeq: 1, latestSeq: 1, cursor: "1", compacted: false })).toThrow();
++    for (const kind of ["worker.ready", "worker.retained"]) expect(HqEventPageSchema.parse({
++      events: [{ ...base, kind, agentId: "agent", generation: 1, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }],
+       snapshots: [], oldestSeq: 1, latestSeq: 1, compacted: false
+     })).toMatchObject({ events: [{ agentId: "agent", generation: 1 }], snapshots: [] });
+   });
+diff --git a/docs/superpowers/reports/2026-09-15-hq-orca-operations-task1.md b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task1.md
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-task1.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task1.md
+@@ -1,6 +1,6 @@
+ # Task 1 — Shared contract and public adapter
+ 
+-Status: fix round 1 implemented and focused verification passed; Task 2 has not started.
++Status: fix round 2 implemented and focused verification passed; independent review pending; Task 2 has not started.
+ 
+ ## Public contract for Task 2
+ 
+@@ -16,7 +16,7 @@
+ - `OperationsMutationReceiptSchema/OperationsMutationReceipt` exposes bounded `requestId,action,targetId,state,observedAt,detail?`.
+ - `sanitizeDisplayText`, `sanitizeResultText`, and `redactPublicText`; credentials are removed before the 64-KiB result bound, including unterminated private-key blocks.
+ 
+-Adapter exports `OrcaOperationsReceiptSchema`, `OrcaOperationsReceipt`, `OrcaOperationsReceiptKind`, and `parseOrcaOperationsReceipt(kind, value)`. Every new operation has an operation-specific result schema; legacy operations and parsers remain unchanged. `OrcaClient.execute` verifies returned task/Dispatch identity for lifecycle controls.
++Adapter exports `OrcaOperationsReceiptSchema`, `OrcaOperationsReceipt`, `OrcaOperationsReceiptKind`, and `parseOrcaOperationsReceipt(kind, value)`. Every new operation has an operation-specific result schema; legacy operations and parsers remain unchanged. `OrcaClient.execute` verifies returned task/Dispatch identity for lifecycle controls, reply thread/question/answer identity, send recipient identity, and returned mutation request identity.
+ 
+ ## Exact public CLI mapping
+ 
+@@ -34,4 +34,16 @@
+ 
+ Task 1 code/tests: `packages/core/src/{index,operations,public-output}.ts`, `packages/core/test/{operations,public-output}.test.ts`, `packages/installer/src/progress-client.ts`, `apps/gateway/src/progress-events.ts`, `packages/orca-adapter/src/{capabilities,process,index,receipts}.ts`, and `packages/orca-adapter/test/{operations,process}.test.ts`.
+ 
+-Remaining work: independent fix-round review, then Task 2 may consume these exact contracts and still must implement its fresh-state authorization/idempotency gates.
++## Fix round 2 evidence
++
++- Scope: only the two remaining Spec/Quality findings in `2026-09-15-hq-orca-operations-task1-rereview.md`; no Task 2 or legacy parser changes.
++- Authoritative reply shape: Orca 1.4.203 coordinator reply to evidence question `msg_af1d64d147f0`, relayed in `msg_5c6866844d09`; actual message `msg_3402deb07500`, mutation request `8ad30ddf-1151-42e0-8391-7d30c239505b`. Result contains typed `message`, optional/null `question`, `duplicate`, and `mutation`; reply target is `message.thread_id`, plus `question.message_id` when present. The fixture uses this observed shape with synthetic values.
++- New reply/message schemas validate bounded identities/text and question answer fields; execution verifies thread/question target, answer-message identity, send Dispatch recipient, and retry request identity. Tests cover target/request mismatches across all six controls.
++- New operations-only worker-read discriminated union requires exactly source-matching transcript/terminal content, caps pages at 500, warnings at 100, IDs at 512, cursors at 2048, and terminal strings/serialized transcript blocks at 64 KiB. Lifecycle state/verdict reject whitespace-only values. Legacy worker-read remains unchanged.
++- RED: focused tests reproduced accepted `reply:42`, source/content mismatch, malformed message/question objects, and execution accepting a different reply target. Original blank-verdict probe was independently reproduced in the re-review; its regression now covers all three lifecycle controls.
++- GREEN: `pnpm vitest run packages/orca-adapter/test/operations.test.ts packages/core/test/operations.test.ts` — 12 passed. Forbidden links are tested on an otherwise-valid page; worker.ready and worker.retained are both accepted.
++- Compatibility: `pnpm vitest run packages/orca-adapter/test/capabilities.test.ts -t 'maps lifecycle operations|rejects an empty result|marks a malformed worker-start'` — 3 passed, 23 intentionally skipped. The earlier 73-test suite was not repeated.
++- Typechecks passed: adapter package source typecheck, direct strict NodeNext/ES2022 typecheck of adapter operations tests, and core `typecheck:test`. Exact source/test diff whitespace check passed.
++- Artifacts: full 13-path `task1.diff` refreshed; `task1-fix2.diff` contains only this round's four code/test files and two report/progress updates against explicit pre-edit snapshots. No real control operation was used for probing; process integration tests used fake Orca.
++
++Remaining work: independent fix-round-2 review; Task 2 stays pending and must implement fresh-state authorization/idempotency and an explicit trusted sender context (the observed coordinator reply required `--from`).
+diff --git a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,12 +1,14 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 fix round 1 implemented and focused verification passed; Task 2 not started
++- Status: Task 1 fix round 2 implemented and focused verification passed; independent review pending; Task 2 not started
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
+ 
+-- Task 1 fix round 1 corrected every review block: installed-help-compatible argv, separate bounded project/setup/repo inventory operations, operation-specific receipt schemas with identity checks, preserved HQ event/compaction fields and receipt-link fencing, output-source XOR, bounded inputs, redact-before-truncate behavior, and one-shot overflow termination. Seven focused/impacted test files (73 tests) and core/adapter/installer typechecks pass; independent re-review remains before Task 2.
++- Task 1 fix round 2 addresses the two remaining re-review findings: authoritative public reply/message schemas and target/request identities, a separate bounded source/content worker-read union, nonblank lifecycle states/verdicts, and otherwise-valid receipt-link tests for forbidden and both allowed kinds. The 12 focused tests, 3 selected legacy receipt tests, adapter source/test typechecks, and core test typecheck pass. See `2026-09-15-hq-orca-operations-task1.md` and the explicit-baseline `task1-fix2.diff`; independent review remains.
++
++- Task 1 fix round 1 corrected the first review findings: installed-help-compatible argv, separate bounded project/setup/repo inventory operations, operation-specific receipt schemas with identity checks, preserved HQ event/compaction fields and receipt-link fencing, output-source XOR, bounded inputs, redact-before-truncate behavior, and one-shot overflow termination. Seven focused/impacted test files (73 tests) and core/adapter/installer typechecks passed; re-review subsequently identified incomplete receipt validation and behavioral coverage.
+ 
+ - Read the approved screen-plan `research.md` and `README.md`, the required writing-plans skill, package manifests, and only the narrow HQ progress/runtime, managed HTTP/control, admission/config, installer, web API, and public Orca adapter sources needed to verify contracts.
+ - Confirmed the public Orca CLI version is `1.4.203`, runtime is ready/reachable/connected, and public help provides run/task/worker reads, bounded worker/terminal output, inbox, dispatch, send/reply, stop/retain/release, and project/worktree/terminal inventory.
+@@ -27,4 +29,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 fix round 1 is ready for independent review. Task 2 must remain pending until that review accepts the corrected public contract; later tasks still run sequentially and Task 5 must be assigned to a fresh reviewer.
++Task 1 fix round 2 is ready for independent review. Task 2 must remain pending until that review accepts the corrected public contract; later tasks still run sequentially and Task 5 must be assigned to a fresh reviewer.

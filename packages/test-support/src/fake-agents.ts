@@ -127,6 +127,7 @@ export class LaunchOrca {
       case "list_projects":
         return receipt("receipt-projects", { repos: [] });
     }
+    throw new Error(`unsupported scripted Orca operation: ${operation.kind}`);
   }
 }
 

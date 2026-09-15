@@ -1,0 +1,47 @@
+# Scoped overlay ledger — integration fix round 1
+#
+# This shared checkout contained pre-existing tracked and untracked Task 1–4
+# changes, so a repository-base patch would incorrectly attribute earlier work
+# to this round. This is a descriptive scope ledger, NOT a unified/applicable
+# patch or a machine-verifiable pre-edit delta. No immutable pre-edit source
+# baseline is supplied; current allowlisted source and named regressions can be
+# inspected, but do not reconstruct this round's exact delta. The companion
+# report records the author's baseline/status account. This ledger excludes unrelated checkout
+# state and the prohibited private-pilot roadmap.
+
+diff --scope R1 browser-session mutation identity
+ apps/web/src/operations-state.ts                 | add bounded session registry
+ apps/web/src/app.tsx                             | own registry above keyed routes
+ apps/web/src/routes/operations-compose.tsx       | consume stable reservation/receipt
+ apps/web/src/routes/operations-detail.tsx        | action+Dispatch lifecycle keys
+ apps/web/src/routes/operations-questions.tsx     | source-correct reply keys
+ apps/web/src/app.test.tsx                        | unknown tab/route + bound regressions
+
+diff --scope R2 native terminal identity
+ apps/web/src/api.ts                              | OrcaTerminal.handle + strict parser
+ apps/web/src/routes/operations-resources.tsx     | render/key native handle
+ apps/web/e2e/operations-console.spec.ts          | native handle fixture
+ apps/gateway/test/operations-integration.test.ts | service HTTP response -> web parser
+
+diff --scope R3 bounded current questions
+ apps/web/src/operations-state.ts                 | cursor traversal + stable second pass
+ apps/web/src/routes/operations-overview.tsx      | complete/partial-aware attention
+ apps/web/src/routes/operations-questions.tsx     | current snapshot + honest empty copy
+ apps/web/src/routes/operations-evidence.tsx      | snapshot evidence + partial marker
+ apps/web/src/app.test.tsx                        | >100 cursor all screens + reconcile
+
+diff --scope R4 typed inject
+ packages/orca-adapter/src/capabilities.ts        | required boolean; conditional --inject
+ apps/gateway/src/operations-controls.ts          | strict boolean input and typed operation
+ apps/web/src/routes/operations-compose.tsx       | reviewed choice + unsupervised disclosure
+ packages/orca-adapter/test/operations.test.ts    | exact true/false argv and invalid type
+ apps/gateway/test/operations-service.test.ts     | strict server input and effect proof
+ apps/web/src/app.test.tsx                        | review/body proof
+
+diff --scope R5 combined real-boundary acceptance
+ apps/gateway/test/operations-integration.test.ts | Unix+HTTP+auth+journal+process+parser smoke
+
+diff --scope reports
+ docs/superpowers/reports/2026-09-15-hq-orca-operations-integration-fix1.md
+ docs/superpowers/reports/2026-09-15-hq-orca-operations-integration-fix1.diff
+ docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md

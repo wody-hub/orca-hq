@@ -1,132 +1,108 @@
-export type RiskLevel = "L0" | "L1" | "L2" | "L3" | "unknown";
-export type DeliveryStatus = "pending" | "sent" | "failed";
-export type VerificationStatus = "passed" | "pending" | "failed";
+type JsonRecord = Record<string, unknown>;
+export interface Evidence { source: "hq_api" | "hq_store" | "orca_cli"; command?: string; observedAt: string; verification: "authoritative" | "observed" | "unverifiable" }
+export interface OperationsStatus {
+  collectedAt: string;
+  hq: { state: string; capacity: { limit: number | "unlimited"; source: "config" | "environment" | "default"; active: number; queued: number; byState: Record<string, number>; updateSupported: false; reason: string } };
+  orca: { state: string; reachable: boolean; connectionState?: string; version: string; runtimeId?: string; features: JsonRecord };
+  metrics: { tokens: { available: false; reason: "not_collected" }; cost: { available: false; reason: "not_collected" } };
+}
+export interface HqContext { contextId: string; title: string; state: string; summary: string; projectIds: string[]; jobIds: string[]; createdAt: string; updatedAt: string; lastSeq: number }
+export interface HqContextPage { contexts: HqContext[]; cursor?: string; compacted?: boolean }
+export interface HqContextDetail { source: "hq"; context: HqContext; evidence: Evidence }
+export interface ReceiptLink { runId: string; taskId: string; dispatchId: string; terminalHandle: string }
+export interface HqEvent { source: "hq"; eventSource: "hq" | "tool" | "orca" | "system"; seq: number; eventKey: string; requestId: string; contextId: string | null; kind: string; occurredAt: string; payload: JsonRecord; agentId?: string; generation?: number; receiptLink?: ReceiptLink }
+export interface HqEventPage { events: HqEvent[]; snapshots: HqContext[]; cursor?: string; compacted: boolean; oldestSeq: number; latestSeq: number }
+export interface HqQuestion { source: "hq"; kind: "router_clarification" | "managed_orca_question"; requestId: string; sessionId: string; contextId?: string; messageId?: string; body: string; occurredAt: string; state: string; evidence: Evidence }
+export interface HqQuestionPage { source: "hq"; questions: HqQuestion[]; cursor: string; compacted: boolean }
+export interface OrcaRun { id: string; objective: string; coordinator_handle?: string; consumer_generation?: number; [key: string]: unknown }
+export interface OrcaRunPage { source: "orca"; runs: OrcaRun[]; nextCursor?: string | null; evidence: Evidence; [key: string]: unknown }
+export interface OrcaTask { id: string; status: string; run_id?: string; created_by_terminal_handle?: string; created_by_process_incarnation?: string; created_by_run_generation?: number; [key: string]: unknown }
+export interface OrcaTaskPage { source: "orca"; tasks: OrcaTask[]; evidence: Evidence; [key: string]: unknown }
+export interface OrcaWorkerSummary { dispatchId: string; projection: { dispatchId: string; taskId: string; runId: string; liveness: { verdict: string; [key: string]: unknown }; [key: string]: unknown }; [key: string]: unknown }
+export interface OrcaWorkerPage { source: "orca"; workers: OrcaWorkerSummary[]; page: { hasMore: boolean; nextCursor?: string | null; [key: string]: unknown }; scope: { source: string; [key: string]: unknown }; evidence: Evidence; [key: string]: unknown }
+export interface OrcaWorkerDetail {
+  source: "orca"; dispatch: { id: string; runId: string; taskId: string; status: string; processIncarnation?: string | null; [key: string]: unknown };
+  worker: { dispatchId: string; state: string; stage: string; agentTerminalHandle: string | null; [key: string]: unknown };
+  projection: { dispatchId: string; taskId: string; runId: string; liveness: { verdict: string; [key: string]: unknown }; outcome?: string; resource?: { state: string; ownerDispatchId?: string | null; releaseState: string; [key: string]: unknown }; [key: string]: unknown };
+  observation: { status: string; exactWorker: boolean; [key: string]: unknown };
+  terminal: null | { handle: string; incarnationId: string; connected: boolean; writable: boolean; executionHostId: string; worktreeId: string; [key: string]: unknown };
+  terminalResource: { id: string; ownershipState: string; releaseState: string; ownerDispatchId?: string | null; terminalHandle?: string; endpointIncarnation?: string; [key: string]: unknown };
+  evidence: Evidence; [key: string]: unknown;
+}
+export type OrcaOutputPage = { source: "terminal"; cursor?: string; archived: boolean; warnings: string[]; lines: string[] } | { source: "transcript"; cursor?: string; archived: boolean; warnings: string[]; messages: { id: string; role: string; text: string; occurredAt?: string }[] };
+export interface OrcaQuestionPage { source: "orca"; messages: { id: string; type: string; subject: string; body: string; run_id?: string | null; from_handle?: string; to_handle?: string; created_at?: string; question?: { status: string; [key: string]: unknown }; [key: string]: unknown }[]; count: number; support: { pendingState: { supported: true } | { supported: false; reason: string } }; evidence: Evidence; [key: string]: unknown }
+export interface OrcaTerminal { handle: string; [key: string]: unknown }
+export interface OrcaWorktree { id: string; terminals: OrcaTerminal[]; hostScope?: { hostIds: string[]; omittedHostIds: string[] }; truncated?: boolean; [key: string]: unknown }
+export interface OrcaSetup { id: string; worktrees: OrcaWorktree[]; covered?: boolean; truncated?: boolean; [key: string]: unknown }
+export interface OrcaResources { source: "orca"; projects: { id: string; hostScope: "covered" | "not_covered"; setups: OrcaSetup[]; [key: string]: unknown }[]; evidence: Evidence; [key: string]: unknown }
+export interface OperationsMutationReceipt { requestId: string; action: string; targetId: string; state: "accepted" | "rejected" | "unknown"; observedAt: string; detail?: string }
 
-export interface CommandSummary {
-  readonly id: string;
-  readonly summary: string;
-  readonly status: string;
-  readonly projectKey: string;
-  readonly riskLevel: RiskLevel;
-  readonly updatedAt: string;
+interface Schema<T> { parse(value: unknown): T }
+function malformed(): never { throw new OperationsApiError(502, "malformed_response"); }
+function record(value: unknown): JsonRecord { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : malformed(); }
+function text(value: unknown): string { return typeof value === "string" && value.length > 0 ? value : malformed(); }
+function boundedText(value: unknown, min: number, max: number): string { return typeof value === "string" && value.length >= min && value.length <= max ? value : malformed(); }
+function id(value: unknown, max = 512): string { const result = boundedText(value, 1, max); return result.trim().length > 0 ? result : malformed(); }
+function cursor(value: unknown): string { return boundedText(value, 1, 2048); }
+function publicText(value: unknown, max = 64 * 1024): string { return boundedText(value, 0, max); }
+function nullOrId(value: unknown): string | null { return value === null ? null : id(value); }
+function bool(value: unknown): boolean { return typeof value === "boolean" ? value : malformed(); }
+function integer(value: unknown): number { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : malformed(); }
+function positiveInteger(value: unknown): number { const result = integer(value); return result > 0 ? result : malformed(); }
+function array<T>(value: unknown, parser: (item: unknown) => T, max = 500): T[] { if (!Array.isArray(value) || value.length > max) malformed(); return value.map((item) => parser(item)); }
+function literal<T extends string | boolean>(value: unknown, allowed: readonly T[]): T { return allowed.includes(value as T) ? value as T : malformed(); }
+function iso(value: unknown): string { const result = text(value); return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(result) && !Number.isNaN(Date.parse(result)) ? result : malformed(); }
+function strings(value: unknown, max = 500, item = text): string[] { return array(value, item, max); }
+function evidence(value: unknown): Evidence { const r = record(value); return { source: literal(r.source, ["hq_api", "hq_store", "orca_cli"] as const), ...(r.command === undefined ? {} : { command: boundedText(r.command, 0, 512) }), observedAt: iso(r.observedAt), verification: literal(r.verification, ["authoritative", "observed", "unverifiable"] as const) }; }
+function context(value: unknown): HqContext { const r = record(value); return { contextId: id(r.contextId, 100), title: boundedText(r.title, 1, 256), state: boundedText(r.state, 1, 64), summary: publicText(r.summary), projectIds: strings(r.projectIds, 64, (item) => id(item, 100)), jobIds: strings(r.jobIds, 100, (item) => id(item, 100)), createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt), lastSeq: integer(r.lastSeq) }; }
+function link(value: unknown): ReceiptLink { const r = record(value); return { runId: id(r.runId), taskId: id(r.taskId), dispatchId: id(r.dispatchId), terminalHandle: id(r.terminalHandle) }; }
+const eventKinds = ["request.accepted", "request.queued", "context.assigned", "agent.started", "agent.resumed", "agent.waiting", "worker.launching", "worker.ready", "worker.retained", "worker.recovery_required", "clarification.required", "hq.progress", "tool.started", "tool.completed", "tool.failed", "job.linked", "job.state", "request.completed", "request.failed", "recovery.required", "history.compacted"] as const;
+
+export const operationsStatusSchema: Schema<OperationsStatus> = { parse(value) { const r = record(value), hq = record(r.hq), capacity = record(hq.capacity), orca = record(r.orca), metrics = record(r.metrics), tokens = record(metrics.tokens), cost = record(metrics.cost), rawLimit = capacity.limit; const byState = record(capacity.byState); for (const count of Object.values(byState)) integer(count); return { collectedAt: iso(r.collectedAt), hq: { state: text(hq.state), capacity: { limit: rawLimit === "unlimited" ? rawLimit : positiveInteger(rawLimit), source: literal(capacity.source, ["config", "environment", "default"] as const), active: integer(capacity.active), queued: integer(capacity.queued), byState: byState as Record<string, number>, updateSupported: literal(capacity.updateSupported, [false] as const), reason: publicText(capacity.reason) } }, orca: { state: text(orca.state), reachable: bool(orca.reachable), ...(orca.connectionState === undefined ? {} : { connectionState: text(orca.connectionState) }), version: text(orca.version), ...(orca.runtimeId === undefined ? {} : { runtimeId: id(orca.runtimeId) }), features: record(orca.features) }, metrics: { tokens: { available: literal(tokens.available, [false] as const), reason: literal(tokens.reason, ["not_collected"] as const) }, cost: { available: literal(cost.available, [false] as const), reason: literal(cost.reason, ["not_collected"] as const) } } }; } };
+export const hqContextPageSchema: Schema<HqContextPage> = { parse(value) { const r = record(value); return { contexts: array(r.contexts, context, 100), ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), ...(r.compacted === undefined ? {} : { compacted: bool(r.compacted) }) }; } };
+export const hqContextDetailSchema: Schema<HqContextDetail> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), context: context(r.context), evidence: evidence(r.evidence) }; } };
+export const hqEventPageSchema: Schema<HqEventPage> = { parse(value) { const r = record(value); return { events: array(r.events, (item) => { const e = record(item), kind = literal(e.kind, eventKinds); if (e.receiptLink !== undefined && kind !== "worker.ready" && kind !== "worker.retained") malformed(); return { source: literal(e.source, ["hq"] as const), eventSource: literal(e.eventSource, ["hq", "tool", "orca", "system"] as const), seq: positiveInteger(e.seq), eventKey: id(e.eventKey), requestId: id(e.requestId, 100), contextId: e.contextId === null ? null : id(e.contextId, 100), kind, occurredAt: iso(e.occurredAt), payload: record(e.payload), ...(e.agentId === undefined ? {} : { agentId: id(e.agentId, 100) }), ...(e.generation === undefined ? {} : { generation: positiveInteger(e.generation) }), ...(e.receiptLink === undefined ? {} : { receiptLink: link(e.receiptLink) }) }; }), snapshots: array(r.snapshots, context, 100), ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), compacted: bool(r.compacted), oldestSeq: integer(r.oldestSeq), latestSeq: integer(r.latestSeq) }; } };
+export const hqQuestionPageSchema: Schema<HqQuestionPage> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), questions: array(r.questions, (item) => { const q = record(item); return { source: literal(q.source, ["hq"] as const), kind: literal(q.kind, ["router_clarification", "managed_orca_question"] as const), requestId: id(q.requestId), sessionId: id(q.sessionId), ...(q.contextId === undefined ? {} : { contextId: id(q.contextId) }), ...(q.messageId === undefined ? {} : { messageId: id(q.messageId) }), body: publicText(q.body), occurredAt: iso(q.occurredAt), state: text(q.state), evidence: evidence(q.evidence) }; }, 100), cursor: cursor(r.cursor), compacted: bool(r.compacted) }; } };
+export const orcaRunPageSchema: Schema<OrcaRunPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), runs: array(r.runs, (item) => { const run = record(item); return { ...run, id: id(run.id), objective: typeof run.objective === "string" ? run.objective : malformed(), ...(run.coordinator_handle === undefined ? {} : { coordinator_handle: id(run.coordinator_handle) }), ...(run.consumer_generation === undefined ? {} : { consumer_generation: positiveInteger(run.consumer_generation) }) }; }, 100), ...(r.nextCursor === undefined ? {} : { nextCursor: r.nextCursor === null ? null : cursor(r.nextCursor) }), evidence: evidence(r.evidence) }; } };
+export const orcaTaskPageSchema: Schema<OrcaTaskPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), tasks: array(r.tasks, (item) => { const task = record(item); return { ...task, id: id(task.id), status: boundedText(task.status, 1, 512), ...(task.run_id === undefined ? {} : { run_id: id(task.run_id) }), ...(task.created_by_terminal_handle === undefined ? {} : { created_by_terminal_handle: id(task.created_by_terminal_handle) }), ...(task.created_by_process_incarnation === undefined ? {} : { created_by_process_incarnation: id(task.created_by_process_incarnation) }), ...(task.created_by_run_generation === undefined ? {} : { created_by_run_generation: integer(task.created_by_run_generation) }) }; }, 100), evidence: evidence(r.evidence) }; } };
+function projection(value: unknown): OrcaWorkerDetail["projection"] { const p = record(value), liveness = record(p.liveness), resource = p.resource === undefined ? undefined : record(p.resource); return { ...p, dispatchId: id(p.dispatchId), taskId: id(p.taskId), runId: id(p.runId), liveness: { ...liveness, verdict: boundedText(liveness.verdict, 1, 512) }, ...(p.outcome === undefined ? {} : { outcome: boundedText(p.outcome, 1, 512) }), ...(resource === undefined ? {} : { resource: { ...resource, state: boundedText(resource.state, 1, 512), releaseState: boundedText(resource.releaseState, 1, 512), ...(resource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrId(resource.ownerDispatchId) }) } }) }; }
+export const orcaWorkerPageSchema: Schema<OrcaWorkerPage> = { parse(value) { const r = record(value), page = record(r.page), scope = record(r.scope); return { ...r, source: literal(r.source, ["orca"] as const), workers: array(r.workers, (item) => { const worker = record(item); return { ...worker, dispatchId: id(worker.dispatchId), projection: projection(worker.projection) }; }, 100), page: { ...page, hasMore: bool(page.hasMore), ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor === null ? null : cursor(page.nextCursor) }) }, scope: { ...scope, source: boundedText(scope.source, 1, 512) }, evidence: evidence(r.evidence) }; } };
+export const orcaWorkerDetailSchema: Schema<OrcaWorkerDetail> = { parse(value) { const r = record(value), dispatch = record(r.dispatch), worker = record(r.worker), projected = projection(r.projection), observation = record(r.observation), terminalResource = record(r.terminalResource); const terminal = r.terminal === null ? null : record(r.terminal); return { ...r, source: literal(r.source, ["orca"] as const), dispatch: { ...dispatch, id: id(dispatch.id), runId: id(dispatch.runId), taskId: id(dispatch.taskId), status: boundedText(dispatch.status, 1, 512), ...(dispatch.processIncarnation === undefined ? {} : { processIncarnation: nullOrId(dispatch.processIncarnation) }) }, worker: { ...worker, dispatchId: id(worker.dispatchId), state: boundedText(worker.state, 1, 512), stage: boundedText(worker.stage, 1, 512), agentTerminalHandle: nullOrId(worker.agentTerminalHandle) }, projection: projected, observation: { ...observation, status: boundedText(observation.status, 1, 512), exactWorker: bool(observation.exactWorker) }, terminal: terminal === null ? null : { ...terminal, handle: id(terminal.handle), incarnationId: id(terminal.incarnationId), connected: bool(terminal.connected), writable: bool(terminal.writable), executionHostId: id(terminal.executionHostId), worktreeId: id(terminal.worktreeId) }, terminalResource: { ...terminalResource, id: id(terminalResource.id), ownershipState: boundedText(terminalResource.ownershipState, 1, 512), releaseState: boundedText(terminalResource.releaseState, 1, 512), ...(terminalResource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrId(terminalResource.ownerDispatchId) }), ...(terminalResource.terminalHandle === undefined ? {} : { terminalHandle: id(terminalResource.terminalHandle) }), ...(terminalResource.endpointIncarnation === undefined ? {} : { endpointIncarnation: id(terminalResource.endpointIncarnation) }) }, evidence: evidence(r.evidence) }; } };
+export const orcaOutputPageSchema: Schema<OrcaOutputPage> = { parse(value) { const r = record(value), base = { ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), archived: bool(r.archived), warnings: strings(r.warnings, 100, publicText) }; if (r.source === "terminal") return { source: "terminal", ...base, lines: strings(r.lines, 500, publicText) }; if (r.source === "transcript") return { source: "transcript", ...base, messages: array(r.messages, (item) => { const m = record(item); return { id: id(m.id), role: text(m.role), text: publicText(m.text), ...(m.occurredAt === undefined ? {} : { occurredAt: iso(m.occurredAt) }) }; }, 500) }; return malformed(); } };
+export const orcaQuestionPageSchema: Schema<OrcaQuestionPage> = { parse(value) { const r = record(value), support = record(r.support), pending = record(support.pendingState); const pendingState = bool(pending.supported) ? { supported: true as const } : { supported: false as const, reason: publicText(pending.reason, 256) }; return { ...r, source: literal(r.source, ["orca"] as const), messages: array(r.messages, (item) => { const m = record(item); return { ...m, id: id(m.id), type: boundedText(m.type, 1, 512), subject: typeof m.subject === "string" ? m.subject : malformed(), body: typeof m.body === "string" ? m.body : malformed(), ...(m.run_id === undefined ? {} : { run_id: nullOrId(m.run_id) }), ...(m.from_handle === undefined ? {} : { from_handle: id(m.from_handle) }), ...(m.to_handle === undefined ? {} : { to_handle: id(m.to_handle) }), ...(m.created_at === undefined ? {} : { created_at: text(m.created_at) }), ...(m.question === undefined ? {} : { question: { ...record(m.question), status: boundedText(record(m.question).status, 1, 512) } }) }; }, 100), count: integer(r.count), support: { pendingState }, evidence: evidence(r.evidence) }; } };
+export const orcaResourcesSchema: Schema<OrcaResources> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), projects: array(r.projects, (item) => { const project = record(item); return { ...project, id: id(project.id), hostScope: literal(project.hostScope, ["covered", "not_covered"] as const), setups: array(project.setups, (setupValue) => { const setup = record(setupValue); return { ...setup, id: id(setup.id), ...(setup.covered === undefined ? {} : { covered: bool(setup.covered) }), ...(setup.truncated === undefined ? {} : { truncated: bool(setup.truncated) }), worktrees: array(setup.worktrees, (worktreeValue) => { const worktree = record(worktreeValue), hostScope = worktree.hostScope === undefined ? undefined : record(worktree.hostScope); return { ...worktree, id: id(worktree.id), terminals: array(worktree.terminals, (terminalValue) => { const terminal = record(terminalValue); return { ...terminal, handle: id(terminal.handle) }; }, 100), ...(hostScope === undefined ? {} : { hostScope: { hostIds: strings(hostScope.hostIds, 100, id), omittedHostIds: strings(hostScope.omittedHostIds, 100, id) } }), ...(worktree.truncated === undefined ? {} : { truncated: bool(worktree.truncated) }) }; }, 100) }; }, 100) }; }, 100), evidence: evidence(r.evidence) }; } };
+export const mutationReceiptSchema: Schema<OperationsMutationReceipt> = { parse(value) { const r = record(value); return { requestId: id(r.requestId), action: text(r.action), targetId: id(r.targetId), state: literal(r.state, ["accepted", "rejected", "unknown"] as const), observedAt: iso(r.observedAt), ...(r.detail === undefined ? {} : { detail: publicText(r.detail, 1024) }) }; } };
+const authSchema: Schema<{ csrf: string; expiresAt: string }> = { parse(value) { const r = record(value); return { csrf: text(r.csrf), expiresAt: iso(r.expiresAt) }; } };
+
+export class OperationsApiError extends Error { constructor(readonly status?: number, readonly code = "operations_api_error") { super(code); } }
+export interface OperationsApi {
+  bootstrap(): Promise<void>; status(signal?: AbortSignal): Promise<OperationsStatus>; contexts(cursor?: string, signal?: AbortSignal): Promise<HqContextPage>; context(id: string, signal?: AbortSignal): Promise<HqContextDetail>; events(contextId: string, after?: string, signal?: AbortSignal): Promise<HqEventPage>; hqQuestions(after?: string, signal?: AbortSignal): Promise<HqQuestionPage>; runs(cursor?: string, signal?: AbortSignal): Promise<OrcaRunPage>; tasks(runId: string, signal?: AbortSignal): Promise<OrcaTaskPage>; workers(cursor?: string, signal?: AbortSignal): Promise<OrcaWorkerPage>; worker(id: string, signal?: AbortSignal): Promise<OrcaWorkerDetail>; output(id: string, source: "terminal" | "transcript", cursor?: string, signal?: AbortSignal): Promise<OrcaOutputPage>; orcaQuestions(signal?: AbortSignal): Promise<OrcaQuestionPage>; resources(signal?: AbortSignal): Promise<OrcaResources>; mutate(path: string, body: object, requestId: string): Promise<OperationsMutationReceipt>;
 }
 
-export interface CommandDetail extends CommandSummary {
-  readonly createdAt: string;
-  readonly project: Readonly<{ key: string; displayName: string; path: string }>;
-  readonly routing: Readonly<{ score: number; selectedReason: string; candidates: readonly string[] }>;
-  readonly contract: Readonly<{
-    base: string;
-    allowedScope: readonly string[];
-    prohibitedEffects: readonly string[];
-    testCommands: readonly string[];
-  }>;
-  readonly tasks: readonly Readonly<{
-    id: string;
-    title: string;
-    status: string;
-    dependencies: readonly string[];
-    workerFamily: string;
-    verifierFamily: string;
-    dispatchId: string;
-    dispatchStatus: string;
-    canStop: boolean;
-    canRetry: boolean;
-  }>[];
-  readonly verification: Readonly<{ status: VerificationStatus; commands: readonly string[] }>;
-  readonly diff: Readonly<{ summary: string }>;
-  readonly approval: Readonly<{
-    id: string;
-    level: "L2" | "L3" | "unknown";
-    digest: string;
-    expiresAt: string;
-    operationPhrase?: string;
-    status: "pending" | "approved" | "expired" | "denied";
-    permitted: boolean;
-  }>;
-  readonly audit: Readonly<{ reference: string; summary: string }>;
-  readonly approvalHistory: readonly Readonly<{
-    id: string;
-    level: "L2" | "L3";
-    digest: string;
-    operationPhrase?: string;
-    status: "pending" | "approved" | "consumed" | "expired" | "invalidated";
-    approvedAt: string;
-    expiresAt: string;
-  }>[];
-  readonly auditHistory: readonly Readonly<{
-    reference: string;
-    subjectId: string;
-    summary: string;
-    occurredAt: string;
-  }>[];
-  readonly delivery: readonly Readonly<{ channel: string; status: DeliveryStatus }>[];
-}
-
-export interface DashboardApi {
-  bootstrap(): Promise<void>;
-  listCommands(): Promise<Readonly<{ commands: readonly CommandSummary[] }>>;
-  getCommand(id: string): Promise<CommandDetail>;
-  confirmApproval(id: string, input: Readonly<{ digest: string; phrase?: string }>): Promise<void>;
-  stopDispatch(dispatchId: string): Promise<void>;
-  retryDispatch(dispatchId: string): Promise<void>;
-}
-
-export class DashboardApiError extends Error {
-  constructor(readonly status?: number) { super("dashboard_api_error"); }
-}
-
-function idempotencyKey(): string {
-  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-}
-
-export function createDashboardApi(fetcher: typeof fetch = fetch): DashboardApi {
-  let csrfToken: string | undefined;
-  const bootstrap = async (): Promise<void> => {
+type SessionStore = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+export function createOperationsApi(fetcher: typeof fetch = fetch, storage: SessionStore = sessionStorage): OperationsApi {
+  const storageKey = "orca-hq.operations.csrf"; let csrf = storage.getItem(storageKey) ?? undefined, refreshPromise: Promise<void> | undefined;
+  const parseError = async (response: Response) => { let code = "operations_api_error"; try { const value = record(await response.json()); code = typeof value.error === "string" ? value.error : code; } catch { /* keep generic */ } return new OperationsApiError(response.status, code); };
+  const send = async <T>(path: string, schema: Schema<T>, init: RequestInit = {}): Promise<T> => { try { const response = await fetcher(path, { credentials: "same-origin", ...init }); if (!response.ok) throw await parseError(response); return schema.parse(await response.json()); } catch (error) { if (error instanceof OperationsApiError || (error instanceof DOMException && error.name === "AbortError")) throw error; throw new OperationsApiError(undefined, "network_error"); } };
+  const refresh = () => { if (!refreshPromise) refreshPromise = (async () => { if (!csrf) throw new OperationsApiError(401, "session_required"); const result = await send("/auth/local/refresh", authSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf }, body: "{}" }); csrf = result.csrf; storage.setItem(storageKey, csrf); })().finally(() => { refreshPromise = undefined; }); return refreshPromise; };
+  const read = async <T>(path: string, schema: Schema<T>, signal?: AbortSignal, recover = true): Promise<T> => { try { return await send(path, schema, signal ? { signal } : {}); } catch (error) { if (recover && error instanceof OperationsApiError && error.status === 401 && csrf) { try { await refresh(); } catch (refreshError) { storage.removeItem(storageKey); csrf = undefined; throw refreshError; } return read(path, schema, signal, false); } throw error; } };
+  const mutate = async (path: string, body: object, requestId: string): Promise<OperationsMutationReceipt> => {
     try {
-      const response = await fetcher("/auth/session", { method: "POST", credentials: "same-origin" });
-      if (!response.ok) throw new DashboardApiError(response.status);
-      csrfToken = response.headers.get("x-csrf-token") ?? undefined;
-    } catch (error) {
-      if (error instanceof DashboardApiError) throw error;
-      throw new DashboardApiError();
-    }
-  };
-  const request = async <T>(path: string, init: RequestInit | (() => RequestInit) = {}, canRecover = true): Promise<T> => {
-    try {
-      const requestInit = typeof init === "function" ? init() : init;
-      const response = await fetcher(path, { credentials: "same-origin", ...requestInit });
+      const response = await fetcher(path, { credentials: "same-origin", method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) });
+      if (!response.ok && response.status !== 409 && response.status !== 502) throw await parseError(response);
+      const value: unknown = await response.json();
       if (!response.ok) {
-        if (response.status === 401 && canRecover) {
-          await bootstrap();
-          return request(path, init, false);
-        }
-        throw new DashboardApiError(response.status);
+        try { return mutationReceiptSchema.parse(value); }
+        catch { const error = record(value).error; if (typeof error === "string") throw new OperationsApiError(response.status, error); throw new OperationsApiError(502, "malformed_response"); }
       }
-      return response.status === 204 ? undefined as T : await response.json() as T;
+      return mutationReceiptSchema.parse(value);
     } catch (error) {
-      if (error instanceof DashboardApiError) throw error;
-      throw new DashboardApiError();
+      if (error instanceof OperationsApiError) throw error;
+      throw new OperationsApiError(undefined, "network_error");
     }
-  };
-  const mutation = async (path: string, body: object): Promise<void> => {
-    const key = idempotencyKey();
-    await request(path, () => ({
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-csrf-token": csrfToken ?? "",
-        "idempotency-key": key
-      },
-      body: JSON.stringify(body)
-    }));
   };
   return {
-    bootstrap,
-    listCommands: () => request("/api/commands"),
-    getCommand: (id) => request(`/api/commands/${encodeURIComponent(id)}`),
-    confirmApproval: (id, input) => mutation(`/api/approvals/${encodeURIComponent(id)}/confirm`, input),
-    stopDispatch: (dispatchId) => mutation("/api/actions/stop", { dispatchId }),
-    retryDispatch: (dispatchId) => mutation("/api/actions/retry", { dispatchId })
+    async bootstrap() { const hash = location.hash; if (!hash.startsWith("#claim=")) return; history.replaceState(history.state, "", `${location.pathname}${location.search}`); const claim = hash.slice(7); if (!/^[A-Za-z0-9_-]{43}$/.test(claim)) throw new OperationsApiError(400, "claim_invalid"); const result = await send("/auth/local/claim", authSchema, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim }) }); csrf = result.csrf; storage.setItem(storageKey, csrf); },
+    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), tasks: (runId, signal) => read(`/api/operations/orca/tasks?runId=${encodeURIComponent(runId)}`, orcaTaskPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate,
   };
 }

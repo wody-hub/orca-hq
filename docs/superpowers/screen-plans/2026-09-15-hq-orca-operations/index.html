@@ -1,0 +1,1187 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HQ / Orca Operations — 화면기획</title>
+<style>
+:root{
+  --bg:#f6f4ef;
+  --surface:#ffffff;
+  --surface-alt:#f0ede6;
+  --border:#e2ddd2;
+  --border-strong:#cfc8b8;
+  --text:#1f2430;
+  --text-muted:#68707e;
+  --text-faint:#96a0ab;
+  --navy:#0e1a2b;
+  --navy-alt:#152238;
+  --navy-text:#c9d3e0;
+  --navy-text-dim:#7f8ea3;
+  --emerald:#04815f;
+  --emerald-bg:#e5f4ee;
+  --emerald-border:#bfe3d3;
+  --blue:#1d4ed8;
+  --blue-bg:#e9f0ff;
+  --blue-border:#c3d6fb;
+  --amber:#92400e;
+  --amber-bg:#fbf0dd;
+  --amber-border:#f0dcb0;
+  --red:#a3241a;
+  --red-bg:#fbeae8;
+  --red-border:#f2c9c4;
+  --gray-bg:#eceae4;
+  --gray-border:#d8d3c6;
+  --radius:10px;
+  --shadow:0 1px 2px rgba(20,20,10,.05), 0 4px 14px rgba(20,20,10,.06);
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Apple SD Gothic Neo","Malgun Gothic",sans-serif;
+  font-size:14px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+img{max-width:100%}
+[hidden]{display:none!important}
+button{font-family:inherit}
+a{color:var(--blue)}
+
+/* ---------- layout shell ---------- */
+.app{min-height:100vh;display:flex;flex-direction:column}
+.sim-strip{
+  background:var(--amber-bg);
+  color:var(--amber);
+  border-bottom:1px solid var(--amber-border);
+  font-size:12px;
+  font-weight:600;
+  letter-spacing:.02em;
+  text-align:center;
+  padding:5px 12px;
+}
+.shell{display:flex;flex:1;min-height:0}
+
+/* sidebar */
+.sidebar{
+  width:216px;flex:none;
+  background:var(--navy);
+  color:var(--navy-text);
+  display:flex;flex-direction:column;
+  padding:16px 10px 16px;
+}
+.brand{padding:6px 10px 16px;border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:12px}
+.brand .name{font-size:14.5px;font-weight:700;color:#fff;letter-spacing:-.01em}
+.brand .sub{font-size:11px;color:var(--navy-text-dim);margin-top:2px}
+.nav{display:flex;flex-direction:column;gap:2px;overflow-y:auto}
+.nav button{
+  display:flex;align-items:center;gap:10px;
+  background:transparent;border:none;color:var(--navy-text);
+  text-align:left;padding:9px 10px;border-radius:8px;cursor:pointer;
+  font-size:13.2px;width:100%;
+}
+.nav button .dot{width:6px;height:6px;border-radius:50%;background:var(--navy-text-dim);flex:none}
+.nav button:hover{background:rgba(255,255,255,.06)}
+.nav button.active{background:var(--navy-alt);color:#fff;font-weight:600}
+.nav button.active .dot{background:var(--emerald)}
+.nav button:focus-visible{outline:2px solid #6ea8fe;outline-offset:1px}
+.nav-footer{margin-top:auto;padding:10px;font-size:11px;color:var(--navy-text-dim);border-top:1px solid rgba(255,255,255,.08)}
+
+/* topbar */
+.topbar{
+  background:var(--surface);
+  border-bottom:1px solid var(--border);
+  padding:10px 20px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.conn-pill{
+  display:inline-flex;align-items:center;gap:6px;
+  border:1px solid var(--border-strong);border-radius:999px;
+  padding:4px 10px 4px 8px;font-size:12px;font-weight:600;background:var(--surface-alt);
+  white-space:nowrap;
+}
+.conn-pill .sample-tag{font-weight:700;font-size:9.5px;letter-spacing:.04em;color:var(--text-faint);border:1px solid var(--gray-border);border-radius:4px;padding:1px 4px;margin-left:4px}
+.conn-dot{width:7px;height:7px;border-radius:50%}
+.conn-dot.ok{background:var(--emerald)}
+.conn-dot.warn{background:var(--amber)}
+.conn-dot.bad{background:var(--red)}
+.conn-dot.unk{background:var(--text-faint)}
+.topbar .spacer{flex:1}
+.topbar .collected{font-size:12px;color:var(--text-muted)}
+.scenario-control{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)}
+.scenario-control select{
+  border:1px solid var(--border-strong);border-radius:7px;padding:5px 8px;background:var(--surface);
+  font-size:12.5px;color:var(--text);
+}
+
+/* main */
+.main{flex:1;min-width:0;overflow-y:auto;padding:22px 26px 60px}
+.view-head{margin-bottom:16px}
+.view-head h1{font-size:19px;margin:0 0 4px;letter-spacing:-.01em}
+.view-head p{margin:0;color:var(--text-muted);font-size:13px}
+
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media (max-width:900px){ .grid-2,.grid-3{grid-template-columns:1fr} }
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+.card-pad{padding:16px}
+.card-head{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1px solid var(--border)}
+.card-head h2{font-size:14.5px;margin:0}
+.card-head .meta{font-size:11.5px;color:var(--text-faint)}
+
+.stat-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.stat{flex:1;min-width:150px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px}
+.stat .label{font-size:11.5px;color:var(--text-muted);display:flex;justify-content:space-between;align-items:center}
+.stat .value{font-size:20px;font-weight:700;margin-top:4px;letter-spacing:-.01em}
+.stat .note{font-size:11px;color:var(--text-faint);margin-top:3px}
+
+/* badges */
+.badge{display:inline-flex;align-items:center;gap:4px;border-radius:6px;padding:2px 7px;font-size:11.5px;font-weight:600;white-space:nowrap;border:1px solid transparent}
+.badge.hq{background:var(--blue-bg);color:var(--blue);border-color:var(--blue-border)}
+.badge.orca{background:var(--emerald-bg);color:var(--emerald);border-color:var(--emerald-border)}
+.badge.active{background:var(--blue-bg);color:var(--blue);border-color:var(--blue-border)}
+.badge.question{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-border)}
+.badge.unknown{background:var(--gray-bg);color:#5c5748;border-color:var(--gray-border)}
+.badge.completed{background:var(--emerald-bg);color:var(--emerald);border-color:var(--emerald-border)}
+.badge.stopped{background:var(--red-bg);color:var(--red);border-color:var(--red-border)}
+.badge.sample{background:transparent;color:var(--text-faint);border-color:var(--gray-border);font-weight:700;font-size:9.5px;letter-spacing:.03em}
+.badge.mock{background:var(--gray-bg);color:#5c5748;border-color:var(--gray-border);font-weight:700;font-size:10px}
+
+/* table */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:560px}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--text-faint);padding:9px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface-alt)}
+tbody tr:last-child td{border-bottom:none}
+.cell-title{font-weight:600}
+.cell-sub{color:var(--text-faint);font-size:11.5px;margin-top:2px}
+
+/* buttons */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;justify-content:center;
+  border-radius:8px;border:1px solid var(--border-strong);background:var(--surface);
+  padding:8px 13px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text);
+}
+.btn:hover{background:var(--surface-alt)}
+.btn:focus-visible{outline:2px solid #6ea8fe;outline-offset:1px}
+.btn.primary{background:var(--navy);border-color:var(--navy);color:#fff}
+.btn.primary:hover{background:var(--navy-alt)}
+.btn.accent{background:var(--emerald);border-color:var(--emerald);color:#fff}
+.btn.accent:hover{filter:brightness(1.06)}
+.btn.danger{background:var(--red-bg);border-color:var(--red-border);color:var(--red)}
+.btn.ghost{border-color:transparent;background:transparent}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.sm{padding:5px 9px;font-size:12px;border-radius:7px}
+
+.tabbar{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:14px}
+.tabbar button{
+  background:none;border:none;padding:9px 4px;margin-right:14px;font-size:13.5px;font-weight:600;
+  color:var(--text-muted);border-bottom:2px solid transparent;cursor:pointer;
+}
+.tabbar button.active{color:var(--text);border-bottom-color:var(--navy)}
+.tabbar button:focus-visible{outline:2px solid #6ea8fe}
+
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12.5px;font-weight:600;margin-bottom:5px;color:var(--text)}
+.field .hint{font-size:11.5px;color:var(--text-faint);margin-top:4px}
+.field input[type=text],.field input[type=search],.field select,.field textarea{
+  width:100%;border:1px solid var(--border-strong);border-radius:8px;padding:9px 11px;font-size:13.5px;
+  background:var(--surface);color:var(--text);font-family:inherit;
+}
+.field textarea{resize:vertical;min-height:110px}
+.radio-row{display:flex;gap:10px;flex-wrap:wrap}
+.radio-card{
+  flex:1;min-width:180px;border:1px solid var(--border-strong);border-radius:9px;padding:11px 12px;cursor:pointer;
+}
+.radio-card.selected{border-color:var(--emerald);background:var(--emerald-bg)}
+.radio-card .t{font-weight:700;font-size:13px}
+.radio-card .d{font-size:11.5px;color:var(--text-muted);margin-top:3px}
+
+.explain{margin-top:12px;border:1px dashed var(--border-strong);border-radius:9px;background:var(--surface-alt)}
+.explain summary{cursor:pointer;padding:9px 12px;font-size:12.5px;font-weight:700;color:var(--text-muted);list-style:none}
+.explain summary::-webkit-details-marker{display:none}
+.explain summary:before{content:"▸ ";color:var(--text-faint)}
+.explain[open] summary:before{content:"▾ "}
+.explain .body{padding:0 14px 12px;font-size:12.5px;color:var(--text-muted)}
+.explain code{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:11.5px}
+
+.filter-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.filter-bar input[type=search]{flex:1;min-width:180px}
+.filter-bar select{border:1px solid var(--border-strong);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--surface)}
+
+.attn-item{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--border)}
+.attn-item:last-child{border-bottom:none}
+.attn-item .icn{width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none}
+.attn-item .txt{flex:1;min-width:0}
+.attn-item .txt .t{font-weight:600;font-size:13px}
+.attn-item .txt .s{font-size:12px;color:var(--text-muted);margin-top:2px}
+
+/* modal */
+.overlay{position:fixed;inset:0;background:rgba(14,20,30,.42);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}
+.modal{background:var(--surface);border-radius:12px;max-width:460px;width:100%;box-shadow:0 20px 50px rgba(0,0,0,.25);padding:20px}
+.modal h3{margin:0 0 8px;font-size:16px}
+.modal p{margin:0 0 14px;font-size:13px;color:var(--text-muted)}
+.modal .actions{display:flex;justify-content:flex-end;gap:8px}
+
+/* drawer */
+.drawer-overlay{position:fixed;inset:0;background:rgba(14,20,30,.3);z-index:40}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(520px,92vw);background:var(--surface);box-shadow:-8px 0 30px rgba(0,0,0,.15);z-index:41;overflow-y:auto;padding:18px 20px 40px}
+.drawer-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px}
+
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--navy);color:#fff;padding:10px 16px;border-radius:9px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.25);z-index:60}
+
+.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;font-size:13px;margin:8px 0}
+.kv dt{color:var(--text-faint);font-size:11.5px;text-transform:uppercase;letter-spacing:.02em;padding-top:1px}
+.kv dd{margin:0}
+
+.tree{list-style:none;margin:0;padding:0}
+.tree li{margin:0}
+.tree .row{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px}
+.tree .row:hover{background:var(--surface-alt)}
+.tree .lvl1{padding-left:0}
+.tree .lvl2{padding-left:22px}
+.tree .lvl3{padding-left:44px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.cmdline{background:var(--navy);color:#d6e6ff;padding:12px 14px;border-radius:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;overflow-x:auto;white-space:pre}
+
+.empty-state{padding:34px 18px;text-align:center;color:var(--text-muted)}
+.empty-state .big{font-size:26px;margin-bottom:6px}
+
+.link-list{margin:0;padding:0;list-style:none}
+.link-list li{padding:9px 0;border-bottom:1px solid var(--border)}
+.link-list li:last-child{border-bottom:none}
+.link-list .n{color:var(--text-faint);font-size:11.5px;margin-right:6px}
+.link-list .date{color:var(--text-faint);font-size:11.5px;margin-left:6px}
+
+@media (max-width:880px){
+  .shell{flex-direction:column}
+  .sidebar{width:100%;flex-direction:row;flex-wrap:wrap;padding:8px 10px;align-items:center;gap:2px;row-gap:6px}
+  .brand{border:none;padding:4px 10px 4px 2px;margin:0;flex:none;width:100%}
+  .brand .sub{display:none}
+  .nav{flex-direction:row;flex-wrap:wrap;flex:1;row-gap:6px;min-width:0;width:100%}
+  .nav button{white-space:nowrap;flex:none}
+  .nav-footer{display:none}
+  .main{padding:16px 14px 50px}
+  .kv{grid-template-columns:100px 1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sim-strip">화면기획 · 시뮬레이션 데이터 · 실제 실행 없음</div>
+  <div class="shell">
+    <nav class="sidebar" aria-label="주요 화면 이동">
+      <div class="brand">
+        <div class="name">HQ / Orca Operations</div>
+        <div class="sub">화면기획 시안 · v0.1</div>
+      </div>
+      <div class="nav" id="nav" role="tablist" aria-label="화면 목록"></div>
+      <div class="nav-footer">단일 운영자용 데스크톱 콘솔 시안<br>모든 데이터는 예시입니다</div>
+    </nav>
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column;min-height:0">
+      <header class="topbar">
+        <span class="conn-pill" id="pill-hq"></span>
+        <span class="conn-pill" id="pill-orca"></span>
+        <span class="collected" id="collected-at"></span>
+        <div class="spacer"></div>
+        <div class="scenario-control">
+          <label for="scenario-select">시나리오</label>
+          <select id="scenario-select" aria-label="연결/데이터 시나리오 전환">
+            <option value="connected">정상 연결 (기본)</option>
+            <option value="disconnected">연결 끊김</option>
+            <option value="unknown">상태 불확실</option>
+            <option value="empty">데이터 없음</option>
+          </select>
+        </div>
+      </header>
+      <main class="main" id="main" tabindex="-1"></main>
+    </div>
+  </div>
+</div>
+<div id="overlay-root"></div>
+<div id="toast-root" aria-live="polite"></div>
+
+<script>
+(function(){
+"use strict";
+
+/* ============================== 고정 데모 데이터 ============================== */
+/* 모든 값은 리서치(research.md) 기준 필드 구조만 사용한 예시이며 실제 조회 결과가 아닙니다. */
+
+var NAV = [
+  {id:"overview", label:"운영 개요"},
+  {id:"tasks", label:"업무 목록"},
+  {id:"compose", label:"새 지시"},
+  {id:"inbox", label:"질문함"},
+  {id:"detail", label:"업무 상세", hiddenInNav:true},
+  {id:"projects", label:"프로젝트/터미널"},
+  {id:"settings", label:"운영 설정"},
+  {id:"research", label:"리서치·기획"}
+];
+
+// 업무 항목: HQ 문맥(context)과 Orca Run/Task/Dispatch를 분리 표시. source로만 구분한다.
+var ITEMS = [
+  {
+    id:"hq-1201", source:"hq", cat:"active",
+    title:"결제 실패 로그 조사 요청", summary:"정산 실패 건 재현 로그 확인 및 원인 분류 요청",
+    contextId:"ctx_9f21ab", requestId:"req_18410", sessionId:"sess_kr-ops",
+    state:"executing", updatedAt:"09:41", createdAt:"09:12",
+    linkedOrcaId:null,
+    timeline:[
+      {seq:118,kind:"progress.request.created",source:"tool",at:"09:12",detail:"requestId=req_18410, contextHint={mode:\"new\"}"},
+      {seq:119,kind:"context.created",source:"hq",at:"09:12",detail:"contextId=ctx_9f21ab"},
+      {seq:124,kind:"worker.launching",source:"orca",at:"09:14",detail:"attemptId=att_772, requested={agent:\"claude\",model:\"미확인\"}"},
+      {seq:131,kind:"progress.event",source:"hq",at:"09:41",detail:"state=executing (heartbeat만 확인, 진행 근거 아님)"}
+    ]
+  },
+  {
+    id:"hq-1188", source:"hq", cat:"question",
+    title:"정산 배치 재시도 여부 확인 필요", summary:"실패 배치 3건 재시도 전 승인 필요, 응답 대기 중",
+    contextId:"ctx_77c204", requestId:"req_18355", sessionId:"sess_kr-ops",
+    state:"awaiting_input", updatedAt:"09:33", createdAt:"08:50",
+    linkedOrcaId:null,
+    timeline:[
+      {seq:80,kind:"progress.request.created",source:"tool",at:"08:50",detail:"requestId=req_18355"},
+      {seq:88,kind:"progress.event",source:"hq",at:"09:20",detail:"state=awaiting_input, clarification 발송"},
+      {seq:90,kind:"progress.event",source:"hq",at:"09:33",detail:"아직 응답 없음 (idempotent 재전송 가능)"}
+    ]
+  },
+  {
+    id:"hq-1150", source:"hq", cat:"unknown",
+    title:"고객 데이터 이관 점검", summary:"복구 필요 상태 진입, 원인 미확인 상태로 대기",
+    contextId:"ctx_55ab90", requestId:"req_18201", sessionId:"sess_kr-ops",
+    state:"recovery_required", updatedAt:"08:58", createdAt:"08:10",
+    linkedOrcaId:null,
+    timeline:[
+      {seq:40,kind:"progress.request.created",source:"tool",at:"08:10",detail:"requestId=req_18201"},
+      {seq:55,kind:"worker.recovery_required",source:"orca",at:"08:58",detail:"attemptId=att_701, 원인 필드 미제공"}
+    ]
+  },
+  {
+    id:"hq-1099", source:"hq", cat:"completed",
+    title:"월간 운영 리포트 초안 생성", summary:"완료 접수됨, 결과 요약은 receipt 참고",
+    contextId:"ctx_11ff02", requestId:"req_18022", sessionId:"sess_kr-ops",
+    state:"completed", updatedAt:"07:45", createdAt:"07:05",
+    linkedOrcaId:"run_2231",
+    timeline:[
+      {seq:10,kind:"progress.request.created",source:"tool",at:"07:05",detail:"requestId=req_18022"},
+      {seq:22,kind:"worker.ready",source:"orca",at:"07:20",detail:"runId=run_2231, taskId=task_88, dispatchId=disp_441"},
+      {seq:44,kind:"progress.event",source:"hq",at:"07:45",detail:"state=completed"}
+    ]
+  },
+  {
+    id:"orca-441", source:"orca", cat:"unknown",
+    title:"disp_441 · 로그 요약 워커", summary:"에이전트 판정(liveness)과 터미널 연결 상태가 서로 다름 — 종료 증거 없음",
+    runId:"run_2231", taskId:"task_88", dispatchId:"disp_441",
+    state:"unverifiable", updatedAt:"09:38", createdAt:"07:20",
+    linkedHqId:"hq-1099",
+    requestedModel:"claude-opus-4.6", effectiveModel:"미확인",
+    livenessProjection:"unverifiable", ptyObservation:"live",
+    timeline:[
+      {seq:1,kind:"run-list snapshot",source:"orca",at:"07:20",detail:"projection.liveness.verdict=live"},
+      {seq:2,kind:"worker-show",source:"orca",at:"09:38",detail:"observation.status=live, projection.liveness.verdict=unverifiable"},
+      {seq:3,kind:"note",source:"system",at:"09:38",detail:"live terminal은 healthy agent를 보장하지 않음 (근거: research.md B)"}
+    ]
+  },
+  {
+    id:"orca-506", source:"orca", cat:"completed",
+    title:"disp_506 · 배포 전 점검 워커", summary:"worker-stop 접수 후 정산 완료, 해제 가능",
+    runId:"run_2298", taskId:"task_101", dispatchId:"disp_506",
+    state:"stopped", updatedAt:"09:02", createdAt:"08:30",
+    linkedHqId:null,
+    requestedModel:"claude-sonnet-5", effectiveModel:"claude-sonnet-5",
+    livenessProjection:"exited", ptyObservation:"exited",
+    timeline:[
+      {seq:1,kind:"worker-stop 접수",source:"orca",at:"08:58",detail:"dispatchId=disp_506, 확인 화면 통과 후 실행"},
+      {seq:2,kind:"worker-show",source:"orca",at:"09:02",detail:"projection.liveness.verdict=exited, observation.status=exited, outcome=synthetic stop+settlement receipt"}
+    ]
+  },
+  {
+    id:"orca-512", source:"orca", cat:"question",
+    title:"disp_512 · 스키마 마이그레이션 워커", summary:"Orca 메시지로 정확한 질문 수신, 답변 대기",
+    runId:"run_2301", taskId:"task_104", dispatchId:"disp_512",
+    state:"awaiting_reply", updatedAt:"09:30", createdAt:"09:05",
+    linkedHqId:null,
+    requestedModel:"claude-opus-4.6", effectiveModel:"claude-opus-4.6",
+    livenessProjection:"live", ptyObservation:"live",
+    timeline:[
+      {seq:1,kind:"inbox message",source:"orca",at:"09:30",detail:"type=question, messageId=msg_9910"}
+    ]
+  },
+  {
+    id:"orca-533", source:"orca", cat:"active",
+    title:"disp_533 · 데이터 이관 검증 워커", summary:"실행 중, requested/effective 모델 일치",
+    runId:"run_2318", taskId:"task_110", dispatchId:"disp_533",
+    state:"running", updatedAt:"09:40", createdAt:"09:18",
+    linkedHqId:null,
+    requestedModel:"claude-sonnet-5", effectiveModel:"claude-sonnet-5",
+    livenessProjection:"live", ptyObservation:"live",
+    timeline:[
+      {seq:1,kind:"worker.ready",source:"orca",at:"09:18",detail:"effective={agent:\"claude\",model:\"claude-sonnet-5\"}"},
+      {seq:2,kind:"heartbeat",source:"orca",at:"09:40",detail:"stream 생존 신호 (진행 증거 아님)"}
+    ]
+  }
+];
+
+var QUESTIONS = [
+  {id:"q-hq-1188", source:"hq", relatedId:"hq-1188", text:"정산 실패 배치 3건을 즉시 재시도할까요, 아니면 원인 조사 후 재시도할까요?", state:"pending", deliveredAt:"09:20", channel:"progress event (clarification)"},
+  {id:"q-orca-512", source:"orca", relatedId:"orca-512", text:"기존 스키마 백업이 없는 상태로 진행해도 되나요? (messageId=msg_9910)", state:"pending", deliveredAt:"09:30", channel:"inbox message (type=question)"},
+  {id:"q-hq-1090", source:"hq", relatedId:null, text:"7월 리포트 포맷을 기존 템플릿과 동일하게 유지할까요?", state:"answered", deliveredAt:"어제 18:04", channel:"progress event (clarification)", answer:"네, 기존 템플릿 유지해 주세요.", answeredAt:"어제 18:22"}
+];
+
+var PROJECTS = [
+  {id:"proj-orca-hq", name:"orca-hq", worktrees:[
+    {id:"wt-main", name:"main", terminals:[
+      {handle:"term_a01f", title:"coordinator", connected:true, writable:true, state:"connected"},
+      {handle:"term_b12c", title:null, connected:false, writable:false, state:"orphaned"}
+    ]},
+    {id:"wt-feature", name:"feature/hq-bridge", terminals:[
+      {handle:"term_c88e", title:"disp_441 워커", connected:true, writable:true, state:"connected"},
+      {handle:"term_d40a", title:"disp_512 워커", connected:false, writable:false, state:"unknown"}
+    ]}
+  ]}
+];
+
+/* ============================== 상태 ============================== */
+var STATE = {
+  scenario:"connected",
+  route:{view:"overview", id:null},
+  tasksTab:"hq",
+  tasksSearch:"",
+  tasksFilter:"all",
+  detailTab:"overview",
+  composerMode:"hq",
+  composerStep:"form",
+  composerText:"",
+  composerProject:"orca-hq",
+  composerContextMode:"new",
+  composerAgent:"",
+  composerModel:"",
+  questionDraft:{},
+  createdReceipts:[]
+};
+
+var itemsList = ITEMS.slice();
+var questionsList = QUESTIONS.slice();
+
+/* ============================== 유틸 ============================== */
+function esc(s){
+  return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+  });
+}
+function el(html){ var d=document.createElement("div"); d.innerHTML=html.trim(); return d.firstElementChild; }
+function qs(sel,root){ return (root||document).querySelector(sel); }
+function qsa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }
+
+function livenessUserLabel(v){
+  return {live:"실행 중", exited:"종료됨", unverifiable:"판정 불가"}[v] || v;
+}
+function ptyUserLabel(v){
+  return {live:"연결됨", exited:"종료됨", unverifiable:"관찰 불가"}[v] || v;
+}
+function catLabel(cat){
+  return {active:"진행중", question:"질문", unknown:"확인필요", completed:"완료"}[cat] || cat;
+}
+function catBadge(cat){
+  return '<span class="badge '+cat+'">'+catLabel(cat)+'</span>';
+}
+function sourceBadge(src){
+  return src==="hq" ? '<span class="badge hq">HQ</span>' : '<span class="badge orca">Orca</span>';
+}
+
+function toast(msg){
+  var root = qs("#toast-root");
+  root.innerHTML = "";
+  var t = el('<div class="toast" role="status"></div>');
+  t.textContent = msg;
+  root.appendChild(t);
+  setTimeout(function(){ if(root.contains(t)) root.removeChild(t); }, 3200);
+}
+
+function openOverlay(node){
+  var root = qs("#overlay-root");
+  root.innerHTML = "";
+  root.appendChild(node);
+  document.addEventListener("keydown", overlayEscHandler);
+  var focusable = node.querySelector("button, input, textarea, select, [tabindex]");
+  if(focusable) focusable.focus();
+}
+function closeOverlay(){
+  qs("#overlay-root").innerHTML = "";
+  document.removeEventListener("keydown", overlayEscHandler);
+}
+function overlayEscHandler(e){
+  if(e.key === "Escape") closeOverlay();
+}
+
+/* ============================== 라우팅 ============================== */
+function parseHash(){
+  var h = location.hash.replace(/^#\/?/, "");
+  var parts = h.split("/").filter(Boolean);
+  if(parts.length === 0) return {view:"overview", id:null};
+  return {view:parts[0], id:parts[1] || null};
+}
+function navigate(view, id){
+  location.hash = "#/" + view + (id ? "/"+id : "");
+}
+window.addEventListener("hashchange", function(){
+  STATE.route = parseHash();
+  if(STATE.route.view === "detail") STATE.detailTab = "overview";
+  render();
+});
+
+/* ============================== 최상단 렌더 ============================== */
+function scenarioConn(){
+  switch(STATE.scenario){
+    case "disconnected": return {hq:{cls:"bad",text:"HQ 연결 끊김"}, orca:{cls:"bad",text:"Orca 연결 끊김"}, collected:"마지막 성공 수집: 08:52 (지금은 재시도 중)"};
+    case "unknown": return {hq:{cls:"unk",text:"HQ 상태 확인 필요"}, orca:{cls:"unk",text:"Orca 상태 확인 필요"}, collected:"마지막 수집: 09:12 · 이후 판정 불가"};
+    case "empty": return {hq:{cls:"ok",text:"HQ 연결됨"}, orca:{cls:"ok",text:"Orca 연결됨"}, collected:"마지막 수집: 09:41 (표시할 데이터 없음)"};
+    default: return {hq:{cls:"ok",text:"HQ 연결됨"}, orca:{cls:"ok",text:"Orca 연결됨"}, collected:"마지막 수집: 09:41:07 (mock)"};
+  }
+}
+function renderTopbar(){
+  var c = scenarioConn();
+  qs("#pill-hq").innerHTML = '<span class="conn-dot '+c.hq.cls+'"></span>'+esc(c.hq.text)+'<span class="sample-tag">SAMPLE</span>';
+  qs("#pill-orca").innerHTML = '<span class="conn-dot '+c.orca.cls+'"></span>'+esc(c.orca.text)+'<span class="sample-tag">SAMPLE</span>';
+  qs("#collected-at").textContent = c.collected;
+  qs("#scenario-select").value = STATE.scenario;
+}
+
+function renderNav(){
+  var nav = qs("#nav");
+  nav.innerHTML = "";
+  NAV.filter(function(n){ return !n.hiddenInNav; }).forEach(function(n){
+    var active = STATE.route.view === n.id;
+    var btn = el('<button role="tab" aria-selected="'+active+'"><span class="dot"></span><span>'+esc(n.label)+'</span></button>');
+    if(active) btn.classList.add("active");
+    btn.addEventListener("click", function(){ navigate(n.id); });
+    nav.appendChild(btn);
+  });
+}
+
+/* ============================== 뷰: 운영 개요 ============================== */
+function attentionItems(){
+  if(STATE.scenario === "empty") return [];
+  var out = [];
+  itemsList.forEach(function(it){
+    if(it.cat === "question") out.push({icn:"var(--amber)", t:it.title, s:(it.source==="hq"?"HQ 문맥 응답 대기":"Orca 질문 메시지 대기")+" · "+it.updatedAt, id:it.id});
+    if(it.cat === "unknown") out.push({icn:"var(--text-faint)", t:it.title, s:"상태 확인 필요 · 자동 재시작/해제 금지 · "+it.updatedAt, id:it.id});
+  });
+  if(STATE.scenario === "disconnected") out.unshift({icn:"var(--red)", t:"수집 연결 끊김", s:"마지막 성공 이후 read 재시도 중 — lifecycle 상태는 추정하지 않음", id:null});
+  if(STATE.scenario === "unknown") out.unshift({icn:"var(--text-faint)", t:"연결 상태 판정 불가", s:"capability/version 확인 실패 — 최근 데이터는 참고용", id:null});
+  return out;
+}
+
+function hqOccupiedCount(){
+  return itemsList.filter(function(i){ return i.source==="hq" && (i.cat==="active"||i.cat==="unknown"); }).length;
+}
+function viewOverview(){
+  var hqRows = itemsList.filter(function(i){return i.source==="hq";});
+  var orcaRows = itemsList.filter(function(i){return i.source==="orca";});
+  var attn = attentionItems();
+  var empty = STATE.scenario === "empty";
+
+  return ''+
+  '<div class="view-head"><h1>운영 개요</h1><p>HQ 업무와 Orca 실행을 분리해서 보여줍니다. 두 계열은 서로 다른 시스템이며, 연결된 것으로 보이는 값만 상호 참조합니다.</p></div>'+
+
+  '<div class="stat-row">'+
+    '<div class="stat"><div class="label">HQ 진행중 업무<span class="badge sample">SAMPLE</span></div><div class="value">'+(empty?"—":hqRows.filter(function(i){return i.cat==="active";}).length)+'</div><div class="note">state=executing 기준, 완료 아님</div></div>'+
+    '<div class="stat"><div class="label">Orca 실행 워커<span class="badge sample">SAMPLE</span></div><div class="value">'+(empty?"—":orcaRows.filter(function(i){return i.cat==="active";}).length)+'</div><div class="note">실행 중(live)으로 판정된 워커 기준</div></div>'+
+    '<div class="stat"><div class="label">관심 필요<span class="badge sample">SAMPLE</span></div><div class="value">'+(empty?0:attn.length)+'</div><div class="note">질문 · 확인필요 · 연결 이슈 합계</div></div>'+
+    '<div class="stat"><div class="label">HQ 용량 (예시 10슬롯)<span class="badge sample">SAMPLE</span></div><div class="value">'+(empty?"—":hqOccupiedCount()+" / 10")+'</div><div class="note">HQ가 시작한 worker attempt만 집계(unknown 포함) · Orca 외부 run 미포함</div></div>'+
+  '</div>'+
+
+  '<div class="grid-2">'+
+    '<div class="card">'+
+      '<div class="card-head"><h2>관심함</h2><span class="meta">source 표시 포함</span></div>'+
+      '<div class="card-pad">'+
+        (attn.length===0
+          ? '<div class="empty-state"><div class="big">✓</div>대기 중인 관심 항목이 없습니다.'+(empty?'<div class="hint" style="margin-top:6px">현재 시나리오: 데이터 없음</div>':'')+'</div>'
+          : attn.map(function(a){
+              return '<div class="attn-item" '+(a.id?'data-goto="'+a.id+'" style="cursor:pointer"':'')+'>'+
+                '<span class="icn" style="background:'+a.icn+'"></span>'+
+                '<div class="txt"><div class="t">'+esc(a.t)+'</div><div class="s">'+esc(a.s)+'</div></div>'+
+              '</div>';
+            }).join("")
+        )+
+      '</div>'+
+    '</div>'+
+    '<div class="card">'+
+      '<div class="card-head"><h2>최신 활동</h2><span class="meta">source별 최근 이벤트</span></div>'+
+      '<div class="card-pad">'+
+        (empty ? '<div class="empty-state"><div class="big">–</div>표시할 활동이 없습니다.</div>' :
+        itemsList.slice().sort(function(a,b){return b.updatedAt.localeCompare(a.updatedAt);}).slice(0,5).map(function(it){
+          return '<div class="attn-item" data-goto="'+it.id+'" style="cursor:pointer">'+
+            '<span class="icn" style="background:var(--text-faint)"></span>'+
+            '<div class="txt"><div class="t">'+sourceBadge(it.source)+' '+esc(it.title)+'</div><div class="s">'+esc(it.updatedAt)+' 갱신 · '+catLabel(it.cat)+'</div></div>'+
+          '</div>';
+        }).join(""))+
+      '</div>'+
+    '</div>'+
+  '</div>'+
+
+  '<div class="grid-2" style="margin-top:16px">'+
+    '<div class="card">'+
+      '<div class="card-head"><h2>HQ 업무 (문맥/요청)</h2><span class="meta">'+hqRows.length+'건</span></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>갱신</th></tr></thead><tbody>'+
+        (empty?'':hqRows.map(function(i){
+          return '<tr data-goto="'+i.id+'"><td class="cell-title">'+esc(i.title)+'</td><td>'+catBadge(i.cat)+'</td><td>'+i.updatedAt+'</td></tr>';
+        }).join(""))+
+      '</tbody></table></div>'+
+    '</div>'+
+    '<div class="card">'+
+      '<div class="card-head"><h2>Orca 실행 (Run/Task/Dispatch)</h2><span class="meta">'+orcaRows.length+'건</span></div>'+
+      '<div class="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>갱신</th></tr></thead><tbody>'+
+        (empty?'':orcaRows.map(function(i){
+          return '<tr data-goto="'+i.id+'"><td class="cell-title">'+esc(i.title)+'</td><td>'+catBadge(i.cat)+'</td><td>'+i.updatedAt+'</td></tr>';
+        }).join(""))+
+      '</tbody></table></div>'+
+    '</div>'+
+  '</div>'+
+
+  '<details class="explain" style="margin-top:16px"><summary>기획 해설</summary><div class="body">'+
+    '<p>HQ 문맥과 Orca Run/Task/Dispatch는 서로 다른 모델입니다. HQ는 receipt/message로 받은 Orca ID만 알고, 전체 Orca 실행 내역은 갖고 있지 않습니다 (근거: research.md &sect;HQ와 Orca 경계).</p>'+
+    '<p>비용/토큰/용량 퍼센트는 HQ·Orca CLI 어디에도 필드가 없어 <b>수집되지 않음</b>으로 두었습니다. HQ 용량은 <code>maxActiveWorkers</code> (기본 10, 정수 또는 <code>unlimited</code>)이며 전체 Orca 플릿 한도가 아닙니다.</p>'+
+  '</div></details>';
+}
+
+/* ============================== 뷰: 업무 목록 ============================== */
+function viewTasks(){
+  var tab = STATE.tasksTab;
+  var rows = itemsList.filter(function(i){ return i.source === tab; });
+  if(STATE.tasksFilter !== "all") rows = rows.filter(function(i){ return i.cat === STATE.tasksFilter; });
+  if(STATE.tasksSearch.trim()) {
+    var q = STATE.tasksSearch.trim().toLowerCase();
+    rows = rows.filter(function(i){ return (i.title+" "+i.summary).toLowerCase().indexOf(q) > -1; });
+  }
+  var empty = STATE.scenario === "empty";
+
+  return ''+
+  '<div class="view-head"><h1>업무 목록</h1><p>HQ 문맥과 Orca 실행을 같은 화면에서 볼 수 있지만 하나의 목록으로 합치지 않습니다.</p></div>'+
+  '<div class="tabbar" role="tablist" aria-label="출처 탭">'+
+    '<button role="tab" aria-selected="'+(tab==="hq")+'" data-tab="hq" class="'+(tab==="hq"?"active":"")+'">HQ 문맥</button>'+
+    '<button role="tab" aria-selected="'+(tab==="orca")+'" data-tab="orca" class="'+(tab==="orca"?"active":"")+'">Orca Run/Task/Dispatch</button>'+
+  '</div>'+
+  '<div class="filter-bar">'+
+    '<input type="search" id="task-search" placeholder="제목·요약 검색" value="'+esc(STATE.tasksSearch)+'" aria-label="업무 검색">'+
+    '<select id="task-filter" aria-label="상태 필터">'+
+      '<option value="all"'+(STATE.tasksFilter==="all"?" selected":"")+'>전체 상태</option>'+
+      '<option value="active"'+(STATE.tasksFilter==="active"?" selected":"")+'>진행중</option>'+
+      '<option value="question"'+(STATE.tasksFilter==="question"?" selected":"")+'>질문</option>'+
+      '<option value="unknown"'+(STATE.tasksFilter==="unknown"?" selected":"")+'>확인필요</option>'+
+      '<option value="completed"'+(STATE.tasksFilter==="completed"?" selected":"")+'>완료</option>'+
+    '</select>'+
+  '</div>'+
+  '<div class="card">'+
+    '<div class="table-wrap"><table><thead><tr>'+
+      (tab==="hq"
+        ? '<th>제목</th><th>상태</th><th>contextId</th><th>연결된 Orca</th><th>갱신</th>'
+        : '<th>제목</th><th>상태</th><th>dispatchId</th><th>모델(요청/실제)</th><th>갱신</th>')+
+    '</tr></thead><tbody>'+
+    (empty || rows.length===0
+      ? '<tr><td colspan="5"><div class="empty-state"><div class="big">–</div>'+(empty?'현재 시나리오에 표시할 데이터가 없습니다.':'조건에 맞는 업무가 없습니다.')+'</div></td></tr>'
+      : rows.map(function(i){
+          if(tab==="hq"){
+            return '<tr data-goto="'+i.id+'"><td><div class="cell-title">'+esc(i.title)+'</div><div class="cell-sub">'+esc(i.summary)+'</div></td>'+
+              '<td>'+catBadge(i.cat)+'</td><td class="mono">'+i.contextId+'</td>'+
+              '<td>'+(i.linkedOrcaId?('<span class="mono">'+i.linkedOrcaId+'</span> <span class="badge sample">mock receipt</span>'):'<span style="color:var(--text-faint)">아직 없음</span>')+'</td>'+
+              '<td>'+i.updatedAt+'</td></tr>';
+          }
+          return '<tr data-goto="'+i.id+'"><td><div class="cell-title">'+esc(i.title)+'</div><div class="cell-sub">'+esc(i.summary)+'</div></td>'+
+            '<td>'+catBadge(i.cat)+'</td><td class="mono">'+i.dispatchId+'</td>'+
+            '<td>'+esc(i.requestedModel)+' → '+(i.effectiveModel==="미확인"?'<span style="color:var(--text-faint)">미확인</span>':esc(i.effectiveModel))+'</td>'+
+            '<td>'+i.updatedAt+'</td></tr>';
+        }).join("")
+    )+
+    '</tbody></table></div>'+
+  '</div>'+
+  '<details class="explain" style="margin-top:14px"><summary>기획 해설</summary><div class="body">'+
+    '<p>HQ 탭은 <code>GET /v1/progress/contexts</code> 스냅샷 필드(contextId, state, requestId 등)를 그대로 반영합니다. Orca 탭은 <code>orchestration run-list / task-list / worker-list --json</code> 프로젝션 필드를 반영합니다.</p>'+
+    '<p>두 계열은 명시적인 receipt(주고받은 Orca ID)가 있을 때만 연결 표시합니다. 없는 경우 "아직 없음"으로 두고, 실패나 legacy로 추정하지 않습니다.</p>'+
+  '</div></details>';
+}
+
+/* ============================== 뷰: 업무 상세 ============================== */
+function findItem(id){ return itemsList.filter(function(i){return i.id===id;})[0]; }
+
+function viewDetail(){
+  var it = findItem(STATE.route.id);
+  if(!it){
+    return '<div class="view-head"><h1>업무 상세</h1></div><div class="card card-pad"><p>선택된 업무를 찾을 수 없습니다. <a href="#/tasks">업무 목록으로</a></p></div>';
+  }
+  var tab = STATE.detailTab;
+  var settled = it.state === "completed" || it.state === "stopped";
+
+  var overviewHtml = ''+
+    '<div class="grid-2">'+
+      '<div class="card card-pad">'+
+        '<h3 style="margin:0 0 10px;font-size:13.5px">기본 정보</h3>'+
+        '<dl class="kv">'+
+          '<dt>출처</dt><dd>'+sourceBadge(it.source)+'</dd>'+
+          '<dt>상태</dt><dd>'+catBadge(it.cat)+' <span class="mono" style="color:var(--text-faint)">'+it.state+'</span></dd>'+
+          (it.source==="hq" ? '<dt>contextId</dt><dd class="mono">'+it.contextId+'</dd><dt>requestId</dt><dd class="mono">'+it.requestId+'</dd>'
+            : '<dt>runId</dt><dd class="mono">'+it.runId+'</dd><dt>taskId</dt><dd class="mono">'+it.taskId+'</dd><dt>dispatchId</dt><dd class="mono">'+it.dispatchId+'</dd>')+
+          '<dt>갱신</dt><dd>'+it.updatedAt+'</dd>'+
+        '</dl>'+
+      '</div>'+
+      '<div class="card card-pad">'+
+        '<h3 style="margin:0 0 10px;font-size:13.5px">라이브니스 구분</h3>'+
+        (it.source==="orca" ?
+          '<dl class="kv">'+
+            '<dt>에이전트 판정</dt><dd>'+livenessUserLabel(it.livenessProjection)+' <span class="hint">(fleet 판정, list/show)</span></dd>'+
+            '<dt>터미널 연결</dt><dd>'+ptyUserLabel(it.ptyObservation)+' <span class="hint">(PTY 관찰, observation.status='+esc(it.ptyObservation)+')</span></dd>'+
+          '</dl><p class="hint" style="margin-top:6px">두 값은 다를 수 있습니다. 연결된 터미널이 있어도 에이전트가 정상이라는 보장은 아닙니다.</p>'+
+          '<details class="explain" style="margin-top:8px"><summary>기획 해설</summary><div class="body">공개 CLI 원본 값: <code>projection.liveness.verdict='+esc(it.livenessProjection)+'</code>, <code>observation.status='+esc(it.ptyObservation)+'</code>. 위 라벨은 사용자용 표현이며, 실제 enum은 각각 live/exited/unverifiable입니다. 데모의 내부 진행 상태(state)와는 별개 필드입니다.</div></details>'
+          : '<p class="hint">HQ 문맥에는 별도 liveness 프로젝션이 없습니다. worker.* 이벤트가 오면 연결된 Orca 실행에서 확인하세요.</p>')+
+      '</div>'+
+    '</div>'+
+    (it.source==="orca" ? '<div class="card card-pad" style="margin-top:14px"><h3 style="margin:0 0 10px;font-size:13.5px">모델 (요청 vs 실제)</h3><dl class="kv"><dt>요청됨</dt><dd>'+esc(it.requestedModel)+'</dd><dt>실제 적용</dt><dd>'+(it.effectiveModel==="미확인"?'<span style="color:var(--text-faint)">미확인 — optional 필드 부재는 기본값으로 채우지 않음</span>':esc(it.effectiveModel))+'</dd></dl></div>' : '')+
+    '<div class="card card-pad" style="margin-top:14px">'+
+      '<h3 style="margin:0 0 10px;font-size:13.5px">작업</h3>'+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+        '<button class="btn primary" id="btn-followup">후속 지시 보내기</button>'+
+        (it.source==="orca"
+          ? '<button class="btn danger" id="btn-stop" '+(it.state==="stopped" || it.livenessProjection!=="live" || it.ptyObservation!=="live"?"disabled":"")+' title="'+(it.state==="stopped"?"이미 정지됨":(it.livenessProjection==="live" && it.ptyObservation==="live"?"정지 요청 가능":"최신 liveness/PTY가 live인지 먼저 확인하세요"))+'">정지 요청</button>'+
+            '<button class="btn" id="btn-release" '+(settled?"":"disabled")+' title="'+(settled?"정산 완료됨":"미정산 상태에서는 해제할 수 없음")+'">해제 (release)</button>'
+          : '')+
+      '</div>'+
+      (it.source==="orca" && !settled ? '<p class="hint" style="margin-top:8px">해제 버튼은 정지/완료로 정산된 뒤에만 활성화됩니다 (사유: 미정산 상태).</p>' : '')+
+    '</div>';
+
+  var timelineHtml = '<div class="card"><div class="table-wrap"><table><thead><tr><th>seq</th><th>kind</th><th>source</th><th>시각</th><th>detail</th></tr></thead><tbody>'+
+    it.timeline.map(function(t){
+      return '<tr><td class="mono">'+(t.seq!=null?t.seq:'—')+'</td><td>'+esc(t.kind)+'</td><td>'+sourceBadge(t.source==="orca"||t.source==="tool"?(t.source==="tool"?"hq":"orca"):"hq")+'</td><td>'+t.at+'</td><td class="mono" style="white-space:normal">'+esc(t.detail)+'</td></tr>';
+    }).join("")+
+    '</tbody></table></div></div>'+
+    '<p class="hint" style="margin-top:8px">compaction 발생 시 <code>oldestSeq/latestSeq/snapshots</code>만 남고 개별 seq는 스냅샷으로 대체됩니다. 표시는 최신 latestSeq부터 이어집니다.</p>';
+
+  var logHtml = '<div class="card card-pad">'+
+    '<details class="explain" open><summary>원문 로그 (기본 접힘 해제 · 데모)</summary><div class="body">'+
+      '<div class="cmdline">'+esc('$ orca orchestration worker-read --dispatch '+(it.dispatchId||'—')+' --source auto --limit 50 --json')+'\n'+esc('# exact transcript 우선, 없으면 labeled terminal 텍스트로 대체')+'\n[REDACTED: token/secret/password/authorization/cookie/private key/URL credential 서버 측 제거됨]\n09:1'+esc('2')+' · 요청 수신\n09:18 · 실행 시작 (예시)\n09:'+esc('40')+' · 최근 heartbeat (진행 근거 아님)</div>'+
+    '</div></details>'+
+    '<p class="hint" style="margin-top:10px">로그는 페이지 단위(cursor)로 이어받으며 기본 접힘 + source 표시 + redaction 정책이 적용됩니다.</p>'+
+  '</div>';
+
+  return ''+
+  '<div class="view-head"><a href="#/tasks" style="font-size:12.5px;color:var(--text-muted)">← 업무 목록</a><h1 style="margin-top:6px">'+esc(it.title)+'</h1><p>'+esc(it.summary)+'</p></div>'+
+  '<div class="tabbar" role="tablist">'+
+    ['overview','timeline','log'].map(function(k){
+      var label = {overview:"개요", timeline:"타임라인", log:"로그"}[k];
+      return '<button role="tab" aria-selected="'+(tab===k)+'" data-dtab="'+k+'" class="'+(tab===k?"active":"")+'">'+label+'</button>';
+    }).join("")+
+  '</div>'+
+  '<div>'+ (tab==="overview"?overviewHtml : tab==="timeline"?timelineHtml : logHtml) +'</div>';
+}
+
+/* ============================== 뷰: 새 지시 ============================== */
+function viewCompose(){
+  var mode = STATE.composerMode;
+  var step = STATE.composerStep;
+  var len = STATE.composerText.length;
+  var over = len > 8000;
+
+  if(step === "receipt"){
+    var r = STATE.createdReceipts[STATE.createdReceipts.length-1];
+    return '<div class="view-head"><h1>새 지시</h1></div>'+
+      '<div class="card card-pad">'+
+        '<h3 style="margin:0 0 8px">접수됨 <span class="badge active">대기열</span></h3>'+
+        '<p class="hint">이 접수는 완료가 아닙니다. 실제 처리 여부는 업무 목록/상세에서 상태로 확인하세요.</p>'+
+        '<dl class="kv">'+
+          '<dt>모드</dt><dd>'+(r.mode==="hq"?"HQ 업무 요청":"Orca 직접 실행 (브리지 설계)")+'</dd>'+
+          '<dt>requestId</dt><dd class="mono">'+r.requestId+'</dd>'+
+          '<dt>상태</dt><dd><span class="badge active">queued</span></dd>'+
+        '</dl>'+
+        '<div style="margin-top:14px;display:flex;gap:8px">'+
+          '<button class="btn primary" id="goto-created">업무 목록에서 보기</button>'+
+          '<button class="btn" id="compose-again">새 지시 다시 작성</button>'+
+        '</div>'+
+      '</div>';
+  }
+
+  var hqFields = ''+
+    '<div class="field"><label for="c-project">프로젝트/소스</label>'+
+      '<select id="c-project"><option>orca-hq</option><option>internal-tools</option></select></div>'+
+    '<div class="field"><label>문맥</label><div class="radio-row">'+
+      '<div class="radio-card '+(STATE.composerContextMode==="new"?"selected":"")+'" data-ctx="new"><div class="t">새 문맥</div><div class="d">contextHint={mode:"new"}</div></div>'+
+      '<div class="radio-card '+(STATE.composerContextMode==="continue"?"selected":"")+'" data-ctx="continue"><div class="t">기존 문맥 이어가기</div><div class="d">contextHint={mode:"continue",contextId}</div></div>'+
+    '</div></div>'+
+    (STATE.composerContextMode==="continue" ? '<div class="field"><label for="c-ctxid">contextId</label><input type="text" id="c-ctxid" placeholder="ctx_9f21ab"></div>' : '')+
+    '<p class="hint">참고: HQ 네이티브 진행 요청(POST /v1/progress/requests)은 현재 에이전트 선택 필드를 받지 않습니다. 따라서 이 모드에는 에이전트 선택을 표시하지 않습니다.</p>';
+
+  var orcaFields = ''+
+    '<div class="field"><label for="c-project2">프로젝트/소스</label>'+
+      '<select id="c-project2"><option>orca-hq</option><option>internal-tools</option></select></div>'+
+    '<div class="field"><label for="c-agent">에이전트 (선택)</label><input type="text" id="c-agent" placeholder="예: claude" value="'+esc(STATE.composerAgent)+'"></div>'+
+    '<div class="field"><label for="c-model">모델/effort (선택)</label><input type="text" id="c-model" placeholder="예: claude-sonnet-5 --effort medium" value="'+esc(STATE.composerModel)+'"></div>'+
+    '<p class="hint">실행에는 감독 중인 coordinator/ownership 사전조건이 필요합니다. 아래 미리보기는 <b>공개 CLI 명령 참조</b>이며 실제로 실행되지 않습니다.</p>'+
+    '<div class="cmdline">worker-start --spec &lt;spec&gt; --run &lt;runId&gt; --from &lt;coordinatorRef&gt; --worktree &lt;worktreeId&gt; --agent '+esc(STATE.composerAgent||'&lt;agent&gt;')+(STATE.composerModel?(' '+esc(STATE.composerModel)):' [--model &lt;model&gt;] [--effort &lt;effort&gt;]')+'</div>';
+
+  return ''+
+  '<div class="view-head"><h1>새 지시</h1><p>모드에 따라 실제 백엔드 계약이 다릅니다. 혼동되지 않도록 필드를 분리했습니다.</p></div>'+
+  '<div class="card card-pad">'+
+    '<div class="field"><label>모드</label><div class="radio-row">'+
+      '<div class="radio-card '+(mode==="hq"?"selected":"")+'" data-mode="hq"><div class="t">HQ 업무 요청</div><div class="d">progress request API · new/continue</div></div>'+
+      '<div class="radio-card '+(mode==="orca"?"selected":"")+'" data-mode="orca"><div class="t">Orca 직접 실행 (브리지 설계)</div><div class="d">공개 CLI 미리보기 · 웹 실행은 브리지 필요</div></div>'+
+    '</div></div>'+
+    (mode==="hq" ? hqFields : orcaFields)+
+    '<div class="field"><label for="c-text">요청 내용</label>'+
+      '<textarea id="c-text" placeholder="요청 내용을 입력하세요">'+esc(STATE.composerText)+'</textarea>'+
+      '<div class="hint" style="display:flex;justify-content:space-between"><span>최대 8,000자</span><span style="color:'+(over?"var(--red)":"var(--text-faint)")+'">'+len+' / 8000</span></div>'+
+    '</div>'+
+    (step==="review" ? renderReviewBlock() : '')+
+    '<div style="display:flex;gap:8px;margin-top:6px">'+
+      (step==="form"
+        ? '<button class="btn primary" id="btn-review" '+((len===0||over)?"disabled":"")+'>검토</button>'
+        : '<button class="btn ghost" id="btn-back-form">← 수정</button><button class="btn accent" id="btn-submit">확인 후 제출 (시뮬레이션)</button>')+
+    '</div>'+
+  '</div>'+
+  '<details class="explain" style="margin-top:14px"><summary>기획 해설</summary><div class="body">'+
+    '<p>동일한 requestId+본문 재제출은 idempotent합니다. 재시도를 위해 새 ID를 만들면 의미가 달라지므로, 실제 화면에서는 재제출 전 확인 문구를 노출합니다.</p>'+
+    '<p>Orca 직접 실행 모드는 "브리지 설계" 단계입니다. 지금은 read/typed-control allowlist 브리지가 없어 실제 실행 버튼이 아니라 CLI 참조 미리보기만 제공합니다.</p>'+
+  '</div></details>';
+}
+function renderReviewBlock(){
+  return '<div class="card card-pad" style="background:var(--surface-alt);margin-top:4px">'+
+    '<h4 style="margin:0 0 8px;font-size:13px">제출 전 검토</h4>'+
+    '<dl class="kv">'+
+      '<dt>모드</dt><dd>'+(STATE.composerMode==="hq"?"HQ 업무 요청":"Orca 직접 실행 (브리지 설계)")+'</dd>'+
+      '<dt>문자 수</dt><dd>'+STATE.composerText.length+' / 8000</dd>'+
+    '</dl>'+
+    '<p class="hint">제출해도 즉시 "접수됨(대기열)" 상태이며 완료를 의미하지 않습니다.</p>'+
+  '</div>';
+}
+
+/* ============================== 뷰: 질문함 ============================== */
+function viewInbox(){
+  var pending = questionsList.filter(function(q){return q.state==="pending";}).length;
+  return ''+
+  '<div class="view-head"><h1>질문함 <span class="badge question" style="margin-left:6px">'+pending+'건 대기</span></h1><p>HQ clarification과 Orca 정확 메시지 질문을 출처별로 구분합니다.</p></div>'+
+  questionsList.map(function(q){
+    var linked = q.relatedId ? findItem(q.relatedId) : null;
+    return '<div class="card" style="margin-bottom:12px">'+
+      '<div class="card-head"><h2>'+sourceBadge(q.source)+' &nbsp;'+esc(q.channel)+'</h2>'+
+        (q.state==="pending" ? '<span class="badge question">대기중</span>' : '<span class="badge completed">답변됨</span>')+
+      '</div>'+
+      '<div class="card-pad">'+
+        '<p style="margin:0 0 10px">'+esc(q.text)+'</p>'+
+        '<p class="hint">전달: '+q.deliveredAt+(linked?' · 연결: <a href="#/detail/'+linked.id+'">'+esc(linked.title)+'</a>':'')+'</p>'+
+        (q.state==="answered"
+          ? '<div class="card-pad" style="background:var(--surface-alt);border-radius:8px;margin-top:8px"><b>답변:</b> '+esc(q.answer)+'<div class="hint" style="margin-top:4px">'+q.answeredAt+' 처리 · 전달 확정 여부는 시뮬레이션입니다</div></div>'
+          : '<div style="margin-top:8px"><textarea data-qid="'+q.id+'" rows="2" placeholder="답변 입력" style="width:100%;border:1px solid var(--border-strong);border-radius:8px;padding:8px"></textarea>'+
+            '<div style="margin-top:6px"><button class="btn accent sm" data-reply="'+q.id+'">답변 전송 (시뮬레이션)</button> <span class="hint">전송 후에도 "확인 응답 대기(pending)"로 표시되며, 성공으로 단정하지 않습니다.</span></div></div>')+
+      '</div>'+
+    '</div>';
+  }).join("");
+}
+
+/* ============================== 뷰: 프로젝트/터미널 ============================== */
+function viewProjects(){
+  return ''+
+  '<div class="view-head"><h1>프로젝트 / 터미널</h1><p>project → worktree → terminal 계층입니다. "열기"는 브리지가 없는 현재 상태에서 시뮬레이션 알림만 발생시킵니다.</p></div>'+
+  '<div class="card card-pad">'+
+    PROJECTS.map(function(p){
+      return '<ul class="tree"><li><div class="row lvl1"><b>'+esc(p.name)+'</b><span class="badge sample">project</span></div>'+
+        '<ul>'+p.worktrees.map(function(w){
+          return '<li><div class="row lvl2">'+esc(w.name)+' <span class="badge sample">worktree</span></div>'+
+            '<ul>'+w.terminals.map(function(t){
+              var canOpen = t.state === "connected" || t.state === "orphaned";
+              var stateBadge = t.state === "connected" ? '<span class="badge active">연결됨</span>'
+                : t.state === "orphaned" ? '<span class="badge unknown">고립됨</span>'
+                : '<span class="badge unknown">상태 불확실</span>';
+              return '<li><div class="row lvl3"><span class="mono">'+t.handle+'</span> · '+(t.title?esc(t.title):'<span style="color:var(--text-faint)">제목 없음</span>')+' '+stateBadge+
+                '<span style="margin-left:auto;display:flex;gap:6px">'+
+                (canOpen
+                  ? '<button class="btn sm" data-open-term="'+t.handle+'">열기</button>'
+                  : '<span class="hint">확인 필요 — 재시도/해제 버튼 없음 (증거 부족)</span>')+
+                '</span></div></li>';
+            }).join("")+'</ul></li>';
+        }).join("")+'</ul></li></ul>';
+    }).join("")+
+  '</div>'+
+  '<details class="explain" style="margin-top:14px"><summary>기획 해설</summary><div class="body">'+
+    '<p>"열기"는 로컬 신뢰 브리지가 아직 없으므로 실제 연결 대신 "브리지 없음 — 로컬에서 직접 여세요" 알림만 보여줍니다.</p>'+
+    '<p>고립/불확실 터미널에는 재시도·해제 버튼을 만들지 않습니다. 빈 목록/연결 끊김을 "작업 없음"으로 단정하지 않습니다.</p>'+
+  '</div></details>';
+}
+
+/* ============================== 뷰: 운영 설정 ============================== */
+function viewSettings(){
+  return ''+
+  '<div class="view-head"><h1>운영 설정</h1><p>설정 변경은 이 화면에서 실제로 적용되지 않습니다 (읽기 전용 / 제안 단계).</p></div>'+
+  '<div class="card card-pad">'+
+    '<h3 style="margin:0 0 10px;font-size:13.5px">HQ 동시 워커 용량</h3>'+
+    '<div class="radio-row">'+
+      '<div class="radio-card selected"><div class="t">기본값 10</div><div class="d">maxActiveWorkers=10 (config 우선, 없으면 HQ_MAX_ACTIVE_WORKERS)</div></div>'+
+      '<div class="radio-card"><div class="t">무제한</div><div class="d">maxActiveWorkers="unlimited"</div></div>'+
+    '</div>'+
+    '<p class="hint" id="settings-note" style="margin-top:10px"></p>'+
+    '<div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>구분</th><th>점유</th><th>비고</th></tr></thead><tbody>'+
+      '<tr><td>진행중</td><td>'+itemsList.filter(function(i){return i.source==="hq"&&i.cat==="active";}).length+'</td><td>HQ가 시작한 worker attempt, 실행 중(live)</td></tr>'+
+      '<tr><td>확인필요 (unknown)</td><td>'+itemsList.filter(function(i){return i.source==="hq"&&i.cat==="unknown";}).length+'</td><td>자동 재시작/빈 슬롯 처리 금지</td></tr>'+
+      '<tr><td>release_pending / release_unknown</td><td>0</td><td>해당 없음 (예시)</td></tr>'+
+      '<tr><td>비용/토큰</td><td colspan="2">수집되지 않음 — HQ/Orca CLI 필드 없음</td></tr>'+
+    '</tbody></table></div>'+
+    '<p class="hint" style="margin-top:10px">이 용량은 <b>HQ 로컬 동시 워커 한도</b>이며 전체 Orca 플릿 한도가 아닙니다. 외부에서 이미 실행 중인 Orca run/dispatch(업무 목록의 Orca 탭)는 이 집계에 포함하지 않습니다.</p>'+
+  '</div>'+
+  '<details class="explain" style="margin-top:14px"><summary>기획 해설</summary><div class="body">'+
+    '<p>설정 변경 버튼을 두지 않은 이유: 현재 계획 단계에서는 mutation 계약을 별도로 설계해야 합니다. 선택 시 "제안됨 (미적용, 데모)" 배지만 붙습니다.</p>'+
+    '<p>점유 수치는 HQ 문맥 중 worker.launching/recovery_required 이벤트가 있는 항목만 집계한 예시이며, 공개 CLI verdict 값은 <code>projection.liveness.verdict=live</code>입니다 ("running"은 실제 값이 아닙니다).</p>'+
+  '</div></details>';
+}
+
+/* ============================== 뷰: 리서치·기획 ============================== */
+var EXT_LINKS = [
+  {n:1, name:"OpenAI — Codex cloud", url:"https://learn.chatgpt.com/docs/cloud", date:"날짜 표시 없음"},
+  {n:2, name:"Anthropic — Agent teams", url:"https://code.claude.com/docs/en/agent-teams", date:"2026-09-10"},
+  {n:3, name:"GitHub — About agent management", url:"https://docs.github.com/en/copilot/concepts/agents/cloud-agent/agent-management", date:"날짜 표시 없음"},
+  {n:4, name:"Cursor — Cloud Agents API", url:"https://cursor.com/docs/cloud-agent/api/endpoints.md", date:"날짜 표시 없음"},
+  {n:5, name:"Linear — Agents Getting Started", url:"https://linear.app/developers/agents", date:"날짜 표시 없음"},
+  {n:6, name:"LangSmith — Observability concepts", url:"https://docs.langchain.com/langsmith/observability-concepts", date:"2026-08-04"},
+  {n:7, name:"Langfuse — Observability overview", url:"https://langfuse.com/docs/observability/overview", date:"날짜 값 표시 없음"}
+];
+var SCREENS = [
+  {id:"SCR-1", name:"운영 개요", desc:"HQ/Orca 상태·관심함·용량 요약", accept:"두 출처가 분리 표시되고 cost는 수집되지 않음으로 표기"},
+  {id:"SCR-2", name:"업무 목록", desc:"HQ/Orca 탭, 검색/필터, 상세 진입", accept:"필터·검색이 즉시 반영되고 행 클릭 시 상세로 이동"},
+  {id:"SCR-3", name:"새 지시", desc:"HQ 요청 vs Orca 직접 실행 미리보기", accept:"제출은 접수(queued) 상태만 생성, 완료로 표시하지 않음"},
+  {id:"SCR-4", name:"질문함", desc:"HQ clarification/Orca question 큐", accept:"답변 후에도 pending 배지 유지, 성공 단정 없음"},
+  {id:"SCR-5", name:"업무 상세", desc:"개요/타임라인/로그, liveness vs PTY", accept:"정지 확인 후 결과 표시, 해제는 정산 후에만 활성"},
+  {id:"SCR-6", name:"프로젝트/터미널", desc:"project→worktree→terminal 계층", accept:"열기는 브리지 부재 시 알림만, 불확실 항목에 재시도 버튼 없음"},
+  {id:"SCR-7", name:"운영 설정", desc:"용량 read-only, 비용 미수집 안내", accept:"변경은 제안 배지만 붙고 실제 반영되지 않음"},
+  {id:"SCR-8", name:"리서치·기획", desc:"근거/한계/구현 순서", accept:"7개 외부 링크·대안 3안·capability matrix 노출"}
+];
+function viewResearch(){
+  return ''+
+  '<div class="view-head"><h1>리서치 · 기획</h1><p>research.md 기준 요약입니다. 본문은 <code>docs/superpowers/screen-plans/2026-09-15-hq-orca-operations/research.md</code>에 있습니다.</p></div>'+
+
+  '<div class="card card-pad"><h3 style="margin:0 0 8px;font-size:14px">핵심 결론</h3>'+
+    '<ol style="margin:0;padding-left:18px;font-size:13px;line-height:1.8">'+
+      '<li>HQ는 요청/문맥/상태/이벤트 API를 갖지만 문맥당 viewer lease가 하나뿐입니다.</li>'+
+      '<li>HQ context/event와 Orca Run/Task/Dispatch는 서로 다른 모델이라 화면에서도 분리해야 합니다.</li>'+
+      '<li>공개 Orca CLI(1.4.203)는 read/control 명령을 제공하지만 브라우저용 API가 아닙니다.</li>'+
+      '<li>웹 제어에는 공개 CLI만 strict allowlist로 호출하는 로컬 신뢰 브리지가 새로 필요합니다.</li>'+
+      '<li>비용/토큰 필드는 없으므로 값을 만들지 않고 "수집되지 않음"으로 표기합니다.</li>'+
+    '</ol>'+
+  '</div>'+
+
+  '<div class="grid-2" style="margin-top:14px">'+
+    '<div class="card card-pad"><h3 style="margin:0 0 8px;font-size:14px">외부 근거 7건</h3>'+
+      '<ul class="link-list">'+EXT_LINKS.map(function(l){
+        return '<li><span class="n">'+l.n+'.</span><a href="'+esc(l.url)+'" target="_blank" rel="noopener">'+esc(l.name)+'</a><span class="date">('+esc(l.date)+')</span></li>';
+      }).join("")+'</ul>'+
+    '</div>'+
+    '<div class="card card-pad"><h3 style="margin:0 0 8px;font-size:14px">접근 3안과 추천</h3>'+
+      '<div class="table-wrap"><table><thead><tr><th>안</th><th>장점</th><th>위험</th></tr></thead><tbody>'+
+        '<tr><td>A. HQ-only viewer</td><td>가장 빠름</td><td>single lease 경합, Orca 부재</td></tr>'+
+        '<tr><td>B. 이중 원천 콘솔</td><td>요구 충족, 점진 구현</td><td>bridge/auth/redaction, multi-viewer 필요</td></tr>'+
+        '<tr><td>C. 공통 trace 플랫폼</td><td>장기 분석/품질</td><td>현재 미지원, 범위 큼</td></tr>'+
+      '</tbody></table></div>'+
+      '<p class="hint" style="margin-top:8px"><b>추천: B.</b> read-heavy 콘솔로 시작해 reply/follow-up부터 열고, stop/release는 재검증 후 추가, cost/trace는 실제 계측 이후 확장합니다.</p>'+
+    '</div>'+
+  '</div>'+
+
+  '<div class="card card-pad" style="margin-top:14px"><h3 style="margin:0 0 8px;font-size:14px">화면 · ID · 인수 기준</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>ID</th><th>화면</th><th>설명</th><th>인수 기준</th></tr></thead><tbody>'+
+      SCREENS.map(function(s){ return '<tr><td class="mono">'+s.id+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.desc)+'</td><td>'+esc(s.accept)+'</td></tr>'; }).join("")+
+    '</tbody></table></div>'+
+  '</div>'+
+
+  '<div class="card card-pad" style="margin-top:14px"><h3 style="margin:0 0 8px;font-size:14px">capability matrix (요약)</h3>'+
+    '<div class="table-wrap"><table><thead><tr><th>기능</th><th>HQ 오늘</th><th>Orca CLI 오늘</th><th>필요 작업</th></tr></thead><tbody>'+
+      '<tr><td>health/runtime</td><td>/health, hq status</td><td>status --json</td><td>read proxy</td></tr>'+
+      '<tr><td>제출/후속</td><td>POST new/continue</td><td>send/reply</td><td>typed endpoint + identity map</td></tr>'+
+      '<tr><td>목록/타임라인</td><td>context/event NDJSON</td><td>run/task/worker list</td><td>lease-free fan-out</td></tr>'+
+      '<tr><td>정지/해제</td><td>없음</td><td>worker-stop/retain/release</td><td>고위험 확인 + 최신 상태 재조회</td></tr>'+
+      '<tr><td>비용/토큰</td><td>없음</td><td>확인되지 않음</td><td>신규 계측 필요</td></tr>'+
+      '<tr><td>다중 뷰어</td><td>single lease</td><td>해당 없음</td><td>lease-free backend</td></tr>'+
+    '</tbody></table></div>'+
+  '</div>'+
+
+  '<div class="card card-pad" style="margin-top:14px"><h3 style="margin:0 0 8px;font-size:14px">초기 구현 순서 (제안)</h3>'+
+    '<ol style="margin:0;padding-left:18px;font-size:13px;line-height:1.8">'+
+      '<li>읽기 전용 브리지: status/run/task/worker/inbox/project/worktree/terminal list·show·read만 allowlist</li>'+
+      '<li>질문/후속 지시: reply·send를 typed endpoint로 열되 accepted≠done 원칙 유지</li>'+
+      '<li>통제된 정지/해제: 확인 화면 → 최신 상태 재조회 → exact ID 검증 → 실행 → receipt 저장</li>'+
+    '</ol>'+
+    '<p class="hint" style="margin-top:10px">공통 제약: 인증(OS user/session capability), 서버 측 redaction(secret/token/URL credential 제거), 다중 리더 지원(lease-free fan-out) 없이는 2·3단계를 확장할 수 없습니다.</p>'+
+    '<p class="hint" style="margin-top:6px"><b>중요:</b> 브라우저 모니터는 코디네이터 배달을 소비/ack하지 않습니다 — 관찰용 peek/read만 브리지로 수행하고, 실제 owner consumer가 ack를 처리합니다. 이 화면은 모든 데이터/제어 API가 이미 존재한다고 암시하지 않습니다.</p>'+
+  '</div>';
+}
+
+/* ============================== 메인 렌더 & 상세 진입/닫기 ============================== */
+function render(){
+  renderTopbar();
+  renderNav();
+  var main = qs("#main");
+  var view = STATE.route.view;
+  var html;
+  switch(view){
+    case "tasks": html = viewTasks(); break;
+    case "compose": html = viewCompose(); break;
+    case "inbox": html = viewInbox(); break;
+    case "detail": html = viewDetail(); break;
+    case "projects": html = viewProjects(); break;
+    case "settings": html = viewSettings(); break;
+    case "research": html = viewResearch(); break;
+    default: html = viewOverview();
+  }
+  main.innerHTML = html;
+  wireView(view);
+}
+
+function wireView(view){
+  qsa("[data-goto]").forEach(function(n){
+    n.addEventListener("click", function(){ navigate("detail", n.getAttribute("data-goto")); });
+  });
+
+  if(view === "tasks"){
+    qsa("[data-tab]").forEach(function(b){ b.addEventListener("click", function(){ STATE.tasksTab = b.getAttribute("data-tab"); render(); }); });
+    var s = qs("#task-search"); if(s){ s.addEventListener("input", function(){ STATE.tasksSearch = s.value; render(); }); s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
+    var f = qs("#task-filter"); if(f){ f.addEventListener("change", function(){ STATE.tasksFilter = f.value; render(); }); }
+  }
+
+  if(view === "detail"){
+    qsa("[data-dtab]").forEach(function(b){ b.addEventListener("click", function(){ STATE.detailTab = b.getAttribute("data-dtab"); render(); }); });
+    var stopBtn = qs("#btn-stop");
+    if(stopBtn) stopBtn.addEventListener("click", function(){ openStopConfirm(STATE.route.id); });
+    var relBtn = qs("#btn-release");
+    if(relBtn && !relBtn.disabled) relBtn.addEventListener("click", function(){ toast("해제 접수됨 (시뮬레이션) — cleanup 완료로 표시"); });
+    var fu = qs("#btn-followup");
+    if(fu) fu.addEventListener("click", function(){ toast("후속 지시 접수됨 (시뮬레이션) — 완료 아님"); });
+  }
+
+  if(view === "compose"){
+    qsa("[data-mode]").forEach(function(n){ n.addEventListener("click", function(){ STATE.composerMode = n.getAttribute("data-mode"); STATE.composerStep = "form"; render(); }); });
+    qsa("[data-ctx]").forEach(function(n){ n.addEventListener("click", function(){ STATE.composerContextMode = n.getAttribute("data-ctx"); render(); }); });
+    var txt = qs("#c-text");
+    if(txt){ txt.addEventListener("input", function(){ STATE.composerText = txt.value; var lenEl=main_len(); }); }
+    function main_len(){ /* no-op placeholder for potential live counter refresh */ }
+    if(txt) txt.addEventListener("input", function(){ STATE.composerText = txt.value; renderCounterOnly(); });
+    var agentInp = qs("#c-agent"); if(agentInp) agentInp.addEventListener("input", function(){ STATE.composerAgent = agentInp.value; });
+    var modelInp = qs("#c-model"); if(modelInp) modelInp.addEventListener("input", function(){ STATE.composerModel = modelInp.value; });
+    var reviewBtn = qs("#btn-review"); if(reviewBtn) reviewBtn.addEventListener("click", function(){ STATE.composerStep = "review"; render(); });
+    var backBtn = qs("#btn-back-form"); if(backBtn) backBtn.addEventListener("click", function(){ STATE.composerStep = "form"; render(); });
+    var submitBtn = qs("#btn-submit"); if(submitBtn) submitBtn.addEventListener("click", submitComposer);
+    var gotoCreated = qs("#goto-created"); if(gotoCreated) gotoCreated.addEventListener("click", function(){ var r = STATE.createdReceipts[STATE.createdReceipts.length-1]; navigate("detail", r.itemId); });
+    var again = qs("#compose-again"); if(again) again.addEventListener("click", function(){ STATE.composerStep="form"; STATE.composerText=""; render(); });
+  }
+  function renderCounterOnly(){
+    // cheap re-render keeps caret behavior acceptable for this demo scale
+    var focusWasText = document.activeElement && document.activeElement.id === "c-text";
+    var caret = focusWasText ? document.activeElement.selectionStart : null;
+    render();
+    if(focusWasText){
+      var t = qs("#c-text");
+      if(t){ t.focus(); if(caret!=null) t.setSelectionRange(caret, caret); }
+    }
+  }
+
+  if(view === "inbox"){
+    qsa("[data-reply]").forEach(function(b){
+      b.addEventListener("click", function(){
+        var qid = b.getAttribute("data-reply");
+        var ta = qs('textarea[data-qid="'+qid+'"]');
+        var val = ta ? ta.value.trim() : "";
+        if(!val){ toast("답변 내용을 입력하세요"); return; }
+        var q = questionsList.filter(function(x){return x.id===qid;})[0];
+        if(q){
+          q.state = "answered";
+          q.answer = val;
+          q.answeredAt = "방금";
+        }
+        toast("답변 전송됨 (시뮬레이션) — 확인 응답 대기");
+        render();
+      });
+    });
+  }
+
+  if(view === "projects"){
+    qsa("[data-open-term]").forEach(function(b){
+      b.addEventListener("click", function(){ toast("브리지 없음 — 로컬에서 직접 여세요 (시뮬레이션 알림)"); });
+    });
+  }
+
+  if(view === "settings"){
+    var note = qs("#settings-note");
+    qsa(".radio-card").forEach(function(c){
+      c.addEventListener("click", function(){
+        qsa(".radio-card").forEach(function(x){x.classList.remove("selected");});
+        c.classList.add("selected");
+        if(note) note.textContent = "제안됨 (미적용, 데모) — 실제 config 반영 없음";
+      });
+    });
+  }
+}
+
+function submitComposer(){
+  var id = STATE.composerMode === "hq" ? "hq-new-"+Date.now() : "orca-new-"+Date.now();
+  var newItem = STATE.composerMode === "hq"
+    ? {id:id, source:"hq", cat:"active", title:"[신규] "+(STATE.composerText.slice(0,28)||"제목 없음"), summary:"방금 접수됨 (대기열) — 완료 아님",
+       contextId:STATE.composerContextMode==="continue"?"ctx_기존":"ctx_new_"+Math.floor(Math.random()*9000), requestId:"req_"+Math.floor(Math.random()*90000),
+       sessionId:"sess_kr-ops", state:"queued", updatedAt:"방금", createdAt:"방금", linkedOrcaId:null,
+       timeline:[{seq:null,kind:"progress.request.created",source:"tool",at:"방금",detail:"시뮬레이션 제출"}]}
+    : {id:id, source:"orca", cat:"active", title:"[신규] Orca 직접 실행 미리보기", summary:"브리지 프리뷰 전송됨 (실행 아님)",
+       runId:"run_new", taskId:"task_new", dispatchId:"disp_new_"+Math.floor(Math.random()*9000),
+       state:"preview_sent", updatedAt:"방금", createdAt:"방금", linkedHqId:null,
+       requestedModel:STATE.composerModel||"미지정", effectiveModel:"미확인",
+      livenessProjection:"unverifiable", ptyObservation:"unverifiable",
+       timeline:[{seq:null,kind:"bridge.preview.sent",source:"system",at:"방금",detail:"실제 worker-start 실행 없음 (설계 단계)"}]};
+  itemsList.unshift(newItem);
+  STATE.createdReceipts.push({mode:STATE.composerMode, requestId: newItem.requestId || newItem.dispatchId, itemId:id});
+  STATE.composerStep = "receipt";
+  render();
+}
+
+/* ---- 정지 확인 모달 ---- */
+function openStopConfirm(itemId){
+  var it = findItem(itemId);
+  if(!it || it.livenessProjection !== "live" || it.ptyObservation !== "live" || it.state === "stopped"){
+    toast("정지할 수 없음 — 최신 liveness/PTY가 live인지 먼저 확인하세요");
+    return;
+  }
+  var node = el(
+    '<div class="overlay" role="dialog" aria-modal="true" aria-labelledby="stop-title">'+
+      '<div class="modal">'+
+        '<h3 id="stop-title">정지 요청 확인</h3>'+
+        '<p>"'+esc(it.title)+'"에 대해 supervised agent terminal만 정지합니다. worktree나 다른 tab은 삭제되지 않습니다. 계속할까요?</p>'+
+        '<div class="actions">'+
+          '<button class="btn ghost" id="stop-cancel">취소</button>'+
+          '<button class="btn danger" id="stop-confirm">정지 확인</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>'
+  );
+  openOverlay(node);
+  qs("#stop-cancel", node).addEventListener("click", closeOverlay);
+  node.addEventListener("click", function(e){ if(e.target === node) closeOverlay(); });
+  qs("#stop-confirm", node).addEventListener("click", function(){
+    it.state = "stopped";
+    it.cat = "completed";
+    it.livenessProjection = "exited";
+    it.ptyObservation = "exited";
+    it.updatedAt = "방금";
+    it.timeline.push({seq:null,kind:"worker-stop 접수",source:"orca",at:"방금",detail:"확인 화면 통과 후 실행"});
+    it.timeline.push({seq:null,kind:"stop settlement receipt",source:"orca",at:"방금",detail:"synthetic receipt: stop accepted and outcome settled; confirmation click alone is not authoritative"});
+    closeOverlay();
+    toast("정지 완료 접수됨 (positive receipt)");
+    render();
+  });
+}
+
+/* ============================== 초기화 ============================== */
+qs("#scenario-select").addEventListener("change", function(e){ STATE.scenario = e.target.value; render(); });
+
+STATE.route = parseHash();
+render();
+})();
+</script>
+</body>
+</html>

@@ -339,3 +339,27 @@ it("resolves a declared scope through project aliases and fails closed instead o
     expect(admission.listAttempts().every(a => a.item.access === "read")).toBe(true);
   } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
 });
+
+describe("operations runtime capacity resolution", () => {
+  it.each([
+    [
+      { nativeExecution: { maxActiveWorkers: 3 } },
+      { HQ_MAX_ACTIVE_WORKERS: "7" },
+      3,
+      "config",
+    ],
+    [{}, { HQ_MAX_ACTIVE_WORKERS: "7" }, 7, "environment"],
+    [{}, {}, 10, "default"],
+  ])(
+    "exposes resolved limit and provenance without mutating admission",
+    async (config, env, limit, source) => {
+      const { resolveOperationsCapacity } = await import(
+        "../src/managed-runtime.js"
+      );
+      expect(resolveOperationsCapacity(config as any, env as any)).toEqual({
+        limit,
+        source,
+      });
+    },
+  );
+});

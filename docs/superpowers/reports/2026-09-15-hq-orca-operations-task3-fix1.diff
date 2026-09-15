@@ -1,0 +1,465 @@
+--- a/apps/web/src/api.ts
++++ b/apps/web/src/api.ts
+@@ -16,6 +16,8 @@
+ export interface HqQuestionPage { source: "hq"; questions: HqQuestion[]; cursor: string; compacted: boolean }
+ export interface OrcaRun { id: string; objective: string; coordinator_handle?: string; consumer_generation?: number; [key: string]: unknown }
+ export interface OrcaRunPage { source: "orca"; runs: OrcaRun[]; nextCursor?: string | null; evidence: Evidence; [key: string]: unknown }
++export interface OrcaTask { id: string; status: string; run_id?: string; created_by_terminal_handle?: string; created_by_process_incarnation?: string; created_by_run_generation?: number; [key: string]: unknown }
++export interface OrcaTaskPage { source: "orca"; tasks: OrcaTask[]; evidence: Evidence; [key: string]: unknown }
+ export interface OrcaWorkerSummary { dispatchId: string; projection: { dispatchId: string; taskId: string; runId: string; liveness: { verdict: string; [key: string]: unknown }; [key: string]: unknown }; [key: string]: unknown }
+ export interface OrcaWorkerPage { source: "orca"; workers: OrcaWorkerSummary[]; page: { hasMore: boolean; nextCursor?: string | null; [key: string]: unknown }; scope: { source: string; [key: string]: unknown }; evidence: Evidence; [key: string]: unknown }
+ export interface OrcaWorkerDetail {
+@@ -39,37 +41,42 @@
+ function malformed(): never { throw new OperationsApiError(502, "malformed_response"); }
+ function record(value: unknown): JsonRecord { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : malformed(); }
+ function text(value: unknown): string { return typeof value === "string" && value.length > 0 ? value : malformed(); }
+-function maybeText(value: unknown): string | undefined { return value === undefined ? undefined : text(value); }
+-function nullableText(value: unknown): string | null | undefined { return value === undefined || value === null ? value : text(value); }
+-function nullOrText(value: unknown): string | null { return value === null ? null : text(value); }
++function boundedText(value: unknown, min: number, max: number): string { return typeof value === "string" && value.length >= min && value.length <= max ? value : malformed(); }
++function id(value: unknown, max = 512): string { const result = boundedText(value, 1, max); return result.trim().length > 0 ? result : malformed(); }
++function cursor(value: unknown): string { return boundedText(value, 1, 2048); }
++function publicText(value: unknown, max = 64 * 1024): string { return boundedText(value, 0, max); }
++function nullOrId(value: unknown): string | null { return value === null ? null : id(value); }
+ function bool(value: unknown): boolean { return typeof value === "boolean" ? value : malformed(); }
+ function integer(value: unknown): number { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : malformed(); }
++function positiveInteger(value: unknown): number { const result = integer(value); return result > 0 ? result : malformed(); }
+ function array<T>(value: unknown, parser: (item: unknown) => T, max = 500): T[] { if (!Array.isArray(value) || value.length > max) malformed(); return value.map(parser); }
+ function literal<T extends string | boolean>(value: unknown, allowed: readonly T[]): T { return allowed.includes(value as T) ? value as T : malformed(); }
+-function iso(value: unknown): string { const result = text(value); return Number.isNaN(Date.parse(result)) ? malformed() : result; }
+-function strings(value: unknown, max = 500): string[] { return array(value, text, max); }
+-function evidence(value: unknown): Evidence { const r = record(value); return { source: literal(r.source, ["hq_api", "hq_store", "orca_cli"] as const), ...(r.command === undefined ? {} : { command: text(r.command) }), observedAt: iso(r.observedAt), verification: literal(r.verification, ["authoritative", "observed", "unverifiable"] as const) }; }
+-function context(value: unknown): HqContext { const r = record(value); return { contextId: text(r.contextId), title: text(r.title), state: text(r.state), summary: typeof r.summary === "string" ? r.summary : malformed(), projectIds: strings(r.projectIds, 64), jobIds: strings(r.jobIds, 100), createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt), lastSeq: integer(r.lastSeq) }; }
+-function link(value: unknown): ReceiptLink { const r = record(value); return { runId: text(r.runId), taskId: text(r.taskId), dispatchId: text(r.dispatchId), terminalHandle: text(r.terminalHandle) }; }
++function iso(value: unknown): string { const result = text(value); return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(result) && !Number.isNaN(Date.parse(result)) ? result : malformed(); }
++function strings(value: unknown, max = 500, item = text): string[] { return array(value, item, max); }
++function evidence(value: unknown): Evidence { const r = record(value); return { source: literal(r.source, ["hq_api", "hq_store", "orca_cli"] as const), ...(r.command === undefined ? {} : { command: boundedText(r.command, 0, 512) }), observedAt: iso(r.observedAt), verification: literal(r.verification, ["authoritative", "observed", "unverifiable"] as const) }; }
++function context(value: unknown): HqContext { const r = record(value); return { contextId: id(r.contextId, 100), title: boundedText(r.title, 1, 256), state: boundedText(r.state, 1, 64), summary: publicText(r.summary), projectIds: strings(r.projectIds, 64, (item) => id(item, 100)), jobIds: strings(r.jobIds, 100, (item) => id(item, 100)), createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt), lastSeq: integer(r.lastSeq) }; }
++function link(value: unknown): ReceiptLink { const r = record(value); return { runId: id(r.runId), taskId: id(r.taskId), dispatchId: id(r.dispatchId), terminalHandle: id(r.terminalHandle) }; }
++const eventKinds = ["request.accepted", "request.queued", "context.assigned", "agent.started", "agent.resumed", "agent.waiting", "worker.launching", "worker.ready", "worker.retained", "worker.recovery_required", "clarification.required", "hq.progress", "tool.started", "tool.completed", "tool.failed", "job.linked", "job.state", "request.completed", "request.failed", "recovery.required", "history.compacted"] as const;
+ 
+-export const operationsStatusSchema: Schema<OperationsStatus> = { parse(value) { const r = record(value), hq = record(r.hq), capacity = record(hq.capacity), orca = record(r.orca), metrics = record(r.metrics), tokens = record(metrics.tokens), cost = record(metrics.cost), rawLimit = capacity.limit; const byState = record(capacity.byState); for (const count of Object.values(byState)) integer(count); return { collectedAt: iso(r.collectedAt), hq: { state: text(hq.state), capacity: { limit: rawLimit === "unlimited" ? rawLimit : integer(rawLimit), source: literal(capacity.source, ["config", "environment", "default"] as const), active: integer(capacity.active), queued: integer(capacity.queued), byState: byState as Record<string, number>, updateSupported: literal(capacity.updateSupported, [false] as const), reason: text(capacity.reason) } }, orca: { state: text(orca.state), reachable: bool(orca.reachable), ...(orca.connectionState === undefined ? {} : { connectionState: text(orca.connectionState) }), version: text(orca.version), ...(orca.runtimeId === undefined ? {} : { runtimeId: text(orca.runtimeId) }), features: record(orca.features) }, metrics: { tokens: { available: literal(tokens.available, [false] as const), reason: literal(tokens.reason, ["not_collected"] as const) }, cost: { available: literal(cost.available, [false] as const), reason: literal(cost.reason, ["not_collected"] as const) } } }; } };
+-export const hqContextPageSchema: Schema<HqContextPage> = { parse(value) { const r = record(value); return { contexts: array(r.contexts, context, 100), ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), ...(r.compacted === undefined ? {} : { compacted: bool(r.compacted) }) }; } };
++export const operationsStatusSchema: Schema<OperationsStatus> = { parse(value) { const r = record(value), hq = record(r.hq), capacity = record(hq.capacity), orca = record(r.orca), metrics = record(r.metrics), tokens = record(metrics.tokens), cost = record(metrics.cost), rawLimit = capacity.limit; const byState = record(capacity.byState); for (const count of Object.values(byState)) integer(count); return { collectedAt: iso(r.collectedAt), hq: { state: text(hq.state), capacity: { limit: rawLimit === "unlimited" ? rawLimit : positiveInteger(rawLimit), source: literal(capacity.source, ["config", "environment", "default"] as const), active: integer(capacity.active), queued: integer(capacity.queued), byState: byState as Record<string, number>, updateSupported: literal(capacity.updateSupported, [false] as const), reason: publicText(capacity.reason) } }, orca: { state: text(orca.state), reachable: bool(orca.reachable), ...(orca.connectionState === undefined ? {} : { connectionState: text(orca.connectionState) }), version: text(orca.version), ...(orca.runtimeId === undefined ? {} : { runtimeId: id(orca.runtimeId) }), features: record(orca.features) }, metrics: { tokens: { available: literal(tokens.available, [false] as const), reason: literal(tokens.reason, ["not_collected"] as const) }, cost: { available: literal(cost.available, [false] as const), reason: literal(cost.reason, ["not_collected"] as const) } } }; } };
++export const hqContextPageSchema: Schema<HqContextPage> = { parse(value) { const r = record(value); return { contexts: array(r.contexts, context, 100), ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), ...(r.compacted === undefined ? {} : { compacted: bool(r.compacted) }) }; } };
+ export const hqContextDetailSchema: Schema<HqContextDetail> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), context: context(r.context), evidence: evidence(r.evidence) }; } };
+-export const hqEventPageSchema: Schema<HqEventPage> = { parse(value) { const r = record(value); return { events: array(r.events, (item) => { const e = record(item); return { source: literal(e.source, ["hq"] as const), eventSource: literal(e.eventSource, ["hq", "tool", "orca", "system"] as const), seq: integer(e.seq), eventKey: text(e.eventKey), requestId: text(e.requestId), contextId: e.contextId === null ? null : text(e.contextId), kind: text(e.kind), occurredAt: iso(e.occurredAt), payload: record(e.payload), ...(e.agentId === undefined ? {} : { agentId: text(e.agentId) }), ...(e.generation === undefined ? {} : { generation: integer(e.generation) }), ...(e.receiptLink === undefined ? {} : { receiptLink: link(e.receiptLink) }) }; }), snapshots: array(r.snapshots, context, 100), ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), compacted: bool(r.compacted), oldestSeq: integer(r.oldestSeq), latestSeq: integer(r.latestSeq) }; } };
+-export const hqQuestionPageSchema: Schema<HqQuestionPage> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), questions: array(r.questions, (item) => { const q = record(item); return { source: literal(q.source, ["hq"] as const), kind: literal(q.kind, ["router_clarification", "managed_orca_question"] as const), requestId: text(q.requestId), sessionId: text(q.sessionId), ...(q.contextId === undefined ? {} : { contextId: text(q.contextId) }), ...(q.messageId === undefined ? {} : { messageId: text(q.messageId) }), body: typeof q.body === "string" ? q.body : malformed(), occurredAt: iso(q.occurredAt), state: text(q.state), evidence: evidence(q.evidence) }; }, 100), cursor: text(r.cursor), compacted: bool(r.compacted) }; } };
+-export const orcaRunPageSchema: Schema<OrcaRunPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), runs: array(r.runs, (item) => { const run = record(item); return { ...run, id: text(run.id), objective: typeof run.objective === "string" ? run.objective : malformed(), ...(run.coordinator_handle === undefined ? {} : { coordinator_handle: text(run.coordinator_handle) }), ...(run.consumer_generation === undefined ? {} : { consumer_generation: integer(run.consumer_generation) }) }; }, 100), ...(r.nextCursor === undefined ? {} : { nextCursor: r.nextCursor === null ? null : text(r.nextCursor) }), evidence: evidence(r.evidence) }; } };
+-function projection(value: unknown): OrcaWorkerDetail["projection"] { const p = record(value), liveness = record(p.liveness), resource = p.resource === undefined ? undefined : record(p.resource); return { ...p, dispatchId: text(p.dispatchId), taskId: text(p.taskId), runId: text(p.runId), liveness: { ...liveness, verdict: text(liveness.verdict) }, ...(p.outcome === undefined ? {} : { outcome: text(p.outcome) }), ...(resource === undefined ? {} : { resource: { ...resource, state: text(resource.state), releaseState: text(resource.releaseState), ...(resource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrText(resource.ownerDispatchId) }) } }) }; }
+-export const orcaWorkerPageSchema: Schema<OrcaWorkerPage> = { parse(value) { const r = record(value), page = record(r.page), scope = record(r.scope); return { ...r, source: literal(r.source, ["orca"] as const), workers: array(r.workers, (item) => { const worker = record(item); return { ...worker, dispatchId: text(worker.dispatchId), projection: projection(worker.projection) }; }, 100), page: { ...page, hasMore: bool(page.hasMore), ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor === null ? null : text(page.nextCursor) }) }, scope: { ...scope, source: text(scope.source) }, evidence: evidence(r.evidence) }; } };
+-export const orcaWorkerDetailSchema: Schema<OrcaWorkerDetail> = { parse(value) { const r = record(value), dispatch = record(r.dispatch), worker = record(r.worker), projected = projection(r.projection), observation = record(r.observation), terminalResource = record(r.terminalResource); const terminal = r.terminal === null ? null : record(r.terminal); return { ...r, source: literal(r.source, ["orca"] as const), dispatch: { ...dispatch, id: text(dispatch.id), runId: text(dispatch.runId), taskId: text(dispatch.taskId), status: text(dispatch.status), ...(dispatch.processIncarnation === undefined ? {} : { processIncarnation: nullOrText(dispatch.processIncarnation) }) }, worker: { ...worker, dispatchId: text(worker.dispatchId), state: text(worker.state), stage: text(worker.stage), agentTerminalHandle: nullOrText(worker.agentTerminalHandle) }, projection: projected, observation: { ...observation, status: text(observation.status), exactWorker: bool(observation.exactWorker) }, terminal: terminal === null ? null : { ...terminal, handle: text(terminal.handle), incarnationId: text(terminal.incarnationId), connected: bool(terminal.connected), writable: bool(terminal.writable), executionHostId: text(terminal.executionHostId), worktreeId: text(terminal.worktreeId) }, terminalResource: { ...terminalResource, id: text(terminalResource.id), ownershipState: text(terminalResource.ownershipState), releaseState: text(terminalResource.releaseState), ...(terminalResource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrText(terminalResource.ownerDispatchId) }), ...(terminalResource.terminalHandle === undefined ? {} : { terminalHandle: text(terminalResource.terminalHandle) }), ...(terminalResource.endpointIncarnation === undefined ? {} : { endpointIncarnation: text(terminalResource.endpointIncarnation) }) }, evidence: evidence(r.evidence) }; } };
+-export const orcaOutputPageSchema: Schema<OrcaOutputPage> = { parse(value) { const r = record(value), base = { ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), archived: bool(r.archived), warnings: strings(r.warnings, 100) }; if (r.source === "terminal") return { source: "terminal", ...base, lines: strings(r.lines, 500) }; if (r.source === "transcript") return { source: "transcript", ...base, messages: array(r.messages, (item) => { const m = record(item); return { id: text(m.id), role: text(m.role), text: typeof m.text === "string" ? m.text : malformed(), ...(m.occurredAt === undefined ? {} : { occurredAt: iso(m.occurredAt) }) }; }, 500) }; return malformed(); } };
+-export const orcaQuestionPageSchema: Schema<OrcaQuestionPage> = { parse(value) { const r = record(value), support = record(r.support), pending = record(support.pendingState); const pendingState = bool(pending.supported) ? { supported: true as const } : { supported: false as const, reason: text(pending.reason) }; return { ...r, source: literal(r.source, ["orca"] as const), messages: array(r.messages, (item) => { const m = record(item); return { ...m, id: text(m.id), type: text(m.type), subject: typeof m.subject === "string" ? m.subject : malformed(), body: typeof m.body === "string" ? m.body : malformed(), ...(m.run_id === undefined ? {} : { run_id: nullOrText(m.run_id) }), ...(m.from_handle === undefined ? {} : { from_handle: text(m.from_handle) }), ...(m.to_handle === undefined ? {} : { to_handle: text(m.to_handle) }), ...(m.created_at === undefined ? {} : { created_at: text(m.created_at) }), ...(m.question === undefined ? {} : { question: { ...record(m.question), status: text(record(m.question).status) } }) }; }, 100), count: integer(r.count), support: { pendingState }, evidence: evidence(r.evidence) }; } };
+-export const orcaResourcesSchema: Schema<OrcaResources> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), projects: array(r.projects, (item) => { const project = record(item); return { ...project, id: text(project.id), hostScope: literal(project.hostScope, ["covered", "not_covered"] as const), setups: array(project.setups, (setupValue) => { const setup = record(setupValue); return { ...setup, id: text(setup.id), ...(setup.covered === undefined ? {} : { covered: bool(setup.covered) }), ...(setup.truncated === undefined ? {} : { truncated: bool(setup.truncated) }), worktrees: array(setup.worktrees, (worktreeValue) => { const worktree = record(worktreeValue), hostScope = worktree.hostScope === undefined ? undefined : record(worktree.hostScope); return { ...worktree, id: text(worktree.id), terminals: array(worktree.terminals, (terminalValue) => { const terminal = record(terminalValue); return { ...terminal, id: text(terminal.id) }; }, 100), ...(hostScope === undefined ? {} : { hostScope: { hostIds: strings(hostScope.hostIds, 100), omittedHostIds: strings(hostScope.omittedHostIds, 100) } }), ...(worktree.truncated === undefined ? {} : { truncated: bool(worktree.truncated) }) }; }, 100) }; }, 100) }; }, 100), evidence: evidence(r.evidence) }; } };
+-export const mutationReceiptSchema: Schema<OperationsMutationReceipt> = { parse(value) { const r = record(value); return { requestId: text(r.requestId), action: text(r.action), targetId: text(r.targetId), state: literal(r.state, ["accepted", "rejected", "unknown"] as const), observedAt: iso(r.observedAt), ...(r.detail === undefined ? {} : { detail: text(r.detail) }) }; } };
++export const hqEventPageSchema: Schema<HqEventPage> = { parse(value) { const r = record(value); return { events: array(r.events, (item) => { const e = record(item), kind = literal(e.kind, eventKinds); if (e.receiptLink !== undefined && kind !== "worker.ready" && kind !== "worker.retained") malformed(); return { source: literal(e.source, ["hq"] as const), eventSource: literal(e.eventSource, ["hq", "tool", "orca", "system"] as const), seq: positiveInteger(e.seq), eventKey: id(e.eventKey), requestId: id(e.requestId, 100), contextId: e.contextId === null ? null : id(e.contextId, 100), kind, occurredAt: iso(e.occurredAt), payload: record(e.payload), ...(e.agentId === undefined ? {} : { agentId: id(e.agentId, 100) }), ...(e.generation === undefined ? {} : { generation: positiveInteger(e.generation) }), ...(e.receiptLink === undefined ? {} : { receiptLink: link(e.receiptLink) }) }; }), snapshots: array(r.snapshots, context, 100), ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), compacted: bool(r.compacted), oldestSeq: integer(r.oldestSeq), latestSeq: integer(r.latestSeq) }; } };
++export const hqQuestionPageSchema: Schema<HqQuestionPage> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), questions: array(r.questions, (item) => { const q = record(item); return { source: literal(q.source, ["hq"] as const), kind: literal(q.kind, ["router_clarification", "managed_orca_question"] as const), requestId: id(q.requestId), sessionId: id(q.sessionId), ...(q.contextId === undefined ? {} : { contextId: id(q.contextId) }), ...(q.messageId === undefined ? {} : { messageId: id(q.messageId) }), body: publicText(q.body), occurredAt: iso(q.occurredAt), state: text(q.state), evidence: evidence(q.evidence) }; }, 100), cursor: cursor(r.cursor), compacted: bool(r.compacted) }; } };
++export const orcaRunPageSchema: Schema<OrcaRunPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), runs: array(r.runs, (item) => { const run = record(item); return { ...run, id: id(run.id), objective: typeof run.objective === "string" ? run.objective : malformed(), ...(run.coordinator_handle === undefined ? {} : { coordinator_handle: id(run.coordinator_handle) }), ...(run.consumer_generation === undefined ? {} : { consumer_generation: positiveInteger(run.consumer_generation) }) }; }, 100), ...(r.nextCursor === undefined ? {} : { nextCursor: r.nextCursor === null ? null : cursor(r.nextCursor) }), evidence: evidence(r.evidence) }; } };
++export const orcaTaskPageSchema: Schema<OrcaTaskPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), tasks: array(r.tasks, (item) => { const task = record(item); return { ...task, id: id(task.id), status: boundedText(task.status, 1, 512), ...(task.run_id === undefined ? {} : { run_id: id(task.run_id) }), ...(task.created_by_terminal_handle === undefined ? {} : { created_by_terminal_handle: id(task.created_by_terminal_handle) }), ...(task.created_by_process_incarnation === undefined ? {} : { created_by_process_incarnation: id(task.created_by_process_incarnation) }), ...(task.created_by_run_generation === undefined ? {} : { created_by_run_generation: integer(task.created_by_run_generation) }) }; }, 100), evidence: evidence(r.evidence) }; } };
++function projection(value: unknown): OrcaWorkerDetail["projection"] { const p = record(value), liveness = record(p.liveness), resource = p.resource === undefined ? undefined : record(p.resource); return { ...p, dispatchId: id(p.dispatchId), taskId: id(p.taskId), runId: id(p.runId), liveness: { ...liveness, verdict: boundedText(liveness.verdict, 1, 512) }, ...(p.outcome === undefined ? {} : { outcome: boundedText(p.outcome, 1, 512) }), ...(resource === undefined ? {} : { resource: { ...resource, state: boundedText(resource.state, 1, 512), releaseState: boundedText(resource.releaseState, 1, 512), ...(resource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrId(resource.ownerDispatchId) }) } }) }; }
++export const orcaWorkerPageSchema: Schema<OrcaWorkerPage> = { parse(value) { const r = record(value), page = record(r.page), scope = record(r.scope); return { ...r, source: literal(r.source, ["orca"] as const), workers: array(r.workers, (item) => { const worker = record(item); return { ...worker, dispatchId: id(worker.dispatchId), projection: projection(worker.projection) }; }, 100), page: { ...page, hasMore: bool(page.hasMore), ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor === null ? null : cursor(page.nextCursor) }) }, scope: { ...scope, source: boundedText(scope.source, 1, 512) }, evidence: evidence(r.evidence) }; } };
++export const orcaWorkerDetailSchema: Schema<OrcaWorkerDetail> = { parse(value) { const r = record(value), dispatch = record(r.dispatch), worker = record(r.worker), projected = projection(r.projection), observation = record(r.observation), terminalResource = record(r.terminalResource); const terminal = r.terminal === null ? null : record(r.terminal); return { ...r, source: literal(r.source, ["orca"] as const), dispatch: { ...dispatch, id: id(dispatch.id), runId: id(dispatch.runId), taskId: id(dispatch.taskId), status: boundedText(dispatch.status, 1, 512), ...(dispatch.processIncarnation === undefined ? {} : { processIncarnation: nullOrId(dispatch.processIncarnation) }) }, worker: { ...worker, dispatchId: id(worker.dispatchId), state: boundedText(worker.state, 1, 512), stage: boundedText(worker.stage, 1, 512), agentTerminalHandle: nullOrId(worker.agentTerminalHandle) }, projection: projected, observation: { ...observation, status: boundedText(observation.status, 1, 512), exactWorker: bool(observation.exactWorker) }, terminal: terminal === null ? null : { ...terminal, handle: id(terminal.handle), incarnationId: id(terminal.incarnationId), connected: bool(terminal.connected), writable: bool(terminal.writable), executionHostId: id(terminal.executionHostId), worktreeId: id(terminal.worktreeId) }, terminalResource: { ...terminalResource, id: id(terminalResource.id), ownershipState: boundedText(terminalResource.ownershipState, 1, 512), releaseState: boundedText(terminalResource.releaseState, 1, 512), ...(terminalResource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrId(terminalResource.ownerDispatchId) }), ...(terminalResource.terminalHandle === undefined ? {} : { terminalHandle: id(terminalResource.terminalHandle) }), ...(terminalResource.endpointIncarnation === undefined ? {} : { endpointIncarnation: id(terminalResource.endpointIncarnation) }) }, evidence: evidence(r.evidence) }; } };
++export const orcaOutputPageSchema: Schema<OrcaOutputPage> = { parse(value) { const r = record(value), base = { ...(r.cursor === undefined ? {} : { cursor: cursor(r.cursor) }), archived: bool(r.archived), warnings: strings(r.warnings, 100, publicText) }; if (r.source === "terminal") return { source: "terminal", ...base, lines: strings(r.lines, 500, publicText) }; if (r.source === "transcript") return { source: "transcript", ...base, messages: array(r.messages, (item) => { const m = record(item); return { id: id(m.id), role: text(m.role), text: publicText(m.text), ...(m.occurredAt === undefined ? {} : { occurredAt: iso(m.occurredAt) }) }; }, 500) }; return malformed(); } };
++export const orcaQuestionPageSchema: Schema<OrcaQuestionPage> = { parse(value) { const r = record(value), support = record(r.support), pending = record(support.pendingState); const pendingState = bool(pending.supported) ? { supported: true as const } : { supported: false as const, reason: publicText(pending.reason, 256) }; return { ...r, source: literal(r.source, ["orca"] as const), messages: array(r.messages, (item) => { const m = record(item); return { ...m, id: id(m.id), type: boundedText(m.type, 1, 512), subject: typeof m.subject === "string" ? m.subject : malformed(), body: typeof m.body === "string" ? m.body : malformed(), ...(m.run_id === undefined ? {} : { run_id: nullOrId(m.run_id) }), ...(m.from_handle === undefined ? {} : { from_handle: id(m.from_handle) }), ...(m.to_handle === undefined ? {} : { to_handle: id(m.to_handle) }), ...(m.created_at === undefined ? {} : { created_at: text(m.created_at) }), ...(m.question === undefined ? {} : { question: { ...record(m.question), status: boundedText(record(m.question).status, 1, 512) } }) }; }, 100), count: integer(r.count), support: { pendingState }, evidence: evidence(r.evidence) }; } };
++export const orcaResourcesSchema: Schema<OrcaResources> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), projects: array(r.projects, (item) => { const project = record(item); return { ...project, id: id(project.id), hostScope: literal(project.hostScope, ["covered", "not_covered"] as const), setups: array(project.setups, (setupValue) => { const setup = record(setupValue); return { ...setup, id: id(setup.id), ...(setup.covered === undefined ? {} : { covered: bool(setup.covered) }), ...(setup.truncated === undefined ? {} : { truncated: bool(setup.truncated) }), worktrees: array(setup.worktrees, (worktreeValue) => { const worktree = record(worktreeValue), hostScope = worktree.hostScope === undefined ? undefined : record(worktree.hostScope); return { ...worktree, id: id(worktree.id), terminals: array(worktree.terminals, (terminalValue) => { const terminal = record(terminalValue); return { ...terminal, id: id(terminal.id) }; }, 100), ...(hostScope === undefined ? {} : { hostScope: { hostIds: strings(hostScope.hostIds, 100, id), omittedHostIds: strings(hostScope.omittedHostIds, 100, id) } }), ...(worktree.truncated === undefined ? {} : { truncated: bool(worktree.truncated) }) }; }, 100) }; }, 100) }; }, 100), evidence: evidence(r.evidence) }; } };
++export const mutationReceiptSchema: Schema<OperationsMutationReceipt> = { parse(value) { const r = record(value); return { requestId: id(r.requestId), action: text(r.action), targetId: id(r.targetId), state: literal(r.state, ["accepted", "rejected", "unknown"] as const), observedAt: iso(r.observedAt), ...(r.detail === undefined ? {} : { detail: publicText(r.detail, 1024) }) }; } };
+ const authSchema: Schema<{ csrf: string; expiresAt: string }> = { parse(value) { const r = record(value); return { csrf: text(r.csrf), expiresAt: iso(r.expiresAt) }; } };
+ 
+ export class OperationsApiError extends Error { constructor(readonly status?: number, readonly code = "operations_api_error") { super(code); } }
+ export interface OperationsApi {
+-  bootstrap(): Promise<void>; status(signal?: AbortSignal): Promise<OperationsStatus>; contexts(cursor?: string, signal?: AbortSignal): Promise<HqContextPage>; context(id: string, signal?: AbortSignal): Promise<HqContextDetail>; events(contextId: string, after?: string, signal?: AbortSignal): Promise<HqEventPage>; hqQuestions(after?: string, signal?: AbortSignal): Promise<HqQuestionPage>; runs(cursor?: string, signal?: AbortSignal): Promise<OrcaRunPage>; workers(cursor?: string, signal?: AbortSignal): Promise<OrcaWorkerPage>; worker(id: string, signal?: AbortSignal): Promise<OrcaWorkerDetail>; output(id: string, source: "terminal" | "transcript", cursor?: string, signal?: AbortSignal): Promise<OrcaOutputPage>; orcaQuestions(signal?: AbortSignal): Promise<OrcaQuestionPage>; resources(signal?: AbortSignal): Promise<OrcaResources>; mutate(path: string, body: object, requestId: string): Promise<OperationsMutationReceipt>;
++  bootstrap(): Promise<void>; status(signal?: AbortSignal): Promise<OperationsStatus>; contexts(cursor?: string, signal?: AbortSignal): Promise<HqContextPage>; context(id: string, signal?: AbortSignal): Promise<HqContextDetail>; events(contextId: string, after?: string, signal?: AbortSignal): Promise<HqEventPage>; hqQuestions(after?: string, signal?: AbortSignal): Promise<HqQuestionPage>; runs(cursor?: string, signal?: AbortSignal): Promise<OrcaRunPage>; tasks(runId: string, signal?: AbortSignal): Promise<OrcaTaskPage>; workers(cursor?: string, signal?: AbortSignal): Promise<OrcaWorkerPage>; worker(id: string, signal?: AbortSignal): Promise<OrcaWorkerDetail>; output(id: string, source: "terminal" | "transcript", cursor?: string, signal?: AbortSignal): Promise<OrcaOutputPage>; orcaQuestions(signal?: AbortSignal): Promise<OrcaQuestionPage>; resources(signal?: AbortSignal): Promise<OrcaResources>; mutate(path: string, body: object, requestId: string): Promise<OperationsMutationReceipt>;
+ }
+ 
+ type SessionStore = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+@@ -81,6 +88,6 @@
+   const read = async <T>(path: string, schema: Schema<T>, signal?: AbortSignal, recover = true): Promise<T> => { try { return await send(path, schema, signal ? { signal } : {}); } catch (error) { if (recover && error instanceof OperationsApiError && error.status === 401 && csrf) { try { await refresh(); } catch (refreshError) { storage.removeItem(storageKey); csrf = undefined; throw refreshError; } return read(path, schema, signal, false); } throw error; } };
+   return {
+     async bootstrap() { const hash = location.hash; if (!hash.startsWith("#claim=")) return; history.replaceState(history.state, "", `${location.pathname}${location.search}`); const claim = hash.slice(7); if (!/^[A-Za-z0-9_-]{43}$/.test(claim)) throw new OperationsApiError(400, "claim_invalid"); const result = await send("/auth/local/claim", authSchema, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim }) }); csrf = result.csrf; storage.setItem(storageKey, csrf); },
+-    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate: (path, body, requestId) => send(path, mutationReceiptSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) }),
++    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), tasks: (runId, signal) => read(`/api/operations/orca/tasks?runId=${encodeURIComponent(runId)}`, orcaTaskPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate: (path, body, requestId) => send(path, mutationReceiptSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) }),
+   };
+ }
+--- a/apps/web/src/api.test.ts
++++ b/apps/web/src/api.test.ts
+@@ -68,6 +68,43 @@
+     await expect(api.status()).rejects.toEqual(expect.objectContaining<Partial<OperationsApiError>>({ status: 502, code: "malformed_response" }));
+   });
+ 
++  it.each([
++    {
++      name: "an over-bound opaque cursor",
++      body: { source: "orca", runs: [], nextCursor: "c".repeat(2049), evidence: { source: "orca_cli", observedAt, verification: "observed" } },
++      read: (api: ReturnType<typeof createOperationsApi>) => api.runs(),
++    },
++    {
++      name: "an over-bound native ID",
++      body: { source: "orca", runs: [{ id: "r".repeat(513), objective: "real run" }], evidence: { source: "orca_cli", observedAt, verification: "observed" } },
++      read: (api: ReturnType<typeof createOperationsApi>) => api.runs(),
++    },
++    {
++      name: "over-bound display text",
++      body: { contexts: [{ contextId: "context-1", title: "t".repeat(257), state: "ready", summary: "summary", projectIds: [], jobIds: [], createdAt: observedAt, updatedAt: observedAt, lastSeq: 1 }] },
++      read: (api: ReturnType<typeof createOperationsApi>) => api.contexts(),
++    },
++    {
++      name: "a non-contract date",
++      body: { contexts: [{ contextId: "context-1", title: "title", state: "ready", summary: "summary", projectIds: [], jobIds: [], createdAt: "September 15, 2026", updatedAt: observedAt, lastSeq: 1 }] },
++      read: (api: ReturnType<typeof createOperationsApi>) => api.contexts(),
++    },
++    {
++      name: "an unknown HQ event discriminant",
++      body: { events: [{ source: "hq", eventSource: "hq", seq: 1, eventKey: "event-1", requestId: "request-1", contextId: null, kind: "invented.kind", occurredAt: observedAt, payload: {} }], snapshots: [], cursor: "1", compacted: false, oldestSeq: 1, latestSeq: 1 },
++      read: (api: ReturnType<typeof createOperationsApi>) => api.events("context-1"),
++    },
++  ])("rejects $name at the response boundary", async ({ body, read }) => {
++    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(200, body)), store());
++    await expect(read(api)).rejects.toMatchObject({ status: 502, code: "malformed_response" });
++  });
++
++  it("preserves the final native Task fields from the Task 2 route", async () => {
++    const body = { source: "orca", tasks: [{ id: "task-1", status: "open", run_id: "run-1", created_by_terminal_handle: "term-1", created_by_process_incarnation: "inc-1", created_by_run_generation: 2 }], evidence: { source: "orca_cli", observedAt, verification: "observed" } };
++    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(200, body)), store());
++    await expect(api.tasks("run-1")).resolves.toMatchObject(body);
++  });
++
+   it("passes read abort signals through to fetch", async () => {
+     const fetcher = vi.fn<typeof fetch>().mockImplementation((_path, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))));
+     const controller = new AbortController();
+--- a/apps/web/src/app.test.tsx
++++ b/apps/web/src/app.test.tsx
+@@ -18,6 +18,7 @@
+     events: vi.fn().mockResolvedValue({ events: [{ source: "hq", eventSource: "hq", seq: 3, eventKey: "event-3", requestId: "request-1", contextId: "context-1", kind: "worker.ready", occurredAt: at, payload: {}, receiptLink: { runId: "run-1", taskId: "task-1", dispatchId: "dispatch-1", terminalHandle: "term-1" } }], snapshots: [context], cursor: "3", compacted: false, oldestSeq: 1, latestSeq: 3 }),
+     hqQuestions: vi.fn().mockResolvedValue({ source: "hq", questions: [], cursor: "3", compacted: false }),
+     runs: vi.fn().mockResolvedValue({ source: "orca", runs: [{ id: "run-1", objective: "검증" }], evidence }),
++    tasks: vi.fn().mockResolvedValue({ source: "orca", tasks: [{ id: "task-1", status: "open", run_id: "run-1" }], evidence }),
+     workers: vi.fn().mockResolvedValue({ source: "orca", workers: [worker], page: { hasMore: false }, scope: { source: "all" }, evidence }),
+     worker: vi.fn().mockResolvedValue({ source: "orca", dispatch: { id: "dispatch-1", runId: "run-1", taskId: "task-1", status: "dispatched" }, worker: { dispatchId: "dispatch-1", state: "ready", stage: "working", agentTerminalHandle: "term-1" }, projection: { dispatchId: "dispatch-1", taskId: "task-1", runId: "run-1", liveness: { verdict: "live" }, resource: { state: "owned", releaseState: "active" } }, observation: { status: "ready", exactWorker: true }, terminal: { handle: "term-1", incarnationId: "inc-1", connected: true, writable: true, executionHostId: "host-1", worktreeId: "wt-1" }, terminalResource: { id: "term-1", ownershipState: "owned", releaseState: "active" }, evidence }),
+     output: vi.fn().mockResolvedValue({ source: "terminal", cursor: "opaque-1", archived: false, warnings: [], lines: ["real output"] }),
+@@ -48,17 +49,64 @@
+     expect(screen.getByText("dispatch-1")).toBeTruthy();
+   });
+ 
++  it("keeps unverifiable Orca inbox observations out of actionable attention", async () => {
++    const orcaQuestions = vi.fn().mockResolvedValue({ source: "orca", messages: [{ id: "message-1", type: "question", subject: "historical question", body: "body" }], count: 1, support: { pendingState: { supported: false, reason: "inbox_has_no_authoritative_pending_question_state" } }, evidence });
++    render(<App api={apiFor({ orcaQuestions })} />);
++    expect(await screen.findByText("historical question")).toBeTruthy();
++    const attention = screen.getByText("관심 필요").parentElement;
++    expect(attention?.querySelector("strong")?.textContent).toBe("0");
++    expect(screen.getByText(/pending 상태 판정 불가/)).toBeTruthy();
++  });
++
++  it("shows native Run rows and loads Task rows only for the selected Run", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup(); const api = apiFor();
++    render(<App api={api} />);
++    expect(await screen.findByText("검증")).toBeTruthy();
++    expect(api.tasks).not.toHaveBeenCalled();
++    await user.click(screen.getByRole("button", { name: /run-1/ }));
++    expect((await screen.findAllByText("task-1")).length).toBeGreaterThan(1);
++    expect(screen.getByText("open")).toBeTruthy();
++    expect(api.tasks).toHaveBeenCalledWith("run-1", expect.any(AbortSignal));
++  });
++
+   it("advances list cursors once and appends the next page", async () => {
+     window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
+     const next = { ...context, contextId: "context-2", title: "다음 실제 문맥" };
+     const contexts = vi.fn().mockImplementation((cursor?: string) => Promise.resolve(cursor ? { contexts: [next] } : { contexts: [context], cursor: "100" }));
+     render(<App api={apiFor({ contexts })} />); await screen.findByText("정산 배치 확인");
+-    await user.click(screen.getByRole("button", { name: "다음 페이지 읽기" }));
++    await user.click(await screen.findByRole("button", { name: "다음 페이지 읽기" }));
+     expect(await screen.findByText("다음 실제 문맥")).toBeTruthy();
+-    expect(contexts).toHaveBeenCalledWith("100");
++    expect(contexts).toHaveBeenCalledWith("100", expect.any(AbortSignal));
+     expect(screen.queryByRole("button", { name: "다음 페이지 읽기" })).toBeNull();
+   });
+ 
++  it("preserves an exhausted page chain across an unchanged visible poll", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    const next = { ...context, contextId: "context-2", title: "마지막 실제 문맥" };
++    const contexts = vi.fn().mockImplementation((cursor?: string) => Promise.resolve(cursor ? { contexts: [next] } : { contexts: [context], cursor: "100" }));
++    render(<App api={apiFor({ contexts })} />); await screen.findByText("정산 배치 확인");
++    await user.click(await screen.findByRole("button", { name: "다음 페이지 읽기" }));
++    expect(await screen.findByText("마지막 실제 문맥")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "다음 페이지 읽기" })).toBeNull();
++    document.dispatchEvent(new Event("visibilitychange"));
++    await screen.findByText("마지막 실제 문맥");
++    expect(screen.queryByRole("button", { name: "다음 페이지 읽기" })).toBeNull();
++  });
++
++  it("drops appended pages when a changed first page invalidates the cursor chain", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    const next = { ...context, contextId: "context-2", title: "오래된 두 번째 페이지" };
++    const replacement = { ...context, contextId: "context-3", title: "새 첫 페이지" };
++    let changed = false;
++    const contexts = vi.fn().mockImplementation((cursor?: string) => Promise.resolve(cursor ? { contexts: [next] } : changed ? { contexts: [replacement] } : { contexts: [context], cursor: "100" }));
++    render(<App api={apiFor({ contexts })} />); await screen.findByText("정산 배치 확인");
++    await user.click(await screen.findByRole("button", { name: "다음 페이지 읽기" }));
++    expect(await screen.findByText("오래된 두 번째 페이지")).toBeTruthy();
++    changed = true; document.dispatchEvent(new Event("visibilitychange"));
++    expect(await screen.findByText("새 첫 페이지")).toBeTruthy();
++    expect(screen.queryByText("오래된 두 번째 페이지")).toBeNull();
++  });
++
+   it("loads Orca detail and logs only when its detail tab is selected", async () => {
+     window.history.replaceState({}, "", "/work/orca/dispatch-1"); const api = apiFor(); const user = userEvent.setup();
+     render(<App api={api} />); await screen.findByText("Dispatch / projection");
+@@ -67,9 +115,26 @@
+     expect(screen.getAllByText("true").length).toBeGreaterThan(0);
+     await user.click(screen.getByRole("tab", { name: "터미널 로그" }));
+     expect(await screen.findByText("real output")).toBeTruthy();
+-    expect(api.output).toHaveBeenCalledWith("dispatch-1", "terminal", undefined);
++    expect(api.output).toHaveBeenCalledWith("dispatch-1", "terminal", undefined, expect.any(AbortSignal));
+   });
+ 
++  it("aborts and ignores stale Orca output when the selected source changes", async () => {
++    window.history.replaceState({}, "", "/work/orca/dispatch-1"); const user = userEvent.setup();
++    let resolveTerminal!: (value: Awaited<ReturnType<OperationsApi["output"]>>) => void;
++    let resolveTranscript!: (value: Awaited<ReturnType<OperationsApi["output"]>>) => void;
++    const output = vi.fn().mockImplementation((_id: string, source: string) => new Promise((resolve) => { if (source === "terminal") resolveTerminal = resolve; else resolveTranscript = resolve; }));
++    render(<App api={apiFor({ output })} />); await screen.findByText("Dispatch / projection");
++    await user.click(screen.getByRole("tab", { name: "터미널 로그" }));
++    const terminalSignal = output.mock.calls[0]?.[3] as AbortSignal | undefined;
++    await user.click(screen.getByRole("tab", { name: "대화 로그" }));
++    expect(terminalSignal?.aborted).toBe(true);
++    resolveTranscript({ source: "transcript", cursor: "transcript-1", archived: false, warnings: [], messages: [{ id: "message-1", role: "assistant", text: "fresh transcript" }] });
++    expect(await screen.findByText("fresh transcript")).toBeTruthy();
++    resolveTerminal({ source: "terminal", cursor: "terminal-1", archived: false, warnings: [], lines: ["stale terminal"] });
++    await Promise.resolve();
++    expect(screen.queryByText("stale terminal")).toBeNull();
++  });
++
+   it("shows only receipt-backed HQ event links and reports compaction", async () => {
+     window.history.replaceState({}, "", "/work/hq/context-1");
+     const api = apiFor({ events: vi.fn().mockResolvedValue({ events: [{ source: "hq", eventSource: "hq", seq: 3, eventKey: "event-3", requestId: "request-1", contextId: "context-1", kind: "history.compacted", occurredAt: at, payload: {} }], snapshots: [context], cursor: "3", compacted: true, oldestSeq: 3, latestSeq: 3 }) });
+--- a/apps/web/src/routes/operations-overview.tsx
++++ b/apps/web/src/routes/operations-overview.tsx
+@@ -13,7 +13,7 @@
+   if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
+   const { status, contexts, workers, hqQuestions, orcaQuestions } = read.data;
+   const uncertain = workers.workers.filter((item) => ["unknown", "unverifiable"].includes(item.projection.liveness.verdict));
+-  const attention = hqQuestions.questions.length + orcaQuestions.messages.length + uncertain.length;
++  const attention = hqQuestions.questions.length + uncertain.length;
+   return <>
+     <div className="view-head"><h1>운영 개요</h1><p>HQ 업무와 Orca 실행은 서로 다른 실제 출처로 분리해 표시합니다.</p></div>
+     <div className="stat-row">
+@@ -24,10 +24,11 @@
+     </div>
+     <div className="grid-2">
+       <section className="card"><div className="card-head"><h2>관심함</h2><span>실제 읽기</span></div><div className="card-body attention-list">
+-        {attention === 0 ? <p className="empty-copy">대기 중인 관심 항목이 없습니다.</p> : null}
++        {attention === 0 ? <p className="empty-copy">권위 있게 확인된 관심 항목이 없습니다.</p> : null}
+         {hqQuestions.questions.map((question) => <button className="attention" key={question.requestId} onClick={() => navigate(question.contextId ? `/work/hq/${encodeURIComponent(question.contextId)}` : "/questions")}><SourceBadge source="hq" /><span>{question.body}</span></button>)}
+-        {orcaQuestions.messages.map((question) => <button className="attention" key={question.id} onClick={() => navigate("/questions")}><SourceBadge source="orca" /><span>{question.subject || question.body}</span></button>)}
+         {uncertain.map((worker) => <button className="attention" key={worker.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(worker.dispatchId)}`)}><SourceBadge source="orca" /><span>{worker.dispatchId} · 상태 판정 필요</span></button>)}
++        {orcaQuestions.messages.length > 0 ? <div className="attention"><SourceBadge source="orca" /><span>{orcaQuestions.messages.map((question) => question.subject || question.body).join(" · ")}</span></div> : null}
++        <p className="muted">Orca inbox {orcaQuestions.messages.length}건 관찰 · pending 상태 판정 불가{orcaQuestions.support.pendingState.supported ? "" : ` · ${orcaQuestions.support.pendingState.reason}`}</p>
+       </div></section>
+       <section className="card"><div className="card-head"><h2>연결 및 수집</h2><span>{new Date(status.collectedAt).toLocaleTimeString()}</span></div><dl className="kv card-body">
+         <dt>HQ</dt><dd>{status.hq.state}</dd><dt>Orca</dt><dd>{status.orca.reachable ? `연결됨 · ${status.orca.version}` : `연결 안 됨 · ${status.orca.state}`}</dd>
+--- a/apps/web/src/routes/operations-list.tsx
++++ b/apps/web/src/routes/operations-list.tsx
+@@ -1,32 +1,100 @@
+-import { useState } from "react";
++import { useEffect, useRef, useState } from "react";
+ import type { HqContext, OperationsApi, OrcaWorkerPage } from "../api.js";
+-import { AsyncState } from "../components/async-state.js";
++import { AsyncState, type LoadState } from "../components/async-state.js";
+ import { SourceBadge } from "../components/source-badge.js";
+-import { useVisiblePolling } from "../hooks.js";
++import { stateForError, useRead, useVisiblePolling } from "../hooks.js";
+ 
+ type Worker = OrcaWorkerPage["workers"][number];
++
++function RunTasks({ api, runId }: Readonly<{ api: OperationsApi; runId: string }>) {
++  const read = useRead((signal) => api.tasks(runId, signal), [api, runId]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  return <div className="table-wrap"><table><thead><tr><th>Task</th><th>status</th><th>created by</th></tr></thead><tbody>{read.data.tasks.map((task) => <tr key={task.id}><td className="mono">{task.id}</td><td>{task.status}</td><td className="mono">{task.created_by_terminal_handle ?? "제공되지 않음"}</td></tr>)}</tbody></table>{read.data.tasks.length === 0 ? <p className="empty-copy">이 Run의 Task가 없습니다.</p> : null}</div>;
++}
++
+ export function OperationsList({ api, navigate }: Readonly<{ api: OperationsApi; navigate: (path: string) => void }>) {
+   const [filter, setFilter] = useState<"all" | "hq" | "orca">("all");
++  const [selectedRun, setSelectedRun] = useState<string>();
+   const [moreContexts, setMoreContexts] = useState<readonly HqContext[]>([]);
+   const [moreWorkers, setMoreWorkers] = useState<readonly Worker[]>([]);
+   const [contextCursor, setContextCursor] = useState<string>();
+   const [workerCursor, setWorkerCursor] = useState<string>();
++  const [pageState, setPageState] = useState<LoadState>("ready");
++  const contextFirstPage = useRef<string | undefined>(undefined);
++  const workerFirstPage = useRef<string | undefined>(undefined);
++  const pageRequest = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 });
+   const read = useVisiblePolling(async (signal) => {
+     const [contexts, workers, runs] = await Promise.all([api.contexts(undefined, signal), api.workers(undefined, signal), api.runs(undefined, signal)]);
+-    setContextCursor(contexts.cursor); setWorkerCursor(workers.page.nextCursor ?? undefined);
+     return { contexts, workers, runs };
+   }, 5000, [api]);
++  const contextSignature = read.data ? JSON.stringify([read.data.contexts.cursor ?? null, read.data.contexts.compacted ?? false, read.data.contexts.contexts.map((row) => [row.contextId, row.updatedAt])]) : undefined;
++  const workerSignature = read.data ? JSON.stringify([read.data.workers.page.nextCursor ?? null, read.data.workers.page.hasMore, read.data.workers.workers.map((row) => row.dispatchId)]) : undefined;
++
++  useEffect(() => {
++    if (!read.data || contextSignature === undefined || workerSignature === undefined) return;
++    if (contextFirstPage.current !== contextSignature) {
++      contextFirstPage.current = contextSignature;
++      setMoreContexts([]);
++      setContextCursor(read.data.contexts.cursor);
++      pageRequest.current.generation++;
++      pageRequest.current.controller?.abort();
++    }
++    if (workerFirstPage.current !== workerSignature) {
++      workerFirstPage.current = workerSignature;
++      setMoreWorkers([]);
++      setWorkerCursor(read.data.workers.page.nextCursor ?? undefined);
++      pageRequest.current.generation++;
++      pageRequest.current.controller?.abort();
++    }
++  }, [read.data, contextSignature, workerSignature]);
++
++  useEffect(() => {
++    const cancel = () => { pageRequest.current.generation++; pageRequest.current.controller?.abort(); };
++    const visibility = () => { if (document.hidden) { cancel(); setPageState("ready"); } };
++    document.addEventListener("visibilitychange", visibility);
++    return () => { document.removeEventListener("visibilitychange", visibility); cancel(); };
++  }, []);
++
+   if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
+-  const contexts = [...read.data.contexts.contexts, ...moreContexts].filter((row, index, all) => all.findIndex((candidate) => candidate.contextId === row.contextId) === index);
+-  const workers = [...read.data.workers.workers, ...moreWorkers].filter((row, index, all) => all.findIndex((candidate) => candidate.dispatchId === row.dispatchId) === index);
++  const contexts = [...read.data.contexts.contexts, ...(contextFirstPage.current === contextSignature ? moreContexts : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.contextId === row.contextId) === index);
++  const workers = [...read.data.workers.workers, ...(workerFirstPage.current === workerSignature ? moreWorkers : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.dispatchId === row.dispatchId) === index);
+   const loadMore = async () => {
+-    if (filter !== "orca" && contextCursor) { const page = await api.contexts(contextCursor); if (page.cursor !== contextCursor) { setMoreContexts((value) => [...value, ...page.contexts]); setContextCursor(page.cursor); } else setContextCursor(undefined); }
+-    if (filter !== "hq" && workerCursor) { const page = await api.workers(workerCursor); const next = page.page.nextCursor ?? undefined; if (next !== workerCursor) { setMoreWorkers((value) => [...value, ...page.workers]); setWorkerCursor(next); } else setWorkerCursor(undefined); }
++    if (pageState === "loading") return;
++    const contextNext = filter !== "orca" ? contextCursor : undefined;
++    const workerNext = filter !== "hq" ? workerCursor : undefined;
++    if (!contextNext && !workerNext) return;
++    const generation = ++pageRequest.current.generation;
++    pageRequest.current.controller?.abort();
++    const controller = new AbortController();
++    pageRequest.current.controller = controller;
++    setPageState("loading");
++    try {
++      const [contextPage, workerPage] = await Promise.all([
++        contextNext ? api.contexts(contextNext, controller.signal) : Promise.resolve(undefined),
++        workerNext ? api.workers(workerNext, controller.signal) : Promise.resolve(undefined),
++      ]);
++      if (controller.signal.aborted || generation !== pageRequest.current.generation) return;
++      if (contextPage && contextNext) {
++        setMoreContexts((value) => [...value, ...contextPage.contexts]);
++        setContextCursor(contextPage.cursor && contextPage.cursor !== contextNext ? contextPage.cursor : undefined);
++      }
++      if (workerPage && workerNext) {
++        setMoreWorkers((value) => [...value, ...workerPage.workers]);
++        const next = workerPage.page.nextCursor ?? undefined;
++        setWorkerCursor(next && next !== workerNext ? next : undefined);
++      }
++      setPageState("ready");
++    } catch (error) {
++      if (!controller.signal.aborted && generation === pageRequest.current.generation) setPageState(stateForError(error));
++    }
+   };
++
+   return <><div className="view-head"><h1>업무 목록</h1><p>HQ 문맥과 Orca Run/Task/Dispatch를 합성하지 않고 나란히 조회합니다.</p></div>
+     <div className="filters" aria-label="출처 필터">{(["all", "hq", "orca"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value === "all" ? "전체" : value === "hq" ? "HQ" : "Orca"}</button>)}</div>
+     {(filter === "all" || filter === "hq") && <section className="card"><div className="card-head"><h2><SourceBadge source="hq" /> 문맥/요청</h2><span>{contexts.length}건</span></div><div className="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>문맥 ID</th><th>갱신</th></tr></thead><tbody>{contexts.map((item) => <tr key={item.contextId} onClick={() => navigate(`/work/hq/${encodeURIComponent(item.contextId)}`)}><td>{item.title}</td><td>{item.state}</td><td className="mono">{item.contextId}</td><td>{new Date(item.updatedAt).toLocaleString()}</td></tr>)}</tbody></table>{contexts.length === 0 ? <p className="empty-copy">HQ 문맥이 없습니다.</p> : null}</div></section>}
+-    {(filter === "all" || filter === "orca") && <section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Dispatch</h2><span>Run {read.data.runs.runs.length}건 · Dispatch {workers.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Dispatch</th><th>liveness</th><th>Task</th><th>Run</th></tr></thead><tbody>{workers.map((item) => <tr key={item.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(item.dispatchId)}`)}><td className="mono">{item.dispatchId}</td><td>{item.projection.liveness.verdict}</td><td>{item.projection.taskId}</td><td>{item.projection.runId}</td></tr>)}</tbody></table>{workers.length === 0 ? <p className="empty-copy">Orca Dispatch가 없습니다.</p> : null}</div></section>}
+-    {((filter !== "orca" && contextCursor) || (filter !== "hq" && workerCursor)) ? <button className="load-more" onClick={() => void loadMore()}>다음 페이지 읽기</button> : null}
++    {(filter === "all" || filter === "orca") && <><section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Run</h2><span>{read.data.runs.runs.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Run</th><th>objective</th><th>coordinator</th></tr></thead><tbody>{read.data.runs.runs.map((run) => <tr key={run.id}><td><button className="mono" onClick={() => setSelectedRun(run.id)} aria-pressed={selectedRun === run.id}>{run.id}</button></td><td>{run.objective || "목표 없음"}</td><td className="mono">{run.coordinator_handle ?? "제공되지 않음"}</td></tr>)}</tbody></table>{read.data.runs.runs.length === 0 ? <p className="empty-copy">Orca Run이 없습니다.</p> : null}</div>{selectedRun ? <div className="card-body"><h3><span className="mono">{selectedRun}</span> Task</h3><RunTasks api={api} runId={selectedRun} /></div> : <p className="card-body muted">Run을 선택하면 native Task를 읽습니다.</p>}</section>
++    <section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Dispatch</h2><span>{workers.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Dispatch</th><th>liveness</th><th>Task</th><th>Run</th></tr></thead><tbody>{workers.map((item) => <tr key={item.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(item.dispatchId)}`)}><td className="mono">{item.dispatchId}</td><td>{item.projection.liveness.verdict}</td><td>{item.projection.taskId}</td><td>{item.projection.runId}</td></tr>)}</tbody></table>{workers.length === 0 ? <p className="empty-copy">Orca Dispatch가 없습니다.</p> : null}</div></section></>}
++    {pageState !== "ready" && pageState !== "loading" ? <AsyncState state={pageState} onRetry={() => void loadMore()} /> : null}
++    {((filter !== "orca" && contextCursor) || (filter !== "hq" && workerCursor)) ? <button className="load-more" disabled={pageState === "loading"} onClick={() => void loadMore()}>{pageState === "loading" ? "읽는 중" : "다음 페이지 읽기"}</button> : null}
+   </>;
+ }
+--- a/apps/web/src/routes/operations-detail.tsx
++++ b/apps/web/src/routes/operations-detail.tsx
+@@ -46,19 +46,31 @@
+   const [log, setLog] = useState<OrcaOutputPage>();
+   const [logState, setLogState] = useState<LoadState>("loading");
+   const lastRequestedCursor = useRef<string | undefined>(undefined);
++  const logRequest = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 });
++  useEffect(() => {
++    const cancel = () => { logRequest.current.generation++; logRequest.current.controller?.abort(); };
++    const visibility = () => { if (document.hidden) cancel(); };
++    document.addEventListener("visibilitychange", visibility);
++    return () => { document.removeEventListener("visibilitychange", visibility); cancel(); };
++  }, [dispatchId]);
+   const loadLog = async (source: "terminal" | "transcript", next?: string) => {
+     const prior = log?.source === source ? log : undefined;
+     if (next && lastRequestedCursor.current === next) return;
+     lastRequestedCursor.current = next;
++    const generation = ++logRequest.current.generation;
++    logRequest.current.controller?.abort();
++    const controller = new AbortController();
++    logRequest.current.controller = controller;
+     setLogState("loading");
+     try {
+-      const page = await api.output(dispatchId, source, next);
++      const page = await api.output(dispatchId, source, next, controller.signal);
++      if (controller.signal.aborted || generation !== logRequest.current.generation) return;
+       if (prior && prior.source === page.source) {
+         if (page.source === "terminal" && prior.source === "terminal") setLog({ ...page, lines: [...prior.lines, ...page.lines].slice(-500) });
+         else if (page.source === "transcript" && prior.source === "transcript") setLog({ ...page, messages: [...prior.messages, ...page.messages].filter((row, index, all) => all.findIndex((candidate) => candidate.id === row.id) === index).slice(-500) });
+       } else setLog(page);
+       setLogState("ready");
+-    } catch (error) { setLogState(stateForError(error)); }
++    } catch (error) { if (!controller.signal.aborted && generation === logRequest.current.generation) setLogState(stateForError(error)); }
+   };
+   const selectTab = (next: typeof tab) => { setTab(next); if ((next === "terminal" || next === "transcript") && log?.source !== next) { lastRequestedCursor.current = undefined; void loadLog(next); } };
+   if (!detail.data || detail.state !== "ready") return <AsyncState state={detail.state} onRetry={detail.reload} />;
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,11 +1,13 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 independent review Spec/Quality BLOCK; Task 4 pending
++- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 fix round 1 implemented/verified and awaiting independent re-review; Task 4 pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
+ 
++- Task 3 fix round 1 addresses review S1/S2/Q1/Q2/Q3: source-honest Orca inbox observations, native Run/Task inspection, AbortSignal/generation fencing, stable exhausted and invalidated pagination chains, and actual-contract response bounds/discriminants. TDD red established 12 failures; green passed **30 tests / 2 files**, typecheck, and build (39 modules). See `2026-09-15-hq-orca-operations-task3-fix1.md` and `task3-fix1.diff`; independent re-review is pending and Task 4 remains out of scope.
++
+ - Task 3 independent review: **Spec BLOCK / Quality BLOCK** in `2026-09-15-hq-orca-operations-task3-review.md`. Required fixes separate unverifiable Orca inbox observations from actionable attention, restore approved Run/Task read coverage, abort stale log/pagination reads, preserve exhausted/compacted pagination state across polling, and enforce the published response bounds/discriminants. The review reused the recorded 19 tests plus typecheck/build/local-asset checks; Task 4 placeholders and controls were deliberately excluded.
+ 
+ - Task 3 real read-first React console implemented across overview, work/source-filtered details, questions, resources, settings, and evidence, with compose/reply controls explicitly deferred to Task 4. Typed dependency-free runtime response schemas follow final Task 2 native shapes; claim/coalesced CSRF recovery, cancellation/non-overlapping polls, cursor/compaction handling, separate HQ events/Orca logs, unavailable metrics, and unsupported capacity mutation are explicit. Focused web verification passed **19 tests / 2 files**, typecheck, build, and local-only asset checks; see `2026-09-15-hq-orca-operations-task3.md` and `task3.diff`.
+@@ -42,4 +44,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 and Task 2 final reviews passed both Spec and Quality. Task 3's implementation has 19 focused web tests plus typecheck/build passing, but its independent review is BLOCK pending the recorded read-view, evidence-honesty, lifecycle, pagination, and validator fixes. Task 4 remains responsible for controls, launcher/static serving, and full browser E2E; Task 5 still requires a fresh reviewer.
++Task 1 and Task 2 final reviews passed both Spec and Quality. Task 3 fix round 1 implements all five independent-review findings with 30 focused web tests plus typecheck/build passing; independent fix re-review is pending. Task 4 remains responsible for controls, launcher/static serving, and full browser E2E; Task 5 still requires a fresh reviewer.
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-task3-fix1.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task3-fix1.md
+@@ -0,0 +1,30 @@
++# Task 3 fix round 1 — S1/S2/Q1/Q2/Q3
++
++Date: 2026-09-15 KST
++Status: implemented and focused verification passed; independent re-review pending
++
++## Implemented fixes
++
++- **S1:** Orca inbox questions remain observed history only. They no longer increase the actionable attention count, and the overview displays the backend's explicit unsupported pending-state reason.
++- **S2:** `/work` now renders native Run rows and loads the selected Run's native Task rows on demand through `GET /api/operations/orca/tasks?runId=...`; Run, Task, and Dispatch stay separate.
++- **Q1:** Output-tab and list-pagination requests carry AbortSignals, abort on unmount/hidden/source replacement, and use generation fences so late responses cannot update the current route/source.
++- **Q2:** First-page signatures preserve an exhausted pagination chain across unchanged polls, but changed cursor/compaction/row identity resets appended pages and aborts obsolete pagination work. HQ and Orca page results remain independently deduplicated.
++- **Q3:** Dependency-free response validation now enforces actual Task 2/core ID, cursor, context text/state, ISO date, positive-sequence/generation, event-kind/link, public output, and receipt bounds. Native Run objective and inbox subject/body remain compatible with their actual unbounded-per-field schemas and the server's 2 MiB response cap.
++
++## TDD and verification
++
++- Red: **12 targeted failures / 18 passes** established over-bound cursor/ID/text/date/event acceptance, missing native Task support, question-state overclaiming, cursor resurrection/stale page retention, and output abort/race defects.
++- Green: `pnpm --filter @orca-hq/web test` — **30 tests / 2 files passed**.
++- `pnpm --filter @orca-hq/web typecheck` — passed.
++- `pnpm --filter @orca-hq/web build` — passed; Vite transformed **39 modules** and emitted local HTML/CSS/JS assets.
++
++## Changed paths and boundary
++
++- Frontend: `apps/web/src/api.ts`, `api.test.ts`, `app.test.tsx`, `routes/operations-overview.tsx`, `operations-list.tsx`, and `operations-detail.tsx`.
++- Reports: this report, `2026-09-15-hq-orca-operations-task3-fix1.diff`, and the progress entry.
++- The overlay diff is based only on explicit pre-edit copies under `/tmp/orca-task3-fix1.p0Snrj`; it does not use a whole-worktree diff.
++- No Task 4 controls/launcher/E2E, backend, dependency, protected document, unrelated artifact, commit, push, install, production restart, or real Orca mutation was performed.
++
++## Handoff
++
++Independent Task 3 fix re-review should verify S1/S2/Q1/Q2/Q3 against this report and overlay. Task 4 remains pending and out of this round.
+

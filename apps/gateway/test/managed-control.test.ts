@@ -39,3 +39,41 @@ it('accepts only valid terminal session IDs and never client-supplied conversati
   expect(received).toHaveLength(1);
  }finally{await server.stop();await rm(dir,{recursive:true,force:true});}
 });
+it("issues only typed owner-socket operations claims and rejects browser-selected authority", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hq-operations-claim-"));
+  let claims = 0;
+  const socketPath = join(dir, "control.sock");
+  const server = await startManagedControl({
+    socketPath,
+    execute: async () => ({ text: "ok" }),
+    operations: {
+      issueClaim: () => {
+        claims++;
+        return {
+          url: "http://127.0.0.1:4310/#claim=once",
+          expiresAt: "2026-09-15T00:00:00.000Z",
+        };
+      },
+    },
+  });
+  const claim = (body: unknown) =>
+    new Promise<number>((resolve) => {
+      const r = request(
+        { socketPath, path: "/v1/operations/session", method: "POST" },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode!);
+        },
+      );
+      r.end(JSON.stringify(body));
+    });
+  try {
+    expect(await claim({ from: "term_arbitrary" })).toBe(400);
+    expect(claims).toBe(0);
+    expect(await claim({})).toBe(200);
+    expect(claims).toBe(1);
+  } finally {
+    await server.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

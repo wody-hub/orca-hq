@@ -137,42 +137,29 @@ export class ProgressRequestFailed extends Error {
   }
 }
 
+
+/**
+ * Renders untrusted server text as a single safe line: terminal control sequences are removed so a
+ * work title or tool summary cannot relabel the window, clear the screen, or hide later output.
+ */
 const escape = String.fromCharCode(0x1b);
 const operatingSystemCommand = new RegExp(`${escape}\\][\\s\\S]*?(?:\\u0007|${escape}\\\\|$)`, "g");
 const controlSequence = new RegExp(`${escape}\\[[0-9;:?]*[ -/]*[@-~]`, "g");
 const remainingEscape = new RegExp(`${escape}[\\s\\S]?`, "g");
 const controlCharacters = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]", "g");
 
-/**
- * Renders untrusted server text as a single safe line: terminal control sequences are removed so a
- * work title or tool summary cannot relabel the window, clear the screen, or hide later output.
- */
+/** Compatibility exports for existing installer callers. Shared console output uses the core copy. */
 export function sanitizeDisplayText(value: unknown): string {
   if (typeof value !== "string") return "";
-  const stripped = value
-    .replace(operatingSystemCommand, "")
-    .replace(controlSequence, "")
-    .replace(remainingEscape, "")
-    .replace(controlCharacters, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  return stripped.length <= displayTextLimit
-    ? stripped
-    : `${stripped.slice(0, displayTextLimit - 1)}…`;
+  const text = value.replace(operatingSystemCommand, "").replace(controlSequence, "").replace(remainingEscape, "").replace(controlCharacters, " ").replace(/\s+/gu, " ").trim();
+  return text.length <= displayTextLimit ? text : `${text.slice(0, displayTextLimit - 1)}…`;
 }
 
-/** Final reports preserve paragraphs; only control codes are removed, with an explicit bound notice. */
 export function sanitizeResultText(value: unknown): string {
   if (typeof value !== "string") return "";
-  const stripped = value
-    .replace(operatingSystemCommand, "")
-    .replace(controlSequence, "")
-    .replace(remainingEscape, "")
-    .replace(/\r\n?/gu, "\n")
-    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, " ")
-    .trim();
+  const text = value.replace(operatingSystemCommand, "").replace(controlSequence, "").replace(remainingEscape, "").replace(/\r\n?/gu, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, " ").trim();
   const limit = 64 * 1024;
-  return stripped.length <= limit ? stripped : `${stripped.slice(0, limit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
+  return text.length <= limit ? text : `${text.slice(0, limit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
 }
 
 interface NativeProfileFields {

@@ -11,6 +11,7 @@ export interface RunOrcaOptions {
   readonly signal: AbortSignal;
   readonly timeoutMs: number;
   readonly terminationGraceMs: number;
+  readonly maxOutputBytes?: number;
   readonly connectionTarget?: OrcaConnectionTarget;
 }
 
@@ -94,6 +95,13 @@ export class OrcaAbortedError extends Error {
   }
 }
 
+export class OrcaOutputLimitError extends Error {
+  readonly code = "orca_output_limit";
+  readonly retryable = false;
+  readonly maxOutputBytes: number;
+  constructor(maxOutputBytes: number) { super("Orca CLI output exceeded its limit"); this.name = "OrcaOutputLimitError"; this.maxOutputBytes = maxOutputBytes; }
+}
+
 function parseJsonReceiptText(stdout: string): unknown {
   try {
     return JSON.parse(stdout) as unknown;
@@ -132,6 +140,8 @@ export async function runOrca(
   if (!Number.isSafeInteger(options.terminationGraceMs) || options.terminationGraceMs <= 0) {
     throw new TypeError("terminationGraceMs must be a positive safe integer");
   }
+  const maxOutputBytes = options.maxOutputBytes ?? 2 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) throw new TypeError("maxOutputBytes must be a positive safe integer");
   if (args.includes("--json")) throw new TypeError("runOrca appends --json");
   const connectionArgs = orcaConnectionArguments(
     options.connectionTarget ?? Object.freeze({ kind: "local" })
@@ -144,9 +154,10 @@ export async function runOrca(
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
+    let stdoutBytes = 0;
     let finished = false;
     let closed = false;
-    let cancellationReason: "aborted" | "timeout" | undefined;
+    let cancellationReason: "aborted" | "timeout" | "output_limit" | undefined;
     let processError: OrcaProcessError | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let terminationGrace: ReturnType<typeof setTimeout> | undefined;
@@ -159,7 +170,7 @@ export async function runOrca(
       options.signal.removeEventListener("abort", abort);
       action();
     };
-    const cancel = (reason: "aborted" | "timeout"): void => {
+    const cancel = (reason: "aborted" | "timeout" | "output_limit"): void => {
       if (finished || cancellationReason !== undefined) return;
       cancellationReason = reason;
       child.kill("SIGTERM");
@@ -171,7 +182,16 @@ export async function runOrca(
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stdout.on("data", (chunk: string) => {
+      if (cancellationReason === "output_limit") return;
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (stdoutBytes + chunkBytes > maxOutputBytes) {
+        cancel("output_limit");
+        return;
+      }
+      stdout += chunk;
+      stdoutBytes += chunkBytes;
+    });
     child.stderr.resume();
     child.on("error", () => {
       processError = new OrcaProcessError(null);
@@ -179,7 +199,9 @@ export async function runOrca(
     child.on("close", (exitCode) => {
       closed = true;
       finish(() => {
-        if (cancellationReason === "aborted") {
+        if (cancellationReason === "output_limit") {
+          reject(new OrcaOutputLimitError(maxOutputBytes));
+        } else if (cancellationReason === "aborted") {
           reject(new OrcaAbortedError());
         } else if (cancellationReason === "timeout") {
           reject(new OrcaTimeoutError(options.timeoutMs));

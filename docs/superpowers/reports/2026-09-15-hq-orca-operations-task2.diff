@@ -1,0 +1,3626 @@
+--- /dev/null
++++ b/apps/gateway/src/operations-journal.ts
+@@ -0,0 +1,140 @@
++import { createHash } from "node:crypto";
++import { z } from "zod";
++import {
++  OperationsMutationReceiptSchema,
++  type OperationsMutationReceipt,
++} from "@orca-hq/core";
++import type { openDatabase } from "@orca-hq/persistence";
++
++type Database = ReturnType<typeof openDatabase>;
++type Intent = {
++  requestId: string;
++  action: string;
++  targetId: string;
++  input: unknown;
++};
++type Result = Pick<OperationsMutationReceipt, "state" | "detail">;
++const Identity = z
++  .string()
++  .min(1)
++  .max(512)
++  .regex(/^[A-Za-z0-9_.:/-]+$/);
++function canonical(value: unknown): string {
++  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
++  if (value !== null && typeof value === "object")
++    return `{${Object.entries(value)
++      .filter(([, v]) => v !== undefined)
++      .sort(([a], [b]) => a.localeCompare(b))
++      .map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`)
++      .join(",")}}`;
++  return JSON.stringify(value) ?? "null";
++}
++/** One owner per managed DB; durable intent precedes every effect, including authorization reads. */
++export class OperationsJournal {
++  private serial: Promise<unknown> = Promise.resolve();
++  constructor(
++    private readonly db: Database,
++    private readonly now = () => new Date(),
++  ) {
++    db.exec(
++      `CREATE TABLE IF NOT EXISTS operations_mutation_receipts(request_id TEXT PRIMARY KEY,action TEXT NOT NULL,target_id TEXT NOT NULL,input_digest TEXT NOT NULL,state TEXT NOT NULL,detail TEXT,observed_at TEXT NOT NULL)`,
++    );
++    db.prepare(
++      "UPDATE operations_mutation_receipts SET state='unknown',detail='interrupted' WHERE state='prepared'",
++    ).run();
++  }
++  execute(
++    intent: Intent,
++    effect: () => Promise<Result>,
++  ): Promise<OperationsMutationReceipt> {
++    Identity.parse(intent.requestId);
++    Identity.parse(intent.action);
++    Identity.parse(intent.targetId);
++    const digest = createHash("sha256")
++      .update(canonical(intent.input))
++      .digest("hex");
++    const operation = this.serial.then(async () => {
++      const row = this.db
++        .prepare(
++          "SELECT * FROM operations_mutation_receipts WHERE request_id=?",
++        )
++        .get(intent.requestId) as
++        | {
++            action: string;
++            target_id: string;
++            input_digest: string;
++            state: string;
++            detail: string | null;
++            observed_at: string;
++          }
++        | undefined;
++      const receipt = (state: string, observedAt: string, detail?: string) =>
++        OperationsMutationReceiptSchema.parse({
++          requestId: intent.requestId,
++          action: intent.action,
++          targetId: intent.targetId,
++          state,
++          observedAt,
++          ...(detail ? { detail } : {}),
++        });
++      if (row) {
++        if (
++          row.action !== intent.action ||
++          row.target_id !== intent.targetId ||
++          row.input_digest !== digest
++        )
++          throw Error("idempotency_conflict");
++        return receipt(
++          row.state === "prepared" ? "unknown" : row.state,
++          row.observed_at,
++          row.detail ?? undefined,
++        );
++      }
++      this.db
++        .prepare(
++          "INSERT INTO operations_mutation_receipts VALUES(?,?,?,?,'prepared',NULL,?)",
++        )
++        .run(
++          intent.requestId,
++          intent.action,
++          intent.targetId,
++          digest,
++          this.now().toISOString(),
++        );
++      let result: OperationsMutationReceipt;
++      try {
++        const outcome = await effect();
++        // Audit details are machine codes only: never bodies, command output, or exception text.
++        result = receipt(
++          outcome.state,
++          this.now().toISOString(),
++          outcome.detail && /^[a-z0-9_:-]{1,128}$/.test(outcome.detail)
++            ? outcome.detail
++            : undefined,
++        );
++      } catch {
++        result = receipt(
++          "unknown",
++          this.now().toISOString(),
++          "effect_unverifiable",
++        );
++      }
++      this.db
++        .prepare(
++          "UPDATE operations_mutation_receipts SET state=?,detail=?,observed_at=? WHERE request_id=?",
++        )
++        .run(
++          result.state,
++          result.detail ?? null,
++          result.observedAt,
++          intent.requestId,
++        );
++      return result;
++    });
++    this.serial = operation.catch(() => {});
++    return operation;
++  }
++  async idle(): Promise<void> {
++    await this.serial;
++  }
++}
+--- /dev/null
++++ b/apps/gateway/src/operations-service.ts
+@@ -0,0 +1,647 @@
++import { OperationsControls, controlSupport } from "./operations-controls.js";
++export type { OperationsServiceOptions } from "./operations-controls.js";
++import { z } from "zod";
++import {
++  HqContextPageSchema,
++  HqEventPageSchema,
++  HqQuestionSchema,
++  OperationsStatusSchema,
++  OrcaOutputPageSchema,
++  SubmitProgressRequestSchema,
++} from "@orca-hq/core";
++import type { ProgressEventQuery } from "./progress-store.js";
++import { OperationsError } from "./operations-http.js";
++import {
++  Id,
++  Cursor,
++  State,
++  Terminal,
++  Run,
++  Task,
++  Worker,
++  Receipt,
++  publicValue,
++  evidence,
++} from "./operations-projections.js";
++import type { QuestionRecord } from "./native-coordinator.js";
++type Action = "dispatch" | "followup" | "reply" | "stop" | "retain" | "release";
++const Body = z
++  .string()
++  .min(1)
++  .max(8000)
++  .refine((value) => value.trim().length > 0);
++const requestSchema = SubmitProgressRequestSchema.extend({
++  text: Body,
++}).strict();
++export class OperationsService extends OperationsControls {
++  contexts(sessionId?: string, cursor?: string) {
++    const offset = z.coerce
++      .number()
++      .int()
++      .nonnegative()
++      .max(1000000)
++      .parse(cursor ?? 0);
++    const rows = this.options.store.listContexts(sessionId);
++    return HqContextPageSchema.parse(
++      publicValue({
++        contexts: rows.slice(offset, offset + 100),
++        ...(rows.length > offset + 100 ? { cursor: String(offset + 100) } : {}),
++      }),
++    );
++  }
++  context(id: string) {
++    const value = this.options.store.getContext(Id.parse(id));
++    if (!value) throw new OperationsError(404, "context_not_found");
++    return {
++      source: "hq",
++      context: publicValue(value),
++      evidence: evidence("hq_store"),
++    };
++  }
++  request(id: string) {
++    const value = this.options.store.getRequest(Id.parse(id));
++    if (!value) throw new OperationsError(404, "request_not_found");
++    return {
++      source: "hq",
++      request: publicValue(value),
++      evidence: evidence("hq_store"),
++    };
++  }
++  events(query: ProgressEventQuery) {
++    const page = this.options.store.readEvents({
++      ...query,
++      limit: Math.min(query.limit ?? 100, 500),
++    });
++    return HqEventPageSchema.parse(
++      publicValue({
++        ...page,
++        snapshots: page.snapshots.slice(0, 100),
++        cursor: String(page.events.at(-1)?.seq ?? query.after),
++        events: page.events.map(({ source, ...event }) => {
++          const link = z
++            .object({
++              runId: Id,
++              taskId: Id,
++              dispatchId: Id,
++              terminalHandle: Id,
++            })
++            .safeParse(event.payload);
++          return {
++            ...event,
++            source: "hq",
++            eventSource: source,
++            ...(["worker.ready", "worker.retained"].includes(event.kind) &&
++            link.success
++              ? { receiptLink: link.data }
++              : {}),
++          };
++        }),
++      }),
++    );
++  }
++  questions(after = 0, limit = 100) {
++    const store = this.options.store;
++    const page = store.readEvents({ after, limit: Math.min(limit, 100) });
++    const native = store.nativeJournal().list<QuestionRecord>("question");
++    const questions = page.events
++      .filter((e) => e.kind === "clarification.required")
++      .flatMap((e) => {
++        const r = store.getRequest(e.requestId);
++        if (!r) return [];
++        const messageId =
++          typeof e.payload.messageId === "string"
++            ? e.payload.messageId
++            : undefined;
++        const pending = messageId
++          ? native.find((q) => q.id === messageId && !q.answered)
++          : undefined;
++        if (messageId ? !pending : r.state !== "awaiting_input") return [];
++        return [
++          HqQuestionSchema.parse({
++            source: "hq",
++            kind: messageId ? "managed_orca_question" : "router_clarification",
++            requestId: e.requestId,
++            sessionId: r.sessionId,
++            ...(e.contextId ? { contextId: e.contextId } : {}),
++            ...(messageId ? { messageId } : {}),
++            body: publicValue(String(e.payload.text ?? "")),
++            occurredAt: e.occurredAt,
++            state: r.state,
++            evidence: evidence("hq_store"),
++          }),
++        ];
++      })
++      .slice(0, 100);
++    return {
++      source: "hq",
++      questions,
++      cursor: String(page.events.at(-1)?.seq ?? 0),
++      compacted: page.compacted,
++    };
++  }
++  async status() {
++    const c = this.options.capacity,
++      byState: Record<string, number> = {};
++    for (const a of c.attempts())
++      byState[a.state] = (byState[a.state] ?? 0) + 1;
++    let orca: {
++      state: string;
++      reachable: boolean;
++      version: string;
++      features: Record<string, unknown>;
++      runtimeId?: string;
++      connectionState?: string;
++    } = {
++      state: "unverifiable",
++      reachable: false,
++      version: "unavailable",
++      features: {
++        controls: { supported: false, reason: "runtime_unverifiable" },
++      },
++    };
++    try {
++      const raw = Receipt.parse(
++        await this.options.orca.execute({ kind: "operations_status" }),
++      );
++      const { runtime } = z
++        .object({
++          runtime: z
++            .object({
++              state: State,
++              reachable: z.boolean(),
++              appVersion: State,
++              capabilities: z.array(State),
++              connectionState: State.optional(),
++            })
++            .passthrough(),
++        })
++        .parse(raw.result);
++      orca = {
++        state: runtime.state,
++        reachable: runtime.reachable,
++        version: runtime.appVersion,
++        ...(runtime.connectionState
++          ? { connectionState: runtime.connectionState }
++          : {}),
++        ...(raw._meta?.runtimeId ? { runtimeId: raw._meta.runtimeId } : {}),
++        features: {
++          advertised: runtime.capabilities,
++          controls: controlSupport(runtime)
++            ? { supported: true }
++            : { supported: false, reason: "control_capability_unavailable" },
++          gate: "fresh_run_owner_exact_incarnation_required",
++        },
++      };
++    } catch {
++      /* A failed runtime observation does not alter HQ occupancy. */
++    }
++    return OperationsStatusSchema.parse(
++      publicValue({
++        collectedAt: new Date().toISOString(),
++        hq: {
++          state: "running",
++          capacity: {
++            limit: c.limit,
++            source: c.source,
++            ...c.snapshot(),
++            byState,
++            updateSupported: false,
++            reason: "restart_safe_mutation_contract_unavailable",
++          },
++        },
++        orca,
++        metrics: {
++          tokens: { available: false, reason: "not_collected" },
++          cost: { available: false, reason: "not_collected" },
++        },
++      }),
++    );
++  }
++  async runs(cursor?: string) {
++    const data = await this.read(
++      { kind: "list_runs", limit: 100, ...(cursor ? { cursor } : {}) },
++      z
++        .object({
++          runs: z.array(Run).max(100),
++          nextCursor: Cursor.nullable().optional(),
++        })
++        .passthrough(),
++    );
++    return this.orcaPage(data);
++  }
++  async run(id: string) {
++    return this.orcaPage(
++      await this.read(
++        { kind: "show_run", runId: id },
++        z.object({ run: Run }).passthrough(),
++      ),
++    );
++  }
++  async tasks(runId: string) {
++    return this.orcaPage(
++      await this.read(
++        { kind: "list_tasks", runId },
++        z.object({ tasks: z.array(Task).max(100) }).passthrough(),
++      ),
++    );
++  }
++  async workers(runId?: string, cursor?: string) {
++    return this.orcaPage(
++      await this.read(
++        {
++          kind: "list_workers",
++          limit: 100,
++          ...(runId ? { runId } : {}),
++          ...(cursor ? { cursor } : {}),
++        },
++        z
++          .object({
++            workers: z
++              .array(
++                z
++                  .object({
++                    dispatchId: Id,
++                    projection: z
++                      .object({
++                        dispatchId: Id,
++                        taskId: Id,
++                        runId: Id,
++                        liveness: z.object({ verdict: State }).passthrough(),
++                      })
++                      .passthrough(),
++                  })
++                  .passthrough(),
++              )
++              .max(100),
++            page: z
++              .object({
++                hasMore: z.boolean(),
++                nextCursor: Cursor.nullable().optional(),
++              })
++              .passthrough(),
++            scope: z.object({ source: State }).passthrough(),
++          })
++          .passthrough(),
++      ),
++    );
++  }
++  async worker(id: string) {
++    return this.orcaPage(
++      await this.read(
++        { kind: "operations_show_worker", dispatchId: id },
++        Worker,
++      ),
++    );
++  }
++  private orcaPage(data: unknown) {
++    return {
++      ...z.record(z.unknown()).parse(publicValue(data)),
++      source: "orca" as const,
++      evidence: evidence("orca_cli"),
++    };
++  }
++  async output(
++    dispatchId: string,
++    source: "terminal" | "transcript",
++    cursor?: string,
++    limit = 100,
++  ) {
++    const raw = Receipt.parse(
++      await this.options.orca
++        .execute({
++          kind: "operations_worker_read",
++          dispatchId,
++          source,
++          limit,
++          ...(cursor ? { cursor } : {}),
++        })
++        .catch((error) => {
++          if (
++            (error as { orcaCode?: string }).orcaCode === "source_changed" ||
++            (error as Error).message === "source_changed"
++          )
++            throw new OperationsError(409, "source_changed");
++          throw error;
++        }),
++    );
++    const base = z
++      .object({
++        dispatchId: Id,
++        source: z.enum(["terminal", "transcript"]),
++        cursor: Cursor,
++        archived: z.boolean(),
++        warnings: z.array(z.string()).max(100),
++      })
++      .passthrough()
++      .parse(raw.result);
++    if (base.dispatchId !== dispatchId)
++      throw new OperationsError(502, "identity_mismatch");
++    if (base.source !== source)
++      throw new OperationsError(409, "source_changed");
++    const content =
++      source === "terminal"
++        ? {
++            lines: z
++              .object({ lines: z.array(z.string()).max(500) })
++              .parse(base.terminal).lines,
++          }
++        : {
++            messages: z
++              .object({
++                messages: z
++                  .array(
++                    z.object({
++                      id: Id,
++                      role: State,
++                      blocks: z.array(z.unknown()),
++                      timestamp: z.number(),
++                    }),
++                  )
++                  .max(500),
++              })
++              .parse(base.transcript)
++              .messages.map((m) => ({
++                id: m.id,
++                role: m.role,
++                text: JSON.stringify(m.blocks),
++                occurredAt: new Date(m.timestamp).toISOString(),
++              })),
++          };
++    return OrcaOutputPageSchema.parse(
++      publicValue({
++        source,
++        cursor: base.cursor,
++        archived: base.archived,
++        warnings: base.warnings,
++        ...content,
++      }),
++    );
++  }
++  async orcaQuestions() {
++    const data = await this.inbox();
++    return this.orcaPage({
++      ...data,
++      messages: data.messages.filter((m) => m.type === "question"),
++      support: {
++        pendingState: {
++          supported: false,
++          reason: "inbox_has_no_authoritative_pending_question_state",
++        },
++      },
++    });
++  }
++  async resources(projectId?: string) {
++    let remaining = 99;
++    const uncovered = {
++      supported: false as const,
++      reason: "request_read_budget_exhausted",
++    };
++    const projects = await this.read(
++      { kind: "operations_list_projects" },
++      z.object({
++        projects: z.array(z.object({ id: Id }).passthrough()).max(100),
++      }),
++    );
++    const rows = await Promise.all(
++      projects.projects
++        .filter((project) => !projectId || project.id === projectId)
++        .map(async (project) => {
++          if (remaining-- <= 0)
++            return {
++              ...project,
++              hostScope: "not_covered",
++              setups: [],
++              support: uncovered,
++            };
++          const { setups } = await this.read(
++            { kind: "list_project_setups", projectId: project.id },
++            z.object({
++              setups: z
++                .array(
++                  z
++                    .object({ id: Id, projectId: Id, repoId: Id, hostId: Id })
++                    .passthrough(),
++                )
++                .max(100),
++            }),
++          );
++          const results = await Promise.all(
++            setups.map(async (setup) => {
++              if (remaining-- <= 0)
++                return {
++                  ...setup,
++                  hostScope: { hostIds: [], omittedHostIds: [setup.hostId] },
++                  covered: false,
++                  truncated: true,
++                  worktrees: [],
++                  support: uncovered,
++                };
++              const page = await this.read(
++                { kind: "list_worktrees", repoId: setup.repoId, limit: 100 },
++                z
++                  .object({
++                    worktrees: z
++                      .array(
++                        z
++                          .object({ id: Id, projectHostSetupId: Id })
++                          .passthrough(),
++                      )
++                      .max(100),
++                    hostScope: z.object({
++                      hostIds: z.array(Id),
++                      omittedHostIds: z.array(Id),
++                    }),
++                    truncated: z.boolean(),
++                  })
++                  .passthrough(),
++              );
++              const worktrees = await Promise.all(
++                page.worktrees
++                  .filter((w) => w.projectHostSetupId === setup.id)
++                  .map(async (w) => {
++                    if (remaining-- <= 0)
++                      return {
++                        ...w,
++                        terminals: [],
++                        hostScope: {
++                          hostIds: [],
++                          omittedHostIds: [setup.hostId],
++                        },
++                        truncated: true,
++                        support: uncovered,
++                      };
++                    const terminals = await this.read(
++                      { kind: "list_terminals", worktreeId: w.id },
++                      z
++                        .object({
++                          terminals: z.array(Terminal).max(100),
++                          hostScope: z.object({
++                            hostIds: z.array(Id),
++                            omittedHostIds: z.array(Id),
++                          }),
++                          truncated: z.boolean(),
++                        })
++                        .passthrough(),
++                    );
++                    return { ...w, ...terminals };
++                  }),
++              );
++              return {
++                ...setup,
++                hostScope: page.hostScope,
++                covered:
++                  page.hostScope.hostIds.includes(setup.hostId) &&
++                  !page.hostScope.omittedHostIds.includes(setup.hostId),
++                truncated: page.truncated,
++                worktrees,
++              };
++            }),
++          );
++          return {
++            ...project,
++            hostScope: results.every((s) => s.covered)
++              ? "covered"
++              : "not_covered",
++            setups: results,
++          };
++        }),
++    );
++    return this.orcaPage({ projects: rows });
++  }
++  async submit(raw: unknown, key: string) {
++    const input = requestSchema.parse(raw);
++    if (input.requestId !== key)
++      throw new OperationsError(409, "request_identity_conflict");
++    return this.options.journal.execute(
++      {
++        requestId: key,
++        action: "hq_request",
++        targetId: input.requestId,
++        input,
++      },
++      async () => {
++        await this.options.submit(input);
++        return { state: "accepted" };
++      },
++    );
++  }
++  async route(
++    method: string,
++    url: URL,
++    body: unknown,
++    key?: string,
++  ): Promise<unknown> {
++    const path = url.pathname.replace(/^\/api\/operations/, "");
++    const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
++    const q = Object.fromEntries(url.searchParams);
++    const id = parts[2];
++    if (
++      !/^\/(?:status|hq\/(?:contexts(?:\/[^/]+)?|requests(?:\/[^/]+)?|events|questions)|orca\/(?:runs(?:\/[^/]+)?|tasks|workers(?:\/[^/]+(?:\/(?:output|stop|retain|release))?)?|questions|resources|dispatches|followups|replies))$/.test(
++        path,
++      )
++    )
++      throw new OperationsError(404, "route_not_found");
++    if (method === "GET") {
++      if (path === "/status") return this.status();
++      if (parts[0] === "hq") {
++        if (parts[1] === "contexts")
++          return id
++            ? this.context(id)
++            : (() => {
++                const p = z
++                  .object({
++                    sessionId: Id.optional(),
++                    cursor: Cursor.optional(),
++                  })
++                  .strict()
++                  .parse(q);
++                return this.contexts(p.sessionId, p.cursor);
++              })();
++        if (parts[1] === "requests" && id) return this.request(id);
++        if (parts[1] === "questions") {
++          const p = z
++            .object({
++              after: z.coerce.number().int().nonnegative().default(0),
++              limit: z.coerce.number().int().positive().max(100).default(100),
++            })
++            .strict()
++            .parse(q);
++          return this.questions(p.after, p.limit);
++        }
++        if (parts[1] === "events") {
++          const filter = z
++            .object({
++              contextId: Id.optional(),
++              after: z.coerce.number().int().nonnegative().default(0),
++              limit: z.coerce.number().int().positive().max(500).default(100),
++            })
++            .strict()
++            .parse(q);
++          return this.events({
++            after: filter.after,
++            limit: filter.limit,
++            ...(filter.contextId ? { contextId: filter.contextId } : {}),
++          });
++        }
++      }
++      if (parts[0] === "orca") {
++        if (parts[1] === "runs")
++          return id
++            ? this.run(id)
++            : this.runs(
++                z.object({ cursor: Cursor.optional() }).strict().parse(q)
++                  .cursor,
++              );
++        if (parts[1] === "tasks")
++          return this.tasks(z.object({ runId: Id }).strict().parse(q).runId);
++        if (parts[1] === "workers") {
++          if (id && parts[3] === "output") {
++            const p = z
++              .object({
++                source: z.enum(["terminal", "transcript"]),
++                cursor: Cursor.optional(),
++                limit: z.coerce.number().int().positive().max(500).default(100),
++              })
++              .strict()
++              .parse(q);
++            return this.output(id, p.source, p.cursor, p.limit);
++          }
++          if (id) return this.worker(id);
++          const p = z
++            .object({ runId: Id.optional(), cursor: Cursor.optional() })
++            .strict()
++            .parse(q);
++          return this.workers(p.runId, p.cursor);
++        }
++        if (parts[1] === "questions") return this.orcaQuestions();
++        if (parts[1] === "resources")
++          return this.resources(
++            z.object({ projectId: Id.optional() }).strict().parse(q).projectId,
++          );
++      }
++    } else if (method === "POST" && key) {
++      if (path === "/hq/requests") return this.submit(body, key);
++      if (parts[0] === "orca") {
++        if (
++          parts[1] === "workers" &&
++          id &&
++          ["stop", "retain", "release"].includes(parts[3] ?? "")
++        )
++          return this.mutate(parts[3] as Action, id, body, key);
++        const mappings = {
++          dispatches: ["dispatch", "taskId"],
++          followups: ["followup", "dispatchId"],
++          replies: ["reply", "messageId"],
++        } as const;
++        if (parts[1] && parts[1] in mappings) {
++          const [action, field] = mappings[parts[1] as keyof typeof mappings];
++          const obj = z.record(z.unknown()).parse(body);
++          const target = Id.parse(obj[field]);
++          const { [field]: _, ...input } = obj;
++          return this.mutate(action, target, input, key);
++        }
++      }
++    }
++    throw new OperationsError(404, "route_not_found");
++  }
++}
+--- /dev/null
++++ b/apps/gateway/src/operations-http.ts
+@@ -0,0 +1,219 @@
++import { randomBytes, timingSafeEqual } from "node:crypto";
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { z } from "zod";
++export class OperationsError extends Error {
++  constructor(
++    readonly status: number,
++    readonly code: string,
++  ) {
++    super(code);
++  }
++}
++const token = () => randomBytes(32).toString("base64url");
++const equal = (a: string, b: string) =>
++  a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
++export class OperationsHttp {
++  private origin = "";
++  private claims = new Map<string, number>();
++  private sessions = new Map<string, { csrf: string; expiresAt: number }>();
++  private readonly now: () => number;
++  constructor(
++    private readonly options: {
++      route(
++        method: string,
++        url: URL,
++        body: unknown,
++        key?: string,
++      ): Promise<unknown>;
++      now?: () => number;
++    },
++  ) {
++    this.now = options.now ?? Date.now;
++  }
++  setOrigin(origin: string) {
++    const u = new URL(origin);
++    if (
++      u.protocol !== "http:" ||
++      u.hostname !== "127.0.0.1" ||
++      u.origin !== origin
++    )
++      throw Error("invalid_operations_origin");
++    this.origin = origin;
++  }
++  isLocal(peer: string | undefined, host: string | undefined) {
++    return (
++      !!this.origin &&
++      (peer === "127.0.0.1" || peer === "::ffff:127.0.0.1") &&
++      host === new URL(this.origin).host
++    );
++  }
++  private prune() {
++    for (const [k, v] of this.claims)
++      if (v <= this.now()) this.claims.delete(k);
++    for (const [k, v] of this.sessions)
++      if (v.expiresAt <= this.now()) this.sessions.delete(k);
++  }
++  issueClaim() {
++    if (!this.origin) throw Error("operations_not_ready");
++    this.prune();
++    if (this.claims.size >= 100) throw Error("claim_limit");
++    const claim = token(),
++      expiresAt = this.now() + 60000;
++    this.claims.set(claim, expiresAt);
++    return {
++      url: `${this.origin}/#claim=${claim}`,
++      expiresAt: new Date(expiresAt).toISOString(),
++    };
++  }
++  async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
++    if (
++      !req.url?.startsWith("/api/operations") &&
++      !req.url?.startsWith("/auth/local/")
++    )
++      return false;
++    const send = (status: number, value: unknown) => {
++      const encoded = JSON.stringify(value);
++      if (Buffer.byteLength(encoded) > 2097152) {
++        res.writeHead(502);
++        res.end('{"error":"output_overflow"}');
++        return;
++      }
++      res.writeHead(status);
++      res.end(encoded);
++    };
++    res.setHeader("Content-Type", "application/json; charset=utf-8");
++    res.setHeader("Cache-Control", "no-store");
++    res.setHeader("X-Content-Type-Options", "nosniff");
++    res.setHeader("Referrer-Policy", "no-referrer");
++    res.setHeader(
++      "Content-Security-Policy",
++      "default-src 'none'; frame-ancestors 'none'",
++    );
++    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
++    try {
++      if (
++        !this.isLocal(req.socket.remoteAddress, req.headers.host) ||
++        req.headers["sec-fetch-site"] === "cross-site"
++      )
++        throw new OperationsError(403, "local_only");
++      const url = new URL(req.url, this.origin);
++      if (url.origin !== this.origin)
++        throw new OperationsError(403, "local_only");
++      if (
++        req.headers.origin !== undefined &&
++        req.headers.origin !== this.origin
++      )
++        throw new OperationsError(403, "origin_required");
++      const mutation = req.method === "POST";
++      if (req.method !== "GET" && !mutation)
++        throw new OperationsError(405, "method_not_allowed");
++      if (mutation && req.headers.origin !== this.origin)
++        throw new OperationsError(403, "origin_required");
++      this.prune();
++      let body: unknown;
++      if (mutation) {
++        if (
++          !/^application\/json(?:;|$)/i.test(req.headers["content-type"] ?? "")
++        )
++          throw new OperationsError(415, "json_required");
++        const chunks: Buffer[] = [];
++        let size = 0;
++        for await (const chunk of req) {
++          const b = Buffer.from(chunk);
++          size += b.length;
++          if (size > 16384) throw new OperationsError(413, "body_too_large");
++          chunks.push(b);
++        }
++        try {
++          body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
++        } catch {
++          throw new OperationsError(400, "invalid_json");
++        }
++      }
++      if (url.pathname === "/auth/local/claim" && mutation) {
++        const { claim } = z
++          .object({ claim: z.string().regex(/^[A-Za-z0-9_-]{43}$/) })
++          .strict()
++          .parse(body);
++        if (!this.claims.delete(claim))
++          throw new OperationsError(401, "claim_expired");
++        if (this.sessions.size >= 100)
++          throw new OperationsError(429, "session_limit");
++        const session = token(),
++          csrf = token(),
++          expiresAt = this.now() + 1800000;
++        this.sessions.set(session, { csrf, expiresAt });
++        res.setHeader(
++          "Set-Cookie",
++          `hq_operations=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800`,
++        );
++        send(200, { csrf, expiresAt: new Date(expiresAt).toISOString() });
++        return true;
++      }
++      const cookies = (req.headers.cookie ?? "")
++        .split(";")
++        .map((s) => s.trim())
++        .filter((s) => s.startsWith("hq_operations="));
++      const session =
++        cookies.length === 1
++          ? this.sessions.get(cookies[0]!.slice(14))
++          : undefined;
++      if (!session) throw new OperationsError(401, "session_required");
++      if (
++        mutation &&
++        (typeof req.headers["x-csrf-token"] !== "string" ||
++          !equal(req.headers["x-csrf-token"], session.csrf))
++      )
++        throw new OperationsError(403, "csrf_required");
++      if (url.pathname === "/auth/local/refresh" && mutation) {
++        z.object({}).strict().parse(body);
++        session.csrf = token();
++        send(200, {
++          csrf: session.csrf,
++          expiresAt: new Date(session.expiresAt).toISOString(),
++        });
++        return true;
++      }
++      const key = req.headers["idempotency-key"];
++      if (
++        mutation &&
++        (typeof key !== "string" || !/^[A-Za-z0-9_.:-]{1,100}$/.test(key))
++      )
++        throw new OperationsError(400, "idempotency_key_required");
++      const result = await this.options.route(
++        req.method!,
++        url,
++        body,
++        typeof key === "string" ? key : undefined,
++      );
++      const state = (result as { state?: string } | null)?.state;
++      send(
++        mutation
++          ? state === "rejected"
++            ? 409
++            : state === "unknown"
++              ? 502
++              : 202
++          : 200,
++        result,
++      );
++    } catch (error) {
++      if (res.writableEnded) return true;
++      if (error instanceof OperationsError)
++        send(error.status, { error: error.code });
++      else if (error instanceof z.ZodError)
++        send(400, { error: "invalid_input" });
++      else if (
++        error instanceof Error &&
++        error.message === "idempotency_conflict"
++      )
++        send(409, { error: "idempotency_conflict" });
++      else send(502, { error: "operations_unavailable" });
++    }
++    return true;
++  }
++  close() {
++    this.claims.clear();
++    this.sessions.clear();
++  }
++}
+--- /dev/null
++++ b/apps/gateway/src/operations-orca.ts
+@@ -0,0 +1,98 @@
++import { z } from "zod";
++import {
++  runOrca,
++  operationArguments,
++  parseOrcaOperation,
++  parseOrcaOperationsReceipt,
++  parseOrcaReceipt,
++  assertSuccessfulReceipt,
++  type OrcaOperation,
++  type OrcaOperationsReceiptKind,
++} from "@orca-hq/orca-adapter";
++
++type Operation = Extract<OrcaOperation, { kind: OrcaOperationsReceiptKind }>;
++export interface OperationsOrcaPort {
++  execute(operation: Operation): Promise<unknown>;
++}
++/** Public process boundary: no ambient terminal/env authority and four bounded concurrent reads. */
++export class OperationsOrca implements OperationsOrcaPort {
++  private active = 0;
++  private waiting: Array<() => void> = [];
++  constructor(
++    private readonly options: {
++      executablePath: string;
++      signal: AbortSignal;
++      run?: typeof runOrca;
++    },
++  ) {}
++  async execute(input: Operation): Promise<unknown> {
++    const op = parseOrcaOperation(input);
++    if (this.active >= 4) await new Promise<void>((r) => this.waiting.push(r));
++    else this.active++;
++    try {
++      const control = [
++        "operations_dispatch",
++        "operations_reply",
++        "operations_send",
++        "operations_stop",
++        "operations_retain",
++        "operations_release",
++      ].includes(op.kind);
++      const raw = await (this.options.run ?? runOrca)(operationArguments(op), {
++        executablePath: this.options.executablePath,
++        signal: this.options.signal,
++        timeoutMs: control ? 75000 : 10000,
++        terminationGraceMs: 250,
++        maxOutputBytes: 2097152,
++        connectionTarget: { kind: "local" },
++      });
++      if (Buffer.byteLength(JSON.stringify(raw)) > 2097152)
++        throw Error("output_overflow");
++      const base = parseOrcaReceipt(raw);
++      assertSuccessfulReceipt(base);
++      const parsed = parseOrcaOperationsReceipt(input.kind, base);
++      const result = z.record(z.unknown()).parse(parsed.result);
++      const same = (a: unknown, b: unknown) => {
++        if (a !== b) throw Error("receipt_identity_mismatch");
++      };
++      if ("dispatchId" in op && result.dispatchId !== undefined)
++        same(result.dispatchId, op.dispatchId);
++      if (op.kind === "operations_show_worker") {
++        for (const key of ["dispatch", "worker", "projection"]) {
++          const row = z.record(z.unknown()).parse(result[key]);
++          same(key === "dispatch" ? row.id : row.dispatchId, op.dispatchId);
++        }
++      }
++      if (op.kind === "operations_dispatch") {
++        same(result.taskId, op.taskId);
++        if (op.runId) same(result.runId, op.runId);
++      }
++      if (op.kind === "operations_reply") {
++        const m = z.record(z.unknown()).parse(result.message);
++        same(m.thread_id, op.messageId);
++        if (result.question) {
++          const q = z.record(z.unknown()).parse(result.question);
++          same(q.message_id, op.messageId);
++          same(q.answer_message_id, m.id);
++        }
++      }
++      if (op.kind === "operations_send")
++        same(
++          z.record(z.unknown()).parse(result.message).to_handle,
++          `dispatch:${op.dispatchId}`,
++        );
++      if ("retryRequestId" in op && result.mutation !== undefined)
++        same(
++          z.record(z.unknown()).parse(result.mutation).requestId,
++          op.retryRequestId,
++        );
++      if (op.kind === "operations_worker_read" && result.source !== op.source)
++        throw Error("source_changed");
++      return parsed;
++    } finally {
++      const next = this.waiting.shift();
++      if (next) next();
++      else this.active--;
++    }
++  }
++}
+--- /dev/null
++++ b/apps/gateway/src/operations-projections.ts
+@@ -0,0 +1,142 @@
++import { z } from "zod";
++import { redactRelayText } from "./orca-relay.js";
++import { redactPublicText } from "@orca-hq/core";
++export const Cursor = z.string().min(1).max(2048);
++export const Id = z.string().min(1).max(512);
++export const State = z.string().trim().min(1).max(512);
++export const Terminal = z
++  .object({
++    handle: Id,
++    ptyId: Id.optional(),
++    incarnationId: Id,
++    connected: z.boolean(),
++    writable: z.boolean(),
++    executionHostId: Id,
++    worktreeId: Id,
++    orphaned: z.boolean().optional(),
++  })
++  .passthrough();
++export const Run = z
++  .object({
++    id: Id,
++    objective: z.string(),
++    coordinator_handle: Id.optional(),
++    consumer_generation: z.number().int().positive().optional(),
++  })
++  .passthrough();
++export const Task = z
++  .object({
++    id: Id,
++    status: State,
++    run_id: Id.optional(),
++    created_by_terminal_handle: Id.optional(),
++    created_by_process_incarnation: Id.optional(),
++    created_by_run_generation: z.number().int().optional(),
++  })
++  .passthrough();
++export const Worker = z
++  .object({
++    dispatch: z
++      .object({
++        id: Id,
++        runId: Id,
++        taskId: Id,
++        status: State,
++        processIncarnation: Id.nullable().optional(),
++      })
++      .passthrough(),
++    worker: z
++      .object({
++        dispatchId: Id,
++        state: State,
++        stage: State,
++        agentTerminalHandle: Id.nullable(),
++      })
++      .passthrough(),
++    projection: z
++      .object({
++        dispatchId: Id,
++        taskId: Id,
++        runId: Id,
++        liveness: z.object({ verdict: State }).passthrough(),
++        outcome: State.optional(),
++        resource: z
++          .object({
++            state: State,
++            ownerDispatchId: Id.nullable().optional(),
++            releaseState: State,
++          })
++          .passthrough()
++          .optional(),
++      })
++      .passthrough(),
++    observation: z
++      .object({ status: State, exactWorker: z.boolean() })
++      .passthrough(),
++    terminal: Terminal.nullable(),
++    terminalResource: z
++      .object({
++        id: Id,
++        ownershipState: State,
++        releaseState: State,
++        ownerDispatchId: Id.nullable().optional(),
++        terminalHandle: Id.optional(),
++        endpointIncarnation: Id.optional(),
++      })
++      .passthrough(),
++  })
++  .passthrough();
++export const Message = z
++  .object({
++    id: Id,
++    type: State,
++    subject: z.string(),
++    body: z.string(),
++    run_id: Id.nullable().optional(),
++    from_handle: Id.optional(),
++    to_handle: Id.optional(),
++    created_at: z.string().optional(),
++    question: z.object({ status: State }).passthrough().optional(),
++  })
++  .passthrough();
++/** Sanitize all nested public strings and strip credential/command-bearing fields before serialization. */
++export function publicValue(value: unknown, depth = 0): unknown {
++  if (depth > 24) return "[depth_limit]";
++  if (typeof value === "string")
++    return redactPublicText(redactRelayText(value));
++  if (Array.isArray(value)) return value.map((v) => publicValue(v, depth + 1));
++  if (value && typeof value === "object")
++    return Object.fromEntries(
++      Object.entries(value)
++        .filter(
++          ([k]) =>
++            !/(?:^|_)(?:token|secret|password|cookie|csrf|authorization|argv|environment|capability)(?:$|_)/i.test(
++              k,
++            ) &&
++            ![
++              "dispatchCapability",
++              "dispatchCapabilityToken",
++              "startOptions",
++            ].includes(k),
++        )
++        .map(([k, v]) => [k, publicValue(v, depth + 1)]),
++    );
++  return value;
++}
++export function evidence(source: "hq_store" | "orca_cli", command?: string) {
++  return {
++    source,
++    observedAt: new Date().toISOString(),
++    verification: "observed" as const,
++    ...(command ? { command } : {}),
++  };
++}
++export const Receipt = z.object({
++  id: Id,
++  ok: z.literal(true),
++  result: z.unknown(),
++  _meta: z
++    .object({ runtimeId: Id.nullable().optional() })
++    .passthrough()
++    .optional(),
++});
+--- a/apps/gateway/src/managed-control.ts
++++ b/apps/gateway/src/managed-control.ts
+@@ -78,6 +78,7 @@
+ export async function startManagedControl(options: {
+   socketPath: string;
+   execute(input: ManagedCommandInput): Promise<ManagedCommandResult>;
++  operations?: { issueClaim(): { url: string; expiresAt: string } };
+   progress?: {
+     handle(req: IncomingMessage, res: ServerResponse): Promise<boolean>;
+     close(): void;
+@@ -92,6 +93,16 @@
+     if (!accepting) {
+       res.writeHead(503);
+       res.end("{}");
++      return;
++    }
++    if (req.method === "POST" && req.url === "/v1/operations/session") {
++      if (!options.operations) { res.writeHead(503); res.end('{"error":"operations_unavailable"}'); return; }
++      try {
++        let body = "";
++        for await (const chunk of req) { body += String(chunk); if (Buffer.byteLength(body) > 16384) { res.writeHead(413); res.end("{}"); return; } }
++        z.object({}).strict().parse(JSON.parse(body || "{}"));
++        res.writeHead(200); res.end(JSON.stringify(options.operations.issueClaim()));
++      } catch { res.writeHead(400); res.end("{}"); }
+       return;
+     }
+     if (options.progress && (await options.progress.handle(req, res))) return;
+--- a/apps/gateway/src/managed-service.ts
++++ b/apps/gateway/src/managed-service.ts
+@@ -1,3 +1,6 @@
++import { OperationsJournal } from "./operations-journal.js";
++import { OperationsService, type OperationsServiceOptions } from "./operations-service.js";
++import { OperationsHttp } from "./operations-http.js";
+ import { createServer } from "node:http";
+ import type { createProgressControl } from "./progress-control.js";
+ import { chmod } from "node:fs/promises";
+@@ -24,6 +27,7 @@
+   execute(input: ManagedCommandInput): Promise<ManagedCommandResult>;
+   channelFactory: LocalChannelFactory;
+   getJob(id: string): CommandJob | undefined;
++  operations?: Omit<OperationsServiceOptions, "journal">;
+   progress?: ReturnType<typeof createProgressControl>;
+   beforeReady?: () => Promise<void>;
+   initialCursors?: Partial<Record<"slack" | "telegram", string | number>>;
+@@ -33,6 +37,9 @@
+   const db = openDatabase(options.databasePath);
+   await chmod(options.databasePath, 0o600);
+   const inbox = new LocalTextStore(db);
++  const operationsJournal = options.operations ? new OperationsJournal(db) : undefined;
++  const operationsService = options.operations && operationsJournal ? new OperationsService({ ...options.operations, journal: operationsJournal }) : undefined;
++  const operationsHttp = operationsService ? new OperationsHttp({ route: (method, url, body, key) => operationsService.route(method, url, body, key) }) : undefined;
+   for (const channel of ["slack", "telegram"] as const) {
+     const cursor = options.initialCursors?.[channel];
+     if (cursor !== undefined && inbox.loadCursor(channel) === undefined)
+@@ -306,7 +313,8 @@
+         active = undefined;
+       });
+   }
+-  const server = createServer((req, res) => {
++  const server = createServer(async (req, res) => {
++    if (operationsHttp && await operationsHttp.handle(req, res)) return;
+     const status = channels.status();
+     res.setHeader("Cache-Control", "no-store");
+     if (req.method === "GET" && req.url === "/health") {
+@@ -350,6 +358,8 @@
+     await serial;
+     if (server.listening)
+       await new Promise<void>((resolve) => server.close(() => resolve()));
++    operationsHttp?.close();
++    await operationsJournal?.idle();
+     db.close();
+   }
+   try {
+@@ -360,10 +370,13 @@
+         resolve();
+       });
+     });
++    const operationsAddress = server.address();
++    if (operationsAddress && typeof operationsAddress !== "string") operationsHttp?.setOrigin(`http://127.0.0.1:${operationsAddress.port}`);
+     await options.beforeReady?.();
+     control = await startManagedControl({
+       socketPath: join(options.directory, "control.sock"),
+       execute: executeOnce,
++      ...(operationsHttp ? { operations: operationsHttp } : {}),
+       ...(options.progress ? { progress: options.progress } : {}),
+     });
+     inbox.recover();
+--- a/apps/gateway/src/managed-runtime.ts
++++ b/apps/gateway/src/managed-runtime.ts
+@@ -1,3 +1,5 @@
++import { OperationsOrca } from "./operations-orca.js";
++import { selectOrcaCliExecutable } from "./managed-projects.js";
+ import { createHash } from "node:crypto";
+ import type { ManagedCommandInput, CommandProject } from "./managed-commands.js";
+ import type { ProgressStore } from "./progress-store.js";
+@@ -132,6 +134,12 @@
+     retentionPolicy: native?.retentionPolicy ?? "retain",
+     profiles: native?.roleProfiles ?? defaultNativeRoleProfiles
+   };
++}
++
++export function resolveOperationsCapacity(config: Pick<PilotConfig, "nativeExecution">, env: Readonly<Partial<Record<"HQ_MAX_ACTIVE_WORKERS", string>>>) {
++  const { maxActiveWorkers: limit } = resolveNativeExecutionSettings(config, env);
++  const source = config.nativeExecution?.maxActiveWorkers !== undefined ? "config" as const : env.HQ_MAX_ACTIVE_WORKERS?.trim() ? "environment" as const : "default" as const;
++  return { limit, source };
+ }
+ 
+ /** Native composition shared by installed channels and isolated integration fixtures. */
+@@ -386,6 +394,8 @@
+   progress = composition.progress;
+   native = composition.native;
+   const progressControl = createProgressControl(progress);
++  const operationsAbort = new AbortController();
++  const operationsOrca = new OperationsOrca({ executablePath: selectOrcaCliExecutable(), signal: operationsAbort.signal });
+   try {
+     await catalog.list();
+     const previous = openDatabase(config.databasePath);
+@@ -420,6 +430,12 @@
+       initialCursors,
+       owner,
+       progress: progressControl,
++      operations: {
++        store: progressStore,
++        submit: input => progress!.submit(input),
++        orca: operationsOrca,
++        capacity: { ...resolveOperationsCapacity(config, process.env), snapshot: () => admission.snapshot(), attempts: () => admission.listAttempts() }
++      },
+       beforeReady: async () => {
+         await engine.start();
+         await native!.start();
+@@ -440,6 +456,7 @@
+     });
+     return {
+       async stop() {
++        operationsAbort.abort();
+         await Promise.all([client.close(), routerClient.close()]);
+         await native?.close();
+         await progress?.close();
+@@ -450,6 +467,7 @@
+       },
+     };
+   } catch (e) {
++    operationsAbort.abort();
+     await Promise.all([client.close(), routerClient.close()]);
+     await native?.close();
+     await progress?.close();
+--- /dev/null
++++ b/apps/gateway/test/operations-journal.test.ts
+@@ -0,0 +1,75 @@
++import { describe, expect, it } from "vitest";
++import { openDatabase } from "@orca-hq/persistence";
++import { OperationsJournal } from "../src/operations-journal.js";
++
++describe("operations durable intent", () => {
++  it("serializes concurrent duplicates and rejects changed identity before effect", async () => {
++    const db = openDatabase(":memory:");
++    const journal = new OperationsJournal(db);
++    let effects = 0;
++    const input = {
++      requestId: "req",
++      action: "reply",
++      targetId: "msg",
++      input: { body: "private text" },
++    };
++    const effect = async () => {
++      effects++;
++      await Promise.resolve();
++      return { state: "accepted" as const };
++    };
++    const [a, b] = await Promise.all([
++      journal.execute(input, effect),
++      journal.execute(input, effect),
++    ]);
++    expect(a).toEqual(b);
++    expect(effects).toBe(1);
++    await expect(
++      journal.execute({ ...input, targetId: "other" }, effect),
++    ).rejects.toThrow("idempotency_conflict");
++    expect(effects).toBe(1);
++    expect(
++      JSON.stringify(
++        db.prepare("SELECT * FROM operations_mutation_receipts").all(),
++      ),
++    ).not.toContain("private text");
++    db.close();
++  });
++  it("persists ambiguous effects and interrupted intents as unknown across restart", async () => {
++    const db = openDatabase(":memory:");
++    const journal = new OperationsJournal(db);
++    const input = {
++      requestId: "req",
++      action: "stop",
++      targetId: "dispatch",
++      input: {},
++    };
++    expect(
++      (
++        await journal.execute(input, async () => {
++          throw Error("token=secret timeout");
++        })
++      ).state,
++    ).toBe("unknown");
++    db.prepare(
++      "UPDATE operations_mutation_receipts SET state='prepared' WHERE request_id='req'",
++    ).run();
++    const restarted = new OperationsJournal(db);
++    let calls = 0;
++    expect(
++      (
++        await restarted.execute(input, async () => {
++          calls++;
++          return { state: "accepted" };
++        })
++      ).state,
++    ).toBe("unknown");
++    expect(calls).toBe(0);
++    expect(
++      JSON.stringify(
++        db.prepare("SELECT * FROM operations_mutation_receipts").all(),
++      ),
++    ).not.toContain("secret");
++    db.close();
++  });
++});
+--- /dev/null
++++ b/apps/gateway/test/operations-service.test.ts
+@@ -0,0 +1,1038 @@
++import { it, expect, vi } from "vitest";
++import { openDatabase } from "@orca-hq/persistence";
++import { SqliteProgressStore } from "../src/progress-store.js";
++import { OperationsJournal } from "../src/operations-journal.js";
++import { OperationsService } from "../src/operations-service.js";
++const terminal = {
++  handle: "term",
++  ptyId: "pty",
++  incarnationId: "inc",
++  connected: true,
++  writable: true,
++  worktreeId: "wt",
++  executionHostId: "local",
++};
++const worker = () => ({
++  dispatch: {
++    id: "d",
++    taskId: "task",
++    runId: "run",
++    status: "dispatched",
++    processIncarnation: "pty:inc",
++  },
++  worker: {
++    dispatchId: "d",
++    state: "ready",
++    stage: "input_accepted",
++    agentTerminalHandle: "term",
++  },
++  projection: {
++    dispatchId: "d",
++    taskId: "task",
++    runId: "run",
++    outcome: "in_progress",
++    stage: { worker: "ready", dispatch: "dispatched" },
++    liveness: { verdict: "live" },
++    resource: {
++      state: "owned",
++      ownerDispatchId: "d",
++      releaseState: "not_requested",
++    },
++  },
++  observation: { status: "live", exactWorker: true },
++  terminal: { ...terminal },
++  terminalResource: {
++    id: "res",
++    ownershipState: "owned",
++    releaseState: "not_requested",
++    ownerDispatchId: "d",
++    terminalHandle: "term",
++    endpointIncarnation: "pty:inc",
++  },
++});
++function fixture() {
++  const db = openDatabase(":memory:"),
++    store = new SqliteProgressStore(openDatabase(":memory:"), {
++      databasePath: ":memory:",
++      ownerKey: "local",
++    });
++  let w = worker();
++  const effects: unknown[] = [];
++  const execute = vi.fn(async (op: any) => {
++    let result: unknown;
++    switch (op.kind) {
++      case "operations_show_worker":
++        result = w;
++        break;
++      case "show_run":
++        result = {
++          run: {
++            id: "run",
++            objective: "work",
++            coordinator_handle: "owner",
++            consumer_generation: 1,
++          },
++        };
++        break;
++      case "show_terminal":
++        result = {
++          terminal:
++            op.terminalHandle === "owner"
++              ? {
++                  ...terminal,
++                  handle: "owner",
++                  ptyId: "ownerpty",
++                  incarnationId: "ownerinc",
++                }
++              : terminal,
++        };
++        break;
++      case "list_tasks":
++        result = {
++          runId: "run",
++          tasks: [
++            {
++              id: "task",
++              run_id: "run",
++              status: "pending",
++              created_by_terminal_handle: "owner",
++              created_by_process_incarnation: "ownerpty:ownerinc",
++              created_by_run_generation: 1,
++            },
++          ],
++        };
++        break;
++      case "operations_inbox":
++        result = {
++          messages: [
++            {
++              id: "q",
++              type: "question",
++              subject: "?",
++              body: "hi",
++              run_id: "run",
++              to_handle: "run:run",
++            },
++          ],
++          count: 1,
++        };
++        break;
++      case "operations_status":
++        result = {
++          runtime: {
++            state: "ready",
++            reachable: true,
++            appVersion: "1.4.203",
++            capabilities: [
++              "orchestration.contract.v1",
++              "orchestration.worker-stop-verdict.v1",
++            ],
++          },
++        };
++        break;
++      default:
++        effects.push(op);
++        result = { dispatchId: "d", state: "accepted", verdict: "accepted" };
++    }
++    return { id: "r", ok: true, result, _meta: { runtimeId: "runtime" } };
++  });
++  const submit = vi.fn(async () => ({ accepted: true }));
++  const service = new OperationsService({
++    store,
++    journal: new OperationsJournal(db),
++    orca: { execute },
++    submit,
++    capacity: {
++      limit: 10,
++      source: "default",
++      snapshot: () => ({ active: 2, queued: 1 }),
++      attempts: () => [{ state: "unknown" }, { state: "active" }],
++    },
++  });
++  return {
++    service,
++    store,
++    db,
++    effects,
++    execute,
++    submit,
++    get w() {
++      return w;
++    },
++    close() {
++      db.close();
++      store.close();
++    },
++  };
++}
++it("reads HQ snapshots without touching a held watch lease and reports HQ-only capacity", async () => {
++  const f = fixture();
++  try {
++    f.store.createContext({
++      contextId: "ctx",
++      originSessionId: "s",
++      objective: "work",
++      title: "secret token=abc",
++      summary: "hello",
++      projectIds: [],
++    });
++    const lease = f.store.acquireViewerLease({
++      contextId: "ctx",
++      viewerInstanceId: "watch",
++    });
++    const acquire = vi.spyOn(f.store, "acquireViewerLease"),
++      release = vi.spyOn(f.store, "releaseViewerLease");
++    expect(f.service.contexts().contexts).toHaveLength(1);
++    expect(f.service.events({ after: 0, contextId: "ctx" }).compacted).toBe(
++      false,
++    );
++    const status = await f.service.status();
++    expect(status.hq.capacity).toMatchObject({
++      active: 2,
++      queued: 1,
++      limit: 10,
++      source: "default",
++      byState: { unknown: 1, active: 1 },
++      updateSupported: false,
++    });
++    expect(status.metrics.tokens.available).toBe(false);
++    expect(
++      f.store.heartbeatViewerLease({
++        contextId: "ctx",
++        viewerInstanceId: "watch",
++        leaseToken: lease.leaseToken!,
++      }),
++    ).toEqual({ ok: true });
++    expect(acquire).not.toHaveBeenCalled();
++    expect(release).not.toHaveBeenCalled();
++  } finally {
++    f.close();
++  }
++});
++it.each([
++  "unknown",
++  "unverifiable",
++  "release_pending",
++  "release_unknown",
++  "transferred",
++])("rejects %s liveness before a stop effect", async (state) => {
++  const f = fixture();
++  try {
++    f.w.projection.liveness.verdict = state;
++    const r = await f.service.mutate(
++      "stop",
++      "d",
++      { runId: "run", expectedIncarnation: "inc" },
++      "req",
++    );
++    expect(r.state).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("uses trusted sender and explicit run for live followup and rejects changed incarnation", async () => {
++  const f = fixture();
++  try {
++    expect(
++      (
++        await f.service.mutate(
++          "followup",
++          "d",
++          { runId: "run", expectedIncarnation: "other", body: "hi" },
++          "bad",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(
++      (
++        await f.service.mutate(
++          "followup",
++          "d",
++          { runId: "run", expectedIncarnation: "inc", body: "hi" },
++          "good",
++        )
++      ).state,
++    ).toBe("accepted");
++    expect(f.effects).toEqual([
++      {
++        kind: "operations_send",
++        dispatchId: "d",
++        body: "hi",
++        senderHandle: "owner",
++        runId: "run",
++        retryRequestId: "good",
++      },
++    ]);
++  } finally {
++    f.close();
++  }
++});
++it("requires fresh question and pending same-run task, and refuses unsafe release", async () => {
++  const f = fixture();
++  try {
++    expect(
++      (
++        await f.service.mutate(
++          "reply",
++          "absent",
++          { runId: "run", body: "hi" },
++          "absent",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(
++      (
++        await f.service.mutate(
++          "reply",
++          "q",
++          { runId: "run", body: "hi" },
++          "reply",
++        )
++      ).state,
++    ).toBe("accepted");
++    expect(
++      (
++        await f.service.mutate(
++          "dispatch",
++          "task",
++          { runId: "run", terminalHandle: "term", expectedIncarnation: "inc" },
++          "dispatch",
++        )
++      ).state,
++    ).toBe("accepted");
++    expect(
++      (
++        await f.service.mutate(
++          "release",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "release",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(2);
++  } finally {
++    f.close();
++  }
++});
++
++it("rejects lifecycle controls when capability or runtime identity is unproven", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) =>
++      op.kind === "operations_status"
++        ? {
++            id: "r",
++            ok: true,
++            result: {
++              runtime: {
++                state: "ready",
++                reachable: true,
++                appVersion: "1.4.203",
++                capabilities: [],
++              },
++            },
++            _meta: { runtimeId: "runtime" },
++          }
++        : original(op),
++    );
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("returns a durable unknown if a successful process reports an ambiguous verdict", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) =>
++      op.kind === "operations_stop"
++        ? {
++            id: "r",
++            ok: true,
++            result: {
++              dispatchId: "d",
++              state: "release_unknown",
++              verdict: "unknown",
++            },
++            _meta: { runtimeId: "runtime" },
++          }
++        : original(op),
++    );
++    const a = await f.service.mutate(
++      "stop",
++      "d",
++      { runId: "run", expectedIncarnation: "inc" },
++      "req",
++    );
++    const b = await f.service.mutate(
++      "stop",
++      "d",
++      { runId: "run", expectedIncarnation: "inc" },
++      "req",
++    );
++    expect(a.state).toBe("unknown");
++    expect(a).toEqual(b);
++    expect(
++      f.execute.mock.calls.filter(([op]) => op.kind === "operations_stop"),
++    ).toHaveLength(1);
++  } finally {
++    f.close();
++  }
++});
++it("paginates contexts without losing records after the first hundred", () => {
++  const f = fixture();
++  try {
++    for (let i = 0; i < 101; i++)
++      f.store.createContext({
++        contextId: `ctx${i}`,
++        originSessionId: "s",
++        title: "t",
++        objective: "work",
++      });
++    const first = f.service.contexts(),
++      second = f.service.contexts(undefined, first.cursor);
++    expect(first.contexts).toHaveLength(100);
++    expect(second.contexts).toHaveLength(1);
++  } finally {
++    f.close();
++  }
++});
++it("routes stored native questions through the existing HQ answer submission", async () => {
++  const f = fixture();
++  try {
++    f.store.acceptRequest({ requestId: "hqreq", sessionId: "s", text: "work" });
++    f.store.nativeJournal().put("question", "q", {
++      id: "q",
++      attemptId: "a",
++      type: "question",
++      body: "question",
++    });
++    f.store.appendEvent({
++      eventKey: "qevent",
++      requestId: "hqreq",
++      contextId: null,
++      kind: "clarification.required",
++      source: "orca",
++      payload: { text: "question", messageId: "q" },
++    });
++    expect(
++      (
++        await f.service.mutate(
++          "reply",
++          "q",
++          { runId: "run", body: "answer" },
++          "answer",
++        )
++      ).state,
++    ).toBe("accepted");
++    expect(f.submit).toHaveBeenCalledWith({
++      requestId: "answer",
++      sessionId: "s",
++      text: "/answer q answer",
++    });
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("fences a runtime replacement observed during authorization", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) => {
++      const r = await original(op);
++      return op.kind === "show_terminal"
++        ? { ...r, _meta: { runtimeId: "replacement" } }
++        : r;
++    });
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("permits exact settled retained resource release and accepts only known effect verdicts", async () => {
++  const f = fixture();
++  try {
++    f.w.projection.outcome = "succeeded";
++    f.w.dispatch.status = "completed";
++    f.w.projection.liveness.verdict = "exited";
++    f.w.terminalResource.releaseState = "retained";
++    expect(
++      (
++        await f.service.mutate(
++          "release",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("accepted");
++  } finally {
++    f.close();
++  }
++});
++it("rejects native sender failures and leaves unrecognized effect states unknown", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) => {
++      if (op.kind === "operations_stop")
++        throw Object.assign(Error("rejected"), {
++          code: "orca_command_failed",
++          orcaCode: "no_active_sender_terminal",
++        });
++      return original(op);
++    });
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    f.execute.mockImplementation(async (op) =>
++      op.kind === "operations_stop"
++        ? {
++            id: "r",
++            ok: true,
++            result: {
++              dispatchId: "d",
++              state: "surprising",
++              verdict: "surprising",
++            },
++            _meta: { runtimeId: "runtime" },
++          }
++        : original(op),
++    );
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "other",
++        )
++      ).state,
++    ).toBe("unknown");
++  } finally {
++    f.close();
++  }
++});
++it("redacts nested public secrets and does not synthesize Run status", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) =>
++      op.kind === "list_runs"
++        ? {
++            id: "r",
++            ok: true,
++            result: {
++              runs: [
++                {
++                  id: "run",
++                  objective: "xoxb-12345-abcdef token=private",
++                  secret: "must-not-leak",
++                },
++              ],
++              nextCursor: null,
++            },
++            _meta: { runtimeId: "runtime" },
++          }
++        : original(op),
++    );
++    const page = await f.service.runs();
++    expect(JSON.stringify(page)).not.toContain("xoxb-12345-abcdef");
++    expect(JSON.stringify(page)).not.toContain("private");
++    expect(JSON.stringify(page)).not.toContain("must-not-leak");
++    expect((page as any).runs[0]).not.toHaveProperty("status");
++  } finally {
++    f.close();
++  }
++});
++it("pages clarification events and preserves compaction sequence evidence and receipt-only links", () => {
++  const f = fixture();
++  try {
++    f.store.acceptRequest({ requestId: "r", sessionId: "s", text: "work" });
++    f.store.updateRequest({ requestId: "r", state: "awaiting_input" });
++    for (let i = 0; i < 3; i++)
++      f.store.appendEvent({
++        eventKey: `q${i}`,
++        requestId: "r",
++        contextId: null,
++        kind: "clarification.required",
++        source: "hq",
++        payload: {
++          text: `question ${i}`,
++          runId: "run",
++          taskId: "task",
++          dispatchId: "d",
++          terminalHandle: "term",
++        },
++      });
++    const page = f.service.questions(0, 2);
++    expect(page.questions).toHaveLength(1);
++    expect(f.service.questions(Number(page.cursor), 2).questions).toHaveLength(
++      2,
++    );
++    expect(
++      f.service
++        .events({ after: 0, limit: 4 })
++        .events.every((e) => e.receiptLink === undefined),
++    ).toBe(true);
++  } finally {
++    f.close();
++  }
++});
++it("turns public source_changed into a conflict instead of an empty log page", async () => {
++  const f = fixture();
++  try {
++    f.execute.mockRejectedValue(
++      Object.assign(Error("changed"), { orcaCode: "source_changed" }),
++    );
++    await expect(f.service.output("d", "terminal")).rejects.toMatchObject({
++      status: 409,
++      code: "source_changed",
++    });
++  } finally {
++    f.close();
++  }
++});
++it("rejects unregistered route suffixes and request identity collisions", async () => {
++  const f = fixture();
++  try {
++    await expect(
++      f.service.route(
++        "GET",
++        new URL("http://127.0.0.1/api/operations/orca/workers/d/not-a-route"),
++        undefined,
++      ),
++    ).rejects.toMatchObject({ status: 404 });
++    await expect(
++      f.service.submit(
++        { requestId: "body", sessionId: "s", text: "work" },
++        "header",
++      ),
++    ).rejects.toMatchObject({ status: 409 });
++    expect(f.submit).not.toHaveBeenCalled();
++  } finally {
++    f.close();
++  }
++});
++it("does not authorize a replacement coordinator process from handle alone", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    f.execute.mockImplementation(async (op) =>
++      op.kind === "show_terminal" && op.terminalHandle === "owner"
++        ? {
++            id: "r",
++            ok: true,
++            result: {
++              terminal: {
++                ...terminal,
++                handle: "owner",
++                ptyId: "ownerpty",
++                incarnationId: "replacement",
++              },
++            },
++            _meta: { runtimeId: "runtime" },
++          }
++        : original(op),
++    );
++    expect(
++      (
++        await f.service.mutate(
++          "reply",
++          "q",
++          { runId: "run", body: "answer" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("rechecks target liveness immediately after sender proof before issuing control", async () => {
++  const f = fixture();
++  try {
++    const original = f.execute.getMockImplementation()!;
++    let reads = 0;
++    f.execute.mockImplementation(async (op) => {
++      if (op.kind === "operations_show_worker" && ++reads === 2)
++        f.w.observation.status = "unverifiable";
++      return original(op);
++    });
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("preserves host omission and terminal inventory scope without inventing coverage", async () => {
++  const f = fixture();
++  try {
++    f.execute.mockImplementation(async (op) => {
++      const results: Record<string, unknown> = {
++        operations_list_projects: {
++          projects: [{ id: "p", displayName: "project", kind: "repo" }],
++        },
++        list_project_setups: {
++          setups: [
++            {
++              id: "setup",
++              projectId: "p",
++              repoId: "repo",
++              hostId: "remote",
++              path: "/workspace",
++            },
++          ],
++        },
++        list_worktrees: {
++          worktrees: [{ id: "wt", projectHostSetupId: "setup" }],
++          hostScope: { hostIds: ["local"], omittedHostIds: ["remote"] },
++          truncated: false,
++        },
++        list_terminals: {
++          terminals: [terminal],
++          hostScope: { hostIds: ["local"], omittedHostIds: ["remote"] },
++          truncated: false,
++        },
++      };
++      return {
++        id: "r",
++        ok: true,
++        result: results[op.kind],
++        _meta: { runtimeId: "runtime" },
++      };
++    });
++    const result = (await f.service.resources()) as any;
++    expect(result.projects[0].hostScope).toBe("not_covered");
++    expect(result.projects[0].setups[0].hostScope.omittedHostIds).toEqual([
++      "remote",
++    ]);
++    expect(result.projects[0].setups[0].worktrees[0].terminals[0].handle).toBe(
++      "term",
++    );
++  } finally {
++    f.close();
++  }
++});
++it("bounds inventory fanout with explicit uncovered evidence instead of unbounded reads", async () => {
++  const f = fixture();
++  try {
++    f.execute.mockImplementation(async (op) => ({
++      id: "r",
++      ok: true,
++      result:
++        op.kind === "operations_list_projects"
++          ? { projects: [{ id: "p" }] }
++          : op.kind === "list_project_setups"
++            ? {
++                setups: Array.from({ length: 100 }, (_, i) => ({
++                  id: `setup${i}`,
++                  projectId: "p",
++                  repoId: `repo${i}`,
++                  hostId: "local",
++                })),
++              }
++            : op.kind === "list_worktrees"
++              ? {
++                  worktrees: [
++                    {
++                      id: "wt",
++                      projectHostSetupId: `setup${String(op.repoId).slice(4)}`,
++                    },
++                  ],
++                  hostScope: { hostIds: ["local"], omittedHostIds: [] },
++                  truncated: false,
++                }
++              : {
++                  terminals: [terminal],
++                  hostScope: { hostIds: ["local"], omittedHostIds: [] },
++                  truncated: false,
++                },
++      _meta: { runtimeId: "runtime" },
++    }));
++    const result = await f.service.resources();
++    expect(f.execute.mock.calls.length).toBeLessThanOrEqual(100);
++    expect(JSON.stringify(result)).toContain("request_read_budget_exhausted");
++  } finally {
++    f.close();
++  }
++});
++it("keeps the server-owned source tag when a passthrough receipt carries another source", async () => {
++  const f = fixture();
++  try {
++    f.execute.mockResolvedValue({
++      id: "r",
++      ok: true,
++      result: { source: "hq", runs: [] },
++      _meta: { runtimeId: "runtime" },
++    });
++    expect((await f.service.runs()).source).toBe("orca");
++  } finally {
++    f.close();
++  }
++});
++it.each([
++  [
++    "wrong Dispatch",
++    (w: any) => {
++      w.dispatch.id = "other";
++    },
++  ],
++  [
++    "wrong task",
++    (w: any) => {
++      w.projection.taskId = "other";
++    },
++  ],
++  [
++    "wrong run",
++    (w: any) => {
++      w.dispatch.runId = "other";
++    },
++  ],
++  [
++    "inexact observation",
++    (w: any) => {
++      w.observation.exactWorker = false;
++    },
++  ],
++  [
++    "missing terminal",
++    (w: any) => {
++      w.terminal = null;
++    },
++  ],
++  [
++    "wrong resource owner",
++    (w: any) => {
++      w.terminalResource.ownerDispatchId = "other";
++    },
++  ],
++  [
++    "changed incarnation",
++    (w: any) => {
++      w.terminal.incarnationId = "other";
++    },
++  ],
++  [
++    "unverifiable PTY",
++    (w: any) => {
++      w.observation.status = "unverifiable";
++    },
++  ],
++  [
++    "disconnected terminal",
++    (w: any) => {
++      w.terminal.connected = false;
++    },
++  ],
++  [
++    "read-only terminal",
++    (w: any) => {
++      w.terminal.writable = false;
++    },
++  ],
++  [
++    "unknown resource release",
++    (w: any) => {
++      w.terminalResource.releaseState = "release_unknown";
++    },
++  ],
++  [
++    "unknown projected ownership",
++    (w: any) => {
++      w.projection.resource.state = "unexpected";
++    },
++  ],
++])("rejects %s before effect", async (_name, change) => {
++  const f = fixture();
++  try {
++    change(f.w);
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("records missing gate evidence as rejected when no effect has started", async () => {
++  const f = fixture();
++  try {
++    delete (f.w as any).projection;
++    expect(
++      (
++        await f.service.mutate(
++          "stop",
++          "d",
++          { runId: "run", expectedIncarnation: "inc" },
++          "req",
++        )
++      ).state,
++    ).toBe("rejected");
++    expect(f.effects).toHaveLength(0);
++  } finally {
++    f.close();
++  }
++});
++it("preserves stale-cursor compaction snapshots and links only complete ready receipts", () => {
++  const f = fixture();
++  try {
++    f.store.acceptRequest({ requestId: "r", sessionId: "s", text: "work" });
++    f.store.createContext({
++      contextId: "ctx",
++      originSessionId: "s",
++      title: "context",
++      objective: "work",
++    });
++    f.store.assignRequestContext({
++      requestId: "r",
++      partId: "p",
++      contextId: "ctx",
++      relation: "new",
++      instruction: "work",
++    });
++    const ready = f.store.appendEvent({
++      requestId: "r",
++      contextId: "ctx",
++      eventKey: "ready",
++      kind: "worker.ready",
++      source: "orca",
++      generation: 1,
++      payload: {
++        attemptId: "a",
++        worktreeId: "wt",
++        requested: { agent: "codex", model: "model", reason: "work" },
++        effective: { agent: "codex" },
++        runId: "run",
++        taskId: "task",
++        dispatchId: "d",
++        terminalHandle: "term",
++      },
++    });
++    expect(
++      f.service
++        .events({ after: 0, contextId: "ctx" })
++        .events.find((e) => e.seq === ready.seq)?.receiptLink,
++    ).toEqual({
++      runId: "run",
++      taskId: "task",
++      dispatchId: "d",
++      terminalHandle: "term",
++    });
++    f.store.appendEvent({
++      requestId: "r",
++      contextId: "ctx",
++      eventKey: "detail",
++      kind: "hq.progress",
++      source: "hq",
++      occurredAt: "2026-07-01T00:00:00.000Z",
++      payload: { text: "old" },
++    });
++    f.store.completeRequest({
++      requestId: "r",
++      eventKey: "complete",
++      state: "completed",
++      text: "done",
++      occurredAt: "2026-07-01T00:00:01.000Z",
++    });
++    f.store.pruneCompletedEvents("2026-08-01T00:00:00.000Z");
++    const page = f.service.events({ after: 0, contextId: "ctx" });
++    expect(page.compacted).toBe(true);
++    expect(page.snapshots[0]?.contextId).toBe("ctx");
++    expect(page.latestSeq).toBeGreaterThanOrEqual(ready.seq);
++  } finally {
++    f.close();
++  }
++});
++it("accepts the public 2048-character output cursor contract", async () => {
++  const f = fixture();
++  try {
++    f.execute.mockResolvedValue({
++      id: "r",
++      ok: true,
++      _meta: { runtimeId: "runtime" },
++      result: {
++        dispatchId: "d",
++        source: "terminal",
++        cursor: "c".repeat(1024),
++        archived: false,
++        warnings: [],
++        terminal: { lines: ["line"] },
++      },
++    });
++    const page = (await f.service.route(
++      "GET",
++      new URL(
++        "http://127.0.0.1/api/operations/orca/workers/d/output?source=terminal&cursor=" +
++          "c".repeat(1024),
++      ),
++      undefined,
++    )) as any;
++    expect(page.cursor).toHaveLength(1024);
++  } finally {
++    f.close();
++  }
++});
++it("enforces the raw 8000-character request bound before trimming", async () => {
++  const f = fixture();
++  try {
++    await expect(
++      f.service.submit(
++        { requestId: "r", sessionId: "s", text: " ".repeat(8000) + "x" },
++        "r",
++      ),
++    ).rejects.toBeDefined();
++    expect(f.submit).not.toHaveBeenCalled();
++  } finally {
++    f.close();
++  }
++});
+--- /dev/null
++++ b/apps/gateway/test/operations-http.test.ts
+@@ -0,0 +1,120 @@
++import { createServer, request } from "node:http";
++import { it, expect } from "vitest";
++import { OperationsHttp } from "../src/operations-http.js";
++it("fences peer, host, origin, single-use claim, session/CSRF and body size", async () => {
++  let now = 1000,
++    effects = 0;
++  const http = new OperationsHttp({
++    now: () => now,
++    route: async () => {
++      effects++;
++      return { ok: true };
++    },
++  });
++  const server = createServer((req, res) => {
++    void http.handle(req, res);
++  });
++  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
++  const port = (server.address() as { port: number }).port;
++  const origin = `http://127.0.0.1:${port}`;
++  http.setOrigin(origin);
++  const call = async (
++    path: string,
++    body?: unknown,
++    headers: Record<string, string> = {},
++  ) =>
++    fetch(origin + path, {
++      method: body === undefined ? "GET" : "POST",
++      headers: { origin, "content-type": "application/json", ...headers },
++      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
++    });
++  try {
++    expect(http.isLocal("10.0.0.1", `127.0.0.1:${port}`)).toBe(false);
++    expect((await call("/api/operations/status")).status).toBe(401);
++    expect(
++      await new Promise<number>((resolve) => {
++        const req = request(
++          origin + "/auth/local/claim",
++          { method: "POST", headers: { host: "evil", origin } },
++          (res) => {
++            res.resume();
++            resolve(res.statusCode!);
++          },
++        );
++        req.end("{}");
++      }),
++    ).toBe(403);
++    const claim = http.issueClaim();
++    const token = new URL(claim.url).hash.slice(7);
++    expect(
++      (
++        await call(
++          "/auth/local/claim",
++          { claim: token },
++          { origin: "http://evil" },
++        )
++      ).status,
++    ).toBe(403);
++    const result = await call("/auth/local/claim", { claim: token });
++    expect(result.status).toBe(200);
++    const cookie = result.headers.get("set-cookie")!;
++    expect(cookie).toContain("HttpOnly");
++    expect(cookie).toContain("SameSite=Strict");
++    const { csrf } = (await result.json()) as { csrf: string };
++    expect((await call("/auth/local/claim", { claim: token })).status).toBe(
++      401,
++    );
++    expect(
++      (await call("/api/operations/status", undefined, { cookie })).status,
++    ).toBe(200);
++    expect(
++      (
++        await call(
++          "/api/operations/hq/requests",
++          {},
++          { cookie, "idempotency-key": "req" },
++        )
++      ).status,
++    ).toBe(403);
++    expect(
++      (
++        await call(
++          "/api/operations/hq/requests",
++          {},
++          { cookie, "x-csrf-token": csrf, "idempotency-key": "req" },
++        )
++      ).status,
++    ).toBe(202);
++    expect(effects).toBe(2);
++    expect(
++      (
++        await call(
++          "/api/operations/hq/requests",
++          { text: "x".repeat(17000) },
++          { cookie, "x-csrf-token": csrf, "idempotency-key": "large" },
++        )
++      ).status,
++    ).toBe(413);
++    expect(
++      (await call("/auth/local/refresh", {}, { cookie, "x-csrf-token": csrf }))
++        .status,
++    ).toBe(200);
++    now += 1800001;
++    expect(
++      (await call("/api/operations/status", undefined, { cookie })).status,
++    ).toBe(401);
++    const expired = http.issueClaim();
++    now += 60001;
++    expect(
++      (
++        await call("/auth/local/claim", {
++          claim: new URL(expired.url).hash.slice(7),
++        })
++      ).status,
++    ).toBe(401);
++  } finally {
++    http.close();
++    server.closeAllConnections();
++    await new Promise<void>((r) => server.close(() => r()));
++  }
++});
+--- /dev/null
++++ b/apps/gateway/test/operations-orca.test.ts
+@@ -0,0 +1,65 @@
++import { it, expect } from "vitest";
++import { OperationsOrca } from "../src/operations-orca.js";
++it("bounds simultaneous reads to four and uses typed inbox, timeout and output budgets", async () => {
++  let active = 0,
++    max = 0;
++  const calls: Array<{
++    argv: readonly string[];
++    timeoutMs: number;
++    maxOutputBytes?: number;
++  }> = [];
++  const client = new OperationsOrca({
++    executablePath: "/fake/orca",
++    signal: new AbortController().signal,
++    run: async (argv, options) => {
++      active++;
++      max = Math.max(max, active);
++      calls.push({ argv, ...options });
++      await new Promise((r) => setTimeout(r, 5));
++      active--;
++      return {
++        id: "r",
++        ok: true,
++        result: { messages: [], count: 0 },
++        _meta: { runtimeId: "runtime" },
++      };
++    },
++  });
++  await Promise.all(
++    Array.from({ length: 9 }, () =>
++      client.execute({ kind: "operations_inbox", limit: 100 }),
++    ),
++  );
++  expect(max).toBe(4);
++  expect(
++    calls.every(
++      (c) =>
++        c.timeoutMs === 10000 &&
++        c.maxOutputBytes === 2097152 &&
++        c.argv.join(" ") === "orchestration inbox --limit 100",
++    ),
++  ).toBe(true);
++});
++it("rejects source and mutation identities that disagree with the requested operation", async () => {
++  const client = new OperationsOrca({
++    executablePath: "/fake",
++    signal: new AbortController().signal,
++    run: async () => ({
++      id: "r",
++      ok: true,
++      result: {
++        dispatchId: "different",
++        state: "stopped",
++        verdict: "stopped",
++        mutation: { requestId: "req", replayed: false },
++      },
++    }),
++  });
++  await expect(
++    client.execute({
++      kind: "operations_stop",
++      dispatchId: "d",
++      retryRequestId: "req",
++    }),
++  ).rejects.toThrow("receipt_identity_mismatch");
++});
+--- a/apps/gateway/test/managed-control.test.ts
++++ b/apps/gateway/test/managed-control.test.ts
+@@ -39,3 +39,41 @@
+   expect(received).toHaveLength(1);
+  }finally{await server.stop();await rm(dir,{recursive:true,force:true});}
+ });
++it("issues only typed owner-socket operations claims and rejects browser-selected authority", async () => {
++  const dir = await mkdtemp(join(tmpdir(), "hq-operations-claim-"));
++  let claims = 0;
++  const socketPath = join(dir, "control.sock");
++  const server = await startManagedControl({
++    socketPath,
++    execute: async () => ({ text: "ok" }),
++    operations: {
++      issueClaim: () => {
++        claims++;
++        return {
++          url: "http://127.0.0.1:4310/#claim=once",
++          expiresAt: "2026-09-15T00:00:00.000Z",
++        };
++      },
++    },
++  });
++  const claim = (body: unknown) =>
++    new Promise<number>((resolve) => {
++      const r = request(
++        { socketPath, path: "/v1/operations/session", method: "POST" },
++        (res) => {
++          res.resume();
++          resolve(res.statusCode!);
++        },
++      );
++      r.end(JSON.stringify(body));
++    });
++  try {
++    expect(await claim({ from: "term_arbitrary" })).toBe(400);
++    expect(claims).toBe(0);
++    expect(await claim({})).toBe(200);
++    expect(claims).toBe(1);
++  } finally {
++    await server.stop();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
+--- a/apps/gateway/test/managed-service.test.ts
++++ b/apps/gateway/test/managed-service.test.ts
+@@ -93,3 +93,103 @@
+   expect(seen.map(input=>input.conversationId)).toEqual(['["slack","owner","C1","thread1"]','["slack","owner","C1","thread1"]','["slack","owner","C1","thread2"]','["slack","owner","C2","thread1"]','["telegram","42","C1","thread1"]']);
+  }finally{await service.stop();await rm(dir,{recursive:true,force:true});}
+ });
++
++it("wires owner socket claims to the same loopback listener and journals real HQ route submissions", async () => {
++  const { request } = await import("node:http");
++  const { SqliteProgressStore } = await import("../src/progress-store.js");
++  const store = new SqliteProgressStore(openDatabase(":memory:"), {
++    databasePath: ":memory:",
++    ownerKey: "local",
++  });
++  const dir = await mkdtemp(join(tmpdir(), "operations-managed-"));
++  const submit = vi.fn(async () => ({ accepted: true }));
++  const service = await startManagedService({
++    directory: dir,
++    databasePath: join(dir, "control.sqlite"),
++    port: 0,
++    owner: { slackUserId: "x", telegramUserId: "y" },
++    execute: async () => ({ text: "ok" }),
++    getJob: () => undefined,
++    channelFactory: () => ({
++      start: async () => {},
++      stop: async () => {},
++      send: async () => {},
++      status: () => ({ slack: true, telegram: true }),
++    }),
++    operations: {
++      store,
++      submit,
++      orca: {
++        execute: async () => {
++          throw Error("unavailable");
++        },
++      },
++      capacity: {
++        limit: 10,
++        source: "default",
++        snapshot: () => ({ active: 0, queued: 0 }),
++        attempts: () => [],
++      },
++    },
++  });
++  try {
++    const claim = await new Promise<{ url: string }>((resolve) => {
++      const r = request(
++        {
++          socketPath: join(dir, "control.sock"),
++          path: "/v1/operations/session",
++          method: "POST",
++          headers: { "content-type": "application/json" },
++        },
++        (res) => {
++          let text = "";
++          res.on("data", (c) => (text += c));
++          res.on("end", () => resolve(JSON.parse(text)));
++        },
++      );
++      r.end("{}");
++    });
++    const url = new URL(claim.url),
++      origin = url.origin;
++    expect(origin).toBe(`http://127.0.0.1:${service.port}`);
++    const auth = await fetch(origin + "/auth/local/claim", {
++      method: "POST",
++      headers: { origin, "content-type": "application/json" },
++      body: JSON.stringify({ claim: url.hash.slice(7) }),
++    });
++    expect(auth.status).toBe(200);
++    const { csrf } = (await auth.json()) as { csrf: string };
++    const headers = {
++      origin,
++      "content-type": "application/json",
++      cookie: auth.headers.get("set-cookie")!,
++      "x-csrf-token": csrf,
++      "idempotency-key": "request",
++    };
++    for (let i = 0; i < 2; i++) {
++      const r = await fetch(origin + "/api/operations/hq/requests", {
++        method: "POST",
++        headers,
++        body: JSON.stringify({
++          requestId: "request",
++          sessionId: "s",
++          text: "work",
++        }),
++      });
++      expect(r.status).toBe(202);
++    }
++    expect(submit).toHaveBeenCalledTimes(1);
++    const db = openDatabase(join(dir, "control.sqlite"));
++    try {
++      expect(
++        db.prepare("SELECT state FROM operations_mutation_receipts").get(),
++      ).toEqual({ state: "accepted" });
++    } finally {
++      db.close();
++    }
++  } finally {
++    await service.stop();
++    store.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
+--- a/apps/gateway/test/managed-runtime.test.ts
++++ b/apps/gateway/test/managed-runtime.test.ts
+@@ -339,3 +339,27 @@
+     expect(admission.listAttempts().every(a => a.item.access === "read")).toBe(true);
+   } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
+ });
++
++describe("operations runtime capacity resolution", () => {
++  it.each([
++    [
++      { nativeExecution: { maxActiveWorkers: 3 } },
++      { HQ_MAX_ACTIVE_WORKERS: "7" },
++      3,
++      "config",
++    ],
++    [{}, { HQ_MAX_ACTIVE_WORKERS: "7" }, 7, "environment"],
++    [{}, {}, 10, "default"],
++  ])(
++    "exposes resolved limit and provenance without mutating admission",
++    async (config, env, limit, source) => {
++      const { resolveOperationsCapacity } = await import(
++        "../src/managed-runtime.js"
++      );
++      expect(resolveOperationsCapacity(config as any, env as any)).toEqual({
++        limit,
++        source,
++      });
++    },
++  );
++});
+--- a/packages/orca-adapter/src/capabilities.ts
++++ b/packages/orca-adapter/src/capabilities.ts
+@@ -52,10 +52,11 @@
+     kind: z.literal("release_worker"),
+     dispatchId: NonEmptyStringSchema
+   }).strict(),
++  z.object({ kind: z.literal("operations_show_worker"), dispatchId: OperationsIdSchema }).strict(),
+   z.object({ kind: z.literal("operations_status") }).strict(),
+-  z.object({ kind: z.literal("operations_dispatch"), taskId: OperationsIdSchema, terminalHandle: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
+-  z.object({ kind: z.literal("operations_reply"), messageId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
+-  z.object({ kind: z.literal("operations_send"), dispatchId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_dispatch"), senderHandle: OperationsIdSchema.optional(), runId: OperationsIdSchema.optional(), taskId: OperationsIdSchema, terminalHandle: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_reply"), senderHandle: OperationsIdSchema.optional(), runId: OperationsIdSchema.optional(), messageId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_send"), senderHandle: OperationsIdSchema.optional(), runId: OperationsIdSchema.optional(), dispatchId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
+   z.object({ kind: z.literal("operations_stop"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
+   z.object({ kind: z.literal("operations_retain"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
+   z.object({ kind: z.literal("operations_release"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
+@@ -153,10 +154,11 @@
+       return ["orchestration", "worker-stop", "--dispatch", operation.dispatchId];
+     case "release_worker":
+       return ["orchestration", "worker-release", "--dispatch", operation.dispatchId];
++    case "operations_show_worker": return ["orchestration", "worker-show", "--dispatch", operation.dispatchId];
+     case "operations_status": return ["status"];
+-    case "operations_dispatch": return ["orchestration", "dispatch", "--task", operation.taskId, "--to", operation.terminalHandle, "--retry-request", operation.retryRequestId];
+-    case "operations_reply": return ["orchestration", "reply", "--id", operation.messageId, "--body", operation.body, "--retry-request", operation.retryRequestId];
+-    case "operations_send": return ["orchestration", "send", "--subject", "HQ operator follow-up", "--to", `dispatch:${operation.dispatchId}`, "--type", "status", "--body", operation.body, "--retry-request", operation.retryRequestId];
++    case "operations_dispatch": return ["orchestration", "dispatch", "--task", operation.taskId, "--to", operation.terminalHandle, "--retry-request", operation.retryRequestId, ...(operation.senderHandle ? ["--from", operation.senderHandle] : []), ...(operation.runId ? ["--run", operation.runId] : [])];
++    case "operations_reply": return ["orchestration", "reply", "--id", operation.messageId, "--body", operation.body, "--retry-request", operation.retryRequestId, ...(operation.senderHandle ? ["--from", operation.senderHandle] : []), ...(operation.runId ? ["--run", operation.runId] : [])];
++    case "operations_send": return ["orchestration", "send", "--subject", "HQ operator follow-up", "--to", `dispatch:${operation.dispatchId}`, "--type", "status", "--body", operation.body, "--retry-request", operation.retryRequestId, ...(operation.senderHandle ? ["--from", operation.senderHandle] : []), ...(operation.runId ? ["--run", operation.runId] : [])];
+     case "operations_stop": return ["orchestration", "worker-stop", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
+     case "operations_retain": return ["orchestration", "worker-retain", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
+     case "operations_release": return ["orchestration", "worker-release", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
+--- a/packages/orca-adapter/src/index.ts
++++ b/packages/orca-adapter/src/index.ts
+@@ -224,6 +224,13 @@
+     throw new OrcaInvalidReceiptError();
+   }
+   switch (operation.kind) {
++    case "operations_show_worker": {
++      const dispatch = result.dispatch as { id: string };
++      const worker = result.worker as { dispatchId: string };
++      const projection = result.projection as { dispatchId: string };
++      if ([dispatch.id, worker.dispatchId, projection.dispatchId].some(id => id !== operation.dispatchId)) throw new OrcaInvalidReceiptError();
++      break;
++    }
+     case "operations_reply": {
+       const message = result.message as { id: string; thread_id: string };
+       const question = result.question as { message_id: string; answer_message_id: string } | null | undefined;
+@@ -280,3 +287,7 @@
+   type OrcaOperationsReceiptKind,
+   type OrcaReceipt
+ } from "./receipts.js";
++
++export { parseOrcaOperation, operationArguments } from "./capabilities.js";
++export { runOrca, type RunOrcaOptions } from "./process.js";
++export { parseOrcaReceipt, assertSuccessfulReceipt } from "./receipts.js";
+--- a/packages/orca-adapter/test/operations.test.ts
++++ b/packages/orca-adapter/test/operations.test.ts
+@@ -2,7 +2,7 @@
+ 
+ import { describe, expect, it } from "vitest";
+ 
+-import { createFakeOrca } from "../../test-support/src/index.js";
++import { createFakeOrca } from "../../test-support/src/fake-orca.js";
+ import { OrcaClient } from "../src/index.js";
+ import { operationArguments, parseOrcaOperation } from "../src/capabilities.js";
+ import { parseOrcaOperationsReceipt } from "../src/receipts.js";
+@@ -166,3 +166,129 @@
+     }
+   });
+ });
++
++it("maps explicit trusted coordinator scope only on public commands that support it", () => {
++  expect(
++    operationArguments({
++      kind: "operations_reply",
++      messageId: "msg",
++      body: "answer",
++      retryRequestId: "req",
++      senderHandle: "term_owner",
++      runId: "run_owner",
++    }),
++  ).toEqual([
++    "orchestration",
++    "reply",
++    "--id",
++    "msg",
++    "--body",
++    "answer",
++    "--retry-request",
++    "req",
++    "--from",
++    "term_owner",
++    "--run",
++    "run_owner",
++  ]);
++});
++it("parses current camelCase worker details without requiring obsolete snake_case fields", () => {
++  expect(() =>
++    parseOrcaOperationsReceipt("operations_show_worker", {
++      id: "r",
++      ok: true,
++      result: {
++        dispatch: {
++          id: "d",
++          runId: "run",
++          taskId: "task",
++          status: "dispatched",
++          processIncarnation: "pty:inc",
++        },
++        worker: {
++          dispatchId: "d",
++          state: "ready",
++          stage: "input_accepted",
++          agentTerminalHandle: "term",
++        },
++        projection: {
++          dispatchId: "d",
++          taskId: "task",
++          runId: "run",
++          liveness: { verdict: "live" },
++        },
++        observation: { status: "live", exactWorker: true },
++        terminal: null,
++        terminalResource: {
++          id: "resource",
++          ownershipState: "owned",
++          releaseState: "not_requested",
++        },
++      },
++    }),
++  ).not.toThrow();
++});
++it("fences current worker read identities in the existing client too", async () => {
++  const fake = await createFakeOrca();
++  try {
++    await fake.enqueueJson(
++      ["status", "--json"],
++      JSON.parse(
++        await readFile(
++          new URL("./fixtures/status-1.4.194.json", import.meta.url),
++          "utf8",
++        ),
++      ),
++    );
++    for (const name of ["orca-cli", "orchestration"])
++      await fake.enqueueJson(["skills", "get", name, "--json"], {
++        name,
++        full: false,
++        markdown: "public contract",
++      });
++    const client = new OrcaClient({
++      executablePath: fake.executablePath,
++      signal: new AbortController().signal,
++      expectedVersionRange: ">=1.4.194",
++    });
++    await fake.enqueueJson(
++      ["orchestration", "worker-show", "--dispatch", "wanted", "--json"],
++      {
++        id: "r",
++        ok: true,
++        result: {
++          dispatch: {
++            id: "other",
++            runId: "run",
++            taskId: "task",
++            status: "dispatched",
++          },
++          worker: {
++            dispatchId: "other",
++            state: "ready",
++            stage: "ready",
++            agentTerminalHandle: "term",
++          },
++          projection: {
++            dispatchId: "other",
++            taskId: "task",
++            runId: "run",
++            liveness: { verdict: "live" },
++          },
++          observation: { status: "live", exactWorker: true },
++          terminal: null,
++          terminalResource: {
++            id: "resource",
++            ownershipState: "owned",
++            releaseState: "not_requested",
++          },
++        },
++      },
++    );
++    await expect(
++      client.execute({ kind: "operations_show_worker", dispatchId: "wanted" }),
++    ).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++  } finally {
++    await fake.cleanup();
++  }
++});
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,10 +1,13 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 fix round 2 implemented and focused verification passed; independent review pending; Task 2 not started
++- Status: Task 1 final Spec/Quality review PASS; Task 2 implemented and verified; independent Task 2 review pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
++
++- Task 1 final review: `2026-09-15-hq-orca-operations-task1-fix2-review.md` records Spec PASS and Quality PASS.
++- Task 2: owner-socket claim and loopback cookie/CSRF sessions; SQLite intent/replay journal; real managed runtime wiring; lease-free HQ projections; bounded public Orca reads; exact sender/worker/incarnation gates; native HQ-answer routing. See the Task 2 report and pre-edit-baseline diff; no commit or deployment performed.
+ 
+ - Task 1 fix round 2 addresses the two remaining re-review findings: authoritative public reply/message schemas and target/request identities, a separate bounded source/content worker-read union, nonblank lifecycle states/verdicts, and otherwise-valid receipt-link tests for forbidden and both allowed kinds. The 12 focused tests, 3 selected legacy receipt tests, adapter source/test typechecks, and core test typecheck pass. See `2026-09-15-hq-orca-operations-task1.md` and the explicit-baseline `task1-fix2.diff`; independent review remains.
+ 
+@@ -29,4 +32,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 fix round 2 is ready for independent review. Task 2 must remain pending until that review accepts the corrected public contract; later tasks still run sequentially and Task 5 must be assigned to a fresh reviewer.
++Task 1 final fix-round-2 review passed both Spec and Quality. Task 2 is implemented with 110 focused/impacted passing tests and gateway typecheck; its independent review is next before Task 3 consumes the finalized route matrix in `2026-09-15-hq-orca-operations-task2.md`. Task 5 still requires a fresh reviewer.
+--- a/packages/orca-adapter/src/receipts.ts
++++ b/packages/orca-adapter/src/receipts.ts
+@@ -328,6 +328,14 @@
+ }).passthrough();
+ 
+ const operationsReceiptSchemas = {
++  operations_show_worker: successReceiptSchema(z.object({
++    dispatch: z.object({ id: BoundedIdSchema, runId: BoundedIdSchema, taskId: BoundedIdSchema, status: OperationsStateSchema, processIncarnation: BoundedIdSchema.nullable().optional() }).passthrough(),
++    worker: z.object({ dispatchId: BoundedIdSchema, state: OperationsStateSchema, stage: OperationsStateSchema, agentTerminalHandle: BoundedIdSchema.nullable() }).passthrough(),
++    projection: ProjectionSchema,
++    observation: z.object({ status: OperationsStateSchema, exactWorker: z.boolean() }).passthrough(),
++    terminal: TerminalSchema.nullable(),
++    terminalResource: z.object({ id: BoundedIdSchema, ownershipState: OperationsStateSchema, releaseState: OperationsStateSchema }).passthrough()
++  }).passthrough()),
+   operations_status: OrcaStatusReceiptSchema,
+   list_runs: successReceiptSchema(z.object({ runs: z.array(RunSchema).max(100), nextCursor: NullableCursorSchema }).passthrough()),
+   show_run: successReceiptSchema(z.object({ run: RunSchema }).passthrough()),
+@@ -364,6 +372,7 @@
+ 
+ export type OrcaOperationsReceiptKind = keyof typeof operationsReceiptSchemas;
+ export const OrcaOperationsReceiptSchema = z.union([
++  operationsReceiptSchemas.operations_show_worker,
+   operationsReceiptSchemas.operations_status,
+   operationsReceiptSchemas.list_runs,
+   operationsReceiptSchemas.show_run,
+--- /dev/null
++++ b/apps/gateway/src/operations-controls.ts
+@@ -0,0 +1,402 @@
++import { z } from "zod";
++import type { SubmitProgressRequest } from "@orca-hq/core";
++import type { ProgressStore } from "./progress-store.js";
++import type { OperationsJournal } from "./operations-journal.js";
++import type { OperationsOrcaPort } from "./operations-orca.js";
++import { OperationsError } from "./operations-http.js";
++import {
++  Id,
++  State,
++  Terminal,
++  Run,
++  Task,
++  Worker,
++  Message,
++  Receipt,
++} from "./operations-projections.js";
++import type { QuestionRecord } from "./native-coordinator.js";
++const Body = z
++  .string()
++  .min(1)
++  .max(8000)
++  .refine((value) => value.trim().length > 0);
++const uncertain = new Set([
++  "unknown",
++  "unverifiable",
++  "release_pending",
++  "release_unknown",
++  "transferred",
++]);
++const runtimeSchema = z.object({
++  runtime: z
++    .object({
++      state: State,
++      reachable: z.boolean(),
++      appVersion: State,
++      capabilities: z.array(State),
++      connectionState: State.optional(),
++    })
++    .passthrough(),
++});
++export function controlSupport(
++  runtime: z.infer<typeof runtimeSchema>["runtime"],
++) {
++  const patch = /^1\.4\.(\d+)$/.exec(runtime.appVersion);
++  return (
++    runtime.state === "ready" &&
++    runtime.reachable &&
++    !!patch &&
++    Number(patch[1]) >= 203 &&
++    ["orchestration.contract.v1", "orchestration.worker-stop-verdict.v1"].every(
++      (c) => runtime.capabilities.includes(c),
++    )
++  );
++}
++const scope = { runId: Id };
++const workerInput = z.object({ ...scope, expectedIncarnation: Id }).strict();
++const followupInput = workerInput.extend({ body: Body }).strict();
++const replyInput = z.object({ ...scope, body: Body }).strict();
++const dispatchInput = workerInput.extend({ terminalHandle: Id }).strict();
++type Action = "dispatch" | "followup" | "reply" | "stop" | "retain" | "release";
++export interface OperationsServiceOptions {
++  store: ProgressStore;
++  journal: OperationsJournal;
++  orca: OperationsOrcaPort;
++  submit(input: SubmitProgressRequest): Promise<unknown> | unknown;
++  capacity: {
++    limit: number | "unlimited";
++    source: "config" | "environment" | "default";
++    snapshot(): { active: number; queued: number };
++    attempts(): ReadonlyArray<{
++      state: string;
++      item?: { attemptId: string; requestId: string; contextId: string };
++    }>;
++  };
++}
++export class OperationsControls {
++  constructor(protected readonly options: OperationsServiceOptions) {}
++  protected async read<T extends z.ZodTypeAny>(
++    op: Parameters<OperationsOrcaPort["execute"]>[0],
++    schema: T,
++    runtimeId?: string,
++  ): Promise<z.infer<T>> {
++    const receipt = Receipt.parse(await this.options.orca.execute(op));
++    if (runtimeId && receipt._meta?.runtimeId !== runtimeId)
++      throw new OperationsError(409, "runtime_changed");
++    return schema.parse(receipt.result);
++  }
++  protected inbox(runtimeId?: string) {
++    return this.read(
++      { kind: "operations_inbox", limit: 100 },
++      z
++        .object({ messages: z.array(Message).max(100), count: z.number() })
++        .passthrough(),
++      runtimeId,
++    );
++  }
++  private async owner(runId: string, runtimeId: string) {
++    const { run } = await this.read(
++      { kind: "show_run", runId },
++      z.object({ run: Run }),
++      runtimeId,
++    );
++    if (run.id !== runId || !run.coordinator_handle || !run.consumer_generation)
++      throw new OperationsError(409, "run_owner_unverifiable");
++    const { terminal } = await this.read(
++      { kind: "show_terminal", terminalHandle: run.coordinator_handle },
++      z.object({ terminal: Terminal }),
++      runtimeId,
++    );
++    if (
++      terminal.handle !== run.coordinator_handle ||
++      !terminal.connected ||
++      !terminal.writable ||
++      terminal.orphaned ||
++      terminal.executionHostId !== "local" ||
++      !terminal.ptyId
++    )
++      throw new OperationsError(409, "sender_unverifiable");
++    const { tasks } = await this.read(
++      { kind: "list_tasks", runId },
++      z.object({ tasks: z.array(Task).max(100) }),
++      runtimeId,
++    );
++    if (
++      !tasks.some(
++        (task) =>
++          task.run_id === runId &&
++          task.created_by_terminal_handle === terminal.handle &&
++          task.created_by_process_incarnation ===
++            `${terminal.ptyId}:${terminal.incarnationId}` &&
++          task.created_by_run_generation === run.consumer_generation,
++      )
++    )
++      throw new OperationsError(409, "sender_incarnation_unverifiable");
++    return { run, terminal };
++  }
++  async mutate(action: Action, targetId: string, raw: unknown, key: string) {
++    Id.parse(targetId);
++    const input = (
++      action === "dispatch"
++        ? dispatchInput
++        : action === "reply"
++          ? replyInput
++          : action === "followup"
++            ? followupInput
++            : workerInput
++    ).parse(raw);
++    return this.options.journal.execute(
++      { requestId: key, action, targetId, input },
++      async () => {
++        let effectStarted = false;
++        try {
++          const status = Receipt.parse(
++            await this.options.orca.execute({ kind: "operations_status" }),
++          );
++          const runtimeId = status._meta?.runtimeId;
++          if (
++            !runtimeId ||
++            !controlSupport(runtimeSchema.parse(status.result).runtime)
++          )
++            throw new OperationsError(409, "control_capability_unavailable");
++          const owner = await this.owner(input.runId, runtimeId);
++          let managedAnswer: SubmitProgressRequest | undefined;
++          const validateTarget = async () => {
++            if (action === "reply") {
++              const q = (await this.inbox(runtimeId)).messages.find(
++                (m) =>
++                  m.id === targetId &&
++                  m.type === "question" &&
++                  m.run_id === input.runId &&
++                  (!m.question || m.question.status === "pending"),
++              );
++              if (!q) throw new OperationsError(409, "question_not_current");
++              const native = this.options.store
++                .nativeJournal()
++                .get<QuestionRecord>("question", targetId);
++              if (native) {
++                if (native.answered)
++                  throw new OperationsError(409, "question_already_answered");
++                const attempt = this.options.capacity
++                  .attempts()
++                  .find((a) => a.item?.attemptId === native.attemptId);
++                const event = attempt
++                  ? undefined
++                  : this.options.store
++                      .readEvents({ after: 0, limit: 500 })
++                      .events.find((e) => e.payload.messageId === targetId);
++                const requestId = attempt?.item?.requestId ?? event?.requestId;
++                const request =
++                  requestId && this.options.store.getRequest(requestId);
++                if (!request)
++                  throw new OperationsError(
++                    409,
++                    "hq_question_context_unavailable",
++                  );
++                managedAnswer = {
++                  requestId: key,
++                  sessionId: request.sessionId,
++                  text: `/answer ${targetId} ${(input as z.infer<typeof replyInput>).body}`,
++                };
++              }
++            } else if (action === "dispatch") {
++              const { tasks } = await this.read(
++                { kind: "list_tasks", runId: input.runId },
++                z.object({ tasks: z.array(Task).max(100) }),
++                runtimeId,
++              );
++              const task = tasks.find((t) => t.id === targetId);
++              if (
++                !task ||
++                task.run_id !== input.runId ||
++                task.status !== "pending" ||
++                task.created_by_terminal_handle !== owner.terminal.handle ||
++                task.created_by_process_incarnation !==
++                  `${owner.terminal.ptyId}:${owner.terminal.incarnationId}` ||
++                task.created_by_run_generation !== owner.run.consumer_generation
++              )
++                throw new OperationsError(409, "task_not_dispatchable");
++              const d = input as z.infer<typeof dispatchInput>;
++              const { terminal } = await this.read(
++                { kind: "show_terminal", terminalHandle: d.terminalHandle },
++                z.object({ terminal: Terminal }),
++                runtimeId,
++              );
++              if (
++                terminal.handle !== d.terminalHandle ||
++                terminal.incarnationId !== d.expectedIncarnation ||
++                !terminal.connected ||
++                !terminal.writable ||
++                terminal.orphaned ||
++                terminal.executionHostId !== "local"
++              )
++                throw new OperationsError(409, "terminal_changed");
++            } else {
++              const w = await this.read(
++                  { kind: "operations_show_worker", dispatchId: targetId },
++                  Worker,
++                  runtimeId,
++                ),
++                t = w.terminal,
++                r = w.terminalResource;
++              if (
++                w.dispatch.id !== targetId ||
++                w.worker.dispatchId !== targetId ||
++                w.projection.dispatchId !== targetId ||
++                w.dispatch.runId !== input.runId ||
++                w.projection.runId !== input.runId ||
++                w.projection.taskId !== w.dispatch.taskId ||
++                !w.observation.exactWorker ||
++                !t ||
++                t.executionHostId !== "local" ||
++                t.handle !== w.worker.agentTerminalHandle ||
++                t.incarnationId !==
++                  (input as z.infer<typeof workerInput>).expectedIncarnation ||
++                !t.ptyId ||
++                w.dispatch.processIncarnation !==
++                  `${t.ptyId}:${t.incarnationId}` ||
++                r.endpointIncarnation !== w.dispatch.processIncarnation ||
++                r.ownerDispatchId !== targetId ||
++                r.terminalHandle !== t.handle ||
++                !["owned", "retained"].includes(r.ownershipState) ||
++                !["not_requested", "retained"].includes(r.releaseState) ||
++                !w.projection.resource ||
++                w.projection.resource.ownerDispatchId !== targetId ||
++                !["owned", "retained"].includes(w.projection.resource.state) ||
++                !["not_requested", "retained"].includes(
++                  w.projection.resource.releaseState,
++                ) ||
++                uncertain.has(w.worker.state) ||
++                uncertain.has(w.dispatch.status) ||
++                uncertain.has(w.projection.liveness.verdict) ||
++                uncertain.has(w.observation.status)
++              )
++                throw new OperationsError(409, "worker_unverifiable");
++              const settled =
++                ["succeeded", "failed", "stopped"].includes(
++                  w.projection.outcome ?? "",
++                ) &&
++                [
++                  "worker_done",
++                  "completed",
++                  "succeeded",
++                  "failed",
++                  "stopped",
++                ].includes(w.dispatch.status) &&
++                ["live", "exited"].includes(w.projection.liveness.verdict) &&
++                ["live", "exited"].includes(w.observation.status);
++              if (action === "release") {
++                if (!settled)
++                  throw new OperationsError(409, "worker_not_settled");
++              } else if (
++                !(action === "retain" && settled) &&
++                (w.projection.liveness.verdict !== "live" ||
++                  w.observation.status !== "live" ||
++                  !t.connected ||
++                  !t.writable ||
++                  t.orphaned)
++              )
++                throw new OperationsError(409, "worker_not_live");
++            }
++          };
++          await validateTarget();
++          const fresh = await this.owner(input.runId, runtimeId);
++          if (
++            owner.terminal.handle !== fresh.terminal.handle ||
++            owner.terminal.incarnationId !== fresh.terminal.incarnationId ||
++            owner.terminal.ptyId !== fresh.terminal.ptyId ||
++            owner.run.consumer_generation !== fresh.run.consumer_generation
++          )
++            throw new OperationsError(409, "sender_changed");
++          await validateTarget();
++          if (managedAnswer) {
++            effectStarted = true;
++            await this.options.submit(managedAnswer);
++            return { state: "accepted" };
++          }
++          const common = {
++            senderHandle: fresh.terminal.handle,
++            runId: input.runId,
++            retryRequestId: key,
++          };
++          const op =
++            action === "reply"
++              ? {
++                  kind: "operations_reply" as const,
++                  messageId: targetId,
++                  body: (input as z.infer<typeof replyInput>).body,
++                  ...common,
++                }
++              : action === "followup"
++                ? {
++                    kind: "operations_send" as const,
++                    dispatchId: targetId,
++                    body: (input as z.infer<typeof followupInput>).body,
++                    ...common,
++                  }
++                : action === "dispatch"
++                  ? {
++                      kind: "operations_dispatch" as const,
++                      taskId: targetId,
++                      terminalHandle: (input as z.infer<typeof dispatchInput>)
++                        .terminalHandle,
++                      ...common,
++                    }
++                  : {
++                      kind:
++                        action === "stop"
++                          ? ("operations_stop" as const)
++                          : action === "retain"
++                            ? ("operations_retain" as const)
++                            : ("operations_release" as const),
++                      dispatchId: targetId,
++                      retryRequestId: key,
++                    };
++          effectStarted = true;
++          const receipt = Receipt.parse(await this.options.orca.execute(op));
++          const result = z.record(z.unknown()).parse(receipt.result);
++          if (receipt._meta?.runtimeId !== runtimeId)
++            return { state: "unknown", detail: "runtime_changed" };
++          if (
++            uncertain.has(String(result.state)) ||
++            uncertain.has(String(result.verdict)) ||
++            (["stop", "retain", "release"].includes(action) &&
++              (![
++                "accepted",
++                "stopped",
++                "retained",
++                "released",
++                "already_released",
++              ].includes(String(result.state)) ||
++                ![
++                  "accepted",
++                  "stopped",
++                  "retained",
++                  "released",
++                  "already_released",
++                ].includes(String(result.verdict))))
++          )
++            return { state: "unknown", detail: "effect_unverifiable" };
++          return { state: "accepted" };
++        } catch (e) {
++          const err = e as { code?: string; orcaCode?: string };
++          if (
++            err.code === "orca_stale_handle" ||
++            (err.code === "orca_command_failed" &&
++              [
++                "no_active_sender_terminal",
++                "invalid_argument",
++                "terminal_handle_stale",
++              ].includes(err.orcaCode ?? ""))
++          )
++            return { state: "rejected", detail: "orca_rejected_before_effect" };
++          if (e instanceof OperationsError)
++            return { state: "rejected", detail: e.code };
++          if (!effectStarted)
++            return { state: "rejected", detail: "gate_evidence_unverifiable" };
++          throw e;
++        }
++      },
++    );
++  }
++}
+--- /dev/null
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task2.md
+@@ -0,0 +1,76 @@
++# Task 2 — Trusted local operations bridge
++
++Status: implemented; independent review pending. Task 1 final Spec/Quality review is complete/PASS.
++
++## Constructor and runtime wiring
++
++- `startManagedRuntime` constructs `OperationsOrca` with the trusted configured executable and shutdown AbortSignal; passes real `progressStore`, `progress.submit`, admission snapshot/attempts, and config/env/default capacity provenance to `startManagedService`.
++- `startManagedService({operations})` constructs `OperationsJournal` on its existing managed-control SQLite connection, `OperationsService`, and `OperationsHttp`; the existing listener remains `127.0.0.1` and `/health` keeps its prior shape.
++- `OperationsService` extends focused `OperationsControls`; schemas/sanitization live in `operations-projections.ts`. No UI, installer, capacity write, viewer lease, private Orca API, or direct terminal-control route was added.
++- Owner-only `control.sock` adds exactly `POST /v1/operations/session` with `{}` → `{url,expiresAt}`. The URL is `http://127.0.0.1:<port>/#claim=<single-use-token>`; SPA/launcher consumption remains Task 3/4.
++
++## Final route matrix for frontend
++
++All paths below are relative to `/api/operations`, except auth. Reads require the session cookie. Writes require exact Origin, JSON, cookie, `X-CSRF-Token`, and `Idempotency-Key` (1–100 safe ID characters).
++All operation writes return `OperationsMutationReceipt`; accepted → HTTP 202, rejected → 409, unknown → 502. Accepted never means completed. Auth/validation errors use `{error:<machine_code>}`.
++
++| Method/path | Input | Output |
++|---|---|---|
++| POST `/auth/local/claim` | `{claim}` | `{csrf,expiresAt}` + `hq_operations` cookie |
++| POST `/auth/local/refresh` | `{}` + cookie/CSRF/Origin; no idempotency key needed | Rotated `{csrf,expiresAt}`; original session deadline unchanged |
++| GET `/status` | none | Task 1 `OperationsStatus`; unavailable metrics, HQ-only occupancy, advertised Orca capabilities and gated `features.controls` support |
++| GET `/hq/contexts` | `sessionId?`, numeric-offset `cursor?` | `HqContextPage`: `{contexts,cursor?}`; max 100 current snapshots |
++| GET `/hq/contexts/:id` | exact context ID | `{source:"hq",context,evidence}` |
++| GET `/hq/requests/:id` | exact request ID | `{source:"hq",request,evidence}` |
++| GET `/hq/events` | `contextId?`, `after=0`, `limit=100` (max 500) | `HqEventPage`: events, snapshots, cursor, compacted, oldestSeq/latestSeq |
++| GET `/hq/questions` | `after=0`, `limit=100` (max 100 event rows) | `{source:"hq",questions,cursor,compacted}`; continue event cursor until unchanged; current request/native-answer state filters questions |
++| POST `/hq/requests` | `{requestId,sessionId,text,contextHint?}`; text 1–8000 raw characters | Receipt; `requestId` must equal Idempotency-Key; existing HQ submission handles new/continue/clarification/answer |
++| GET `/orca/runs` | `cursor?` | `{source:"orca",runs,nextCursor?,...publicFields,evidence}` |
++| GET `/orca/runs/:id` | exact Run ID | `{source:"orca",run,evidence}` |
++| GET `/orca/tasks` | required `runId` | `{source:"orca",tasks,...publicFields,evidence}`; native `run_id`, `status`, creation provenance preserved |
++| GET `/orca/workers` | `runId?`, `cursor?` | `{source:"orca",workers,page,scope,...publicFields,evidence}`; native projection/stage/outcome kept separate |
++| GET `/orca/workers/:id` | Dispatch ID | `{source:"orca",dispatch,worker,projection,observation,terminal,terminalResource,evidence}` |
++| GET `/orca/workers/:id/output` | required `source=terminal|transcript`, `cursor?`, `limit=100` (max 500) | Task 1 `OrcaOutputPage`; terminal `lines` XOR transcript `messages`; source change → 409 |
++| GET `/orca/questions` | none | `{source:"orca",messages,count,support,evidence}`; fresh non-consuming inbox question messages; count is the original inbox count |
++| GET `/orca/resources` | optional `projectId` to narrow inventory | `{source:"orca",projects,evidence}` with nested setups/worktrees/terminals and public hostScope/truncation evidence |
++| POST `/orca/dispatches` | `{taskId,runId,terminalHandle,expectedIncarnation}` | Receipt for typed public dispatch |
++| POST `/orca/followups` | `{dispatchId,runId,expectedIncarnation,body}` | Receipt for typed status send to exact Dispatch |
++| POST `/orca/replies` | `{messageId,runId,body}` | Receipt; stored native HQ questions submit `/answer` through HQ; external questions use public reply |
++| POST `/orca/workers/:id/stop` | `{runId,expectedIncarnation}` | Receipt after exact live/live gate |
++| POST `/orca/workers/:id/retain` | `{runId,expectedIncarnation}` | Receipt after exact owned/retained resource gate and known live or settled evidence |
++| POST `/orca/workers/:id/release` | `{runId,expectedIncarnation}` | Receipt after exact settled/releasable resource gate |
++
++Body fields are strict; browser `from`, executable, environment, argv, and extra authority fields fail validation. `expectedIncarnation` comes from the displayed public `terminal.incarnationId`; the server re-reads it before effect. Public cursors accept up to 2048 characters.
++
++Examples:
++```json
++{"requestId":"request_01","sessionId":"session_01","text":"Continue the existing work","contextHint":{"mode":"continue","contextId":"ctx_01"}}
++{"dispatchId":"ctx_dispatch","runId":"run_01","expectedIncarnation":"inc_01","body":"Run the focused tests"}
++{"requestId":"request_02","action":"followup","targetId":"ctx_dispatch","state":"accepted","observedAt":"2026-09-15T09:00:00.000Z"}
++```
++The first request uses Idempotency-Key `request_01`; the followup example uses `request_02`.
++
++## Deliberate source-compatible refinements and evidence
++
++- Actual Orca 1.4.203 Run records have `coordinator_handle` and `consumer_generation` but no Run status. Worker detail uses `dispatch.runId/taskId/processIncarnation`, `worker.dispatchId/agentTerminalHandle`, `projection.liveness`, and `terminal.incarnationId`. Task 2 preserves those native fields instead of manufacturing the stricter Task 1 presentation aliases/statuses; frontend must consume the matrix above.
++- Added `operations_show_worker` and an operations-specific receipt parser, preserving legacy `show_worker`; adapter and operations port both fence requested Dispatch identity. Explicit typed `senderHandle`/`runId` are optional adapter extensions for source compatibility, but server controls always supply them on dispatch/reply/send.
++- Evidence: read-only current Run/worker/terminal/task-list/status/worker-read probes and public command help on 1.4.203. `reply`, `send`, and `dispatch` advertise `--from/--run`; worker stop/retain/release do not, so no unsupported flags are invented. Worker-read's outer cursor is the opaque resumable cursor, unlike the inner terminal position.
++- Monitoring calls only public `inbox --limit 100`; it never consumes/acks. Public inbox lacks authoritative pending-question state, so `support.pendingState={supported:false,reason:"inbox_has_no_authoritative_pending_question_state"}` is explicit and no pending status is inferred.
++- Controls require ready/reachable tested 1.4.x (patch >=203), contract/stop-verdict capabilities, stable runtime ID, fresh Run ownership, and connected/writable local sender. Because Run has no incarnation field, a fresh same-Run task creation record must match sender handle + `ptyId:incarnationId` + Run generation; absence yields `sender_incarnation_unverifiable`.
++- Sender and target evidence is checked again before effect. Worker ownership, Dispatch/Task/Run IDs, endpoint incarnation, resource release state, projection and PTY liveness are distinct gates. Unknown/unverifiable/transferred/release-pending states never authorize controls or free admission capacity. Remote lifecycle controls lack this local exact-incarnation proof and remain inspect-only.
++- Inventory has 100-row per-list bounds, four concurrent CLI calls, and a 100-read aggregate request budget. Budget omissions carry `supported:false,reason:"request_read_budget_exhausted"`; public host omissions/truncation survive. Public commands without paging cannot expose unbounded inventories; oversize/malformed receipts fail closed.
++
++## Durability and security
++
++- Journal inserts prepared intent before effects, serializes concurrent requests, hashes canonical input, rejects key/action/target/digest collisions, persists accepted/rejected/unknown, and recovers interrupted intents as unknown. Stored columns contain only request/action/target/digest/state/bounded machine detail/time; no text body, transcript, cookie, CSRF, or raw exception.
++- Known pre-effect rejections are rejected; timeout, invalid/mismatched receipt, runtime change after effect, unknown verdict, and other ambiguous effects stay unknown and replay unchanged. Every public mutation uses the HTTP key as `--retry-request`.
++- Claim: single use, 60 seconds, owner socket only. Session: 30 minutes, memory only, HttpOnly/SameSite=Strict/Path=/; peer/Host/exact-Origin checks, CSRF, 16-KiB body cap, 2-MiB process/HTTP output caps, no-store/nosniff/CSP/referrer protections. Processes use existing shell:false bounded environment/termination code; read timeout 10s, effect timeout 75s.
++
++## Verification and concerns
++
++- TDD regressions cover journal duplicates/collision/recovery, owner auth, real listener/socket/DB wiring, lease coexistence, native answer routing, capability/runtime/incarnation replacement, exact-worker denial matrix, ambiguous receipts, source tags, redaction, paging/compaction/receipt links, cursor bounds, and bounded inventory. All control effects use fake ports or fake executable fixtures; no real agent was mutated.
++- Final focused + impacted run: **11 files, 110 tests passed** (four new operations tests plus managed-control/service/runtime/progress-control and adapter operations/capabilities/process).
++- Gateway source typecheck passed; adapter build/source check passed; direct strict NodeNext checks passed for new/changed gateway tests. Adapter operations tests now import only fake-orca, avoiding the unrelated test-support barrel's pre-existing non-exhaustive legacy fake-agent switch; the focused adapter test typecheck also passed. The 37 affected adapter/managed tests passed again after import cleanup and formatting.
++- A failed initial `openProgressStore(:memory:)` test setup chmodded cwd to 0700. Replaced by direct in-memory store construction; restored only cwd to **0755** using the coordinator's recorded pre-task baseline (`msg_aa9be57f3582`) and verified it. No recursive permission change.
++- No commit, push, install, restart, protected-document access, or UI/installer edits. Task 3/4 still provide SPA and launcher. Independent Task 2 review is next; no claim of broader repository typecheck coverage.
++- `task2.diff` is generated from explicit pre-edit snapshots of exact owned paths (including new files); it excludes protected documents and unrelated existing edits. The progress report marks Task 1 reviewed and Task 2 review-ready.

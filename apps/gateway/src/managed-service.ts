@@ -1,7 +1,12 @@
+import { OperationsJournal } from "./operations-journal.js";
+import { OperationsService, type OperationsServiceOptions } from "./operations-service.js";
+import { OperationsHttp } from "./operations-http.js";
+import { createOperationsAssets } from "./operations-assets.js";
 import { createServer } from "node:http";
 import type { createProgressControl } from "./progress-control.js";
 import { chmod } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { openDatabase } from "@orca-hq/persistence";
 import { LocalTextStore, type LocalTextMessage } from "./local-store.js";
 import type { LocalChannelFactory } from "./local-service.js";
@@ -24,6 +29,8 @@ export interface ManagedServiceOptions {
   execute(input: ManagedCommandInput): Promise<ManagedCommandResult>;
   channelFactory: LocalChannelFactory;
   getJob(id: string): CommandJob | undefined;
+  operations?: Omit<OperationsServiceOptions, "journal">;
+  operationsAssetsRoot?: string;
   progress?: ReturnType<typeof createProgressControl>;
   beforeReady?: () => Promise<void>;
   initialCursors?: Partial<Record<"slack" | "telegram", string | number>>;
@@ -33,6 +40,10 @@ export async function startManagedService(options: ManagedServiceOptions) {
   const db = openDatabase(options.databasePath);
   await chmod(options.databasePath, 0o600);
   const inbox = new LocalTextStore(db);
+  const operationsJournal = options.operations ? new OperationsJournal(db) : undefined;
+  const operationsService = options.operations && operationsJournal ? new OperationsService({ ...options.operations, journal: operationsJournal }) : undefined;
+  const operationsHttp = operationsService ? new OperationsHttp({ route: (method, url, body, key) => operationsService.route(method, url, body, key) }) : undefined;
+  const operationsAssets = operationsService ? await createOperationsAssets(options.operationsAssetsRoot ?? fileURLToPath(new URL("../../web/dist", import.meta.url))) : undefined;
   for (const channel of ["slack", "telegram"] as const) {
     const cursor = options.initialCursors?.[channel];
     if (cursor !== undefined && inbox.loadCursor(channel) === undefined)
@@ -306,7 +317,8 @@ export async function startManagedService(options: ManagedServiceOptions) {
         active = undefined;
       });
   }
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
+    if (operationsHttp && await operationsHttp.handle(req, res)) return;
     const status = channels.status();
     res.setHeader("Cache-Control", "no-store");
     if (req.method === "GET" && req.url === "/health") {
@@ -321,7 +333,10 @@ export async function startManagedService(options: ManagedServiceOptions) {
           queue: inbox.summary(),
         }),
       );
-    } else if (req.method === "GET" && req.url === "/") {
+      return;
+    }
+    if (operationsAssets && await operationsAssets.handle(req, res)) return;
+    if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy": "default-src 'none'",
@@ -350,6 +365,8 @@ export async function startManagedService(options: ManagedServiceOptions) {
     await serial;
     if (server.listening)
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    operationsHttp?.close();
+    await operationsJournal?.idle();
     db.close();
   }
   try {
@@ -360,10 +377,13 @@ export async function startManagedService(options: ManagedServiceOptions) {
         resolve();
       });
     });
+    const operationsAddress = server.address();
+    if (operationsAddress && typeof operationsAddress !== "string") operationsHttp?.setOrigin(`http://127.0.0.1:${operationsAddress.port}`);
     await options.beforeReady?.();
     control = await startManagedControl({
       socketPath: join(options.directory, "control.sock"),
       execute: executeOnce,
+      ...(operationsHttp ? { operations: operationsHttp } : {}),
       ...(options.progress ? { progress: options.progress } : {}),
     });
     inbox.recover();

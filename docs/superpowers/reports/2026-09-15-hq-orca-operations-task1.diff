@@ -1,0 +1,1108 @@
+# Task 1 final scoped review diff
+
+Exact Task 1 code/test paths only; documentation and protected files are excluded.
+
+```diff
+diff --git a/apps/gateway/src/progress-events.ts b/apps/gateway/src/progress-events.ts
+--- a/apps/gateway/src/progress-events.ts
++++ b/apps/gateway/src/progress-events.ts
+@@ -1,15 +1,8 @@
+ import { redactRelayText } from "./orca-relay.js";
++import { redactPublicText } from "@orca-hq/core";
+ import type { CommandJob } from "./managed-commands.js";
+ export function publicProgressText(text: string): string {
+-  return redactRelayText(text)
+-    .replace(
+-      /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gu,
+-      "[REDACTED]",
+-    )
+-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
+-    .replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/gu, "[REDACTED]")
+-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/gu, "")
+-    .slice(0, 14000);
++  return redactPublicText(redactRelayText(text)).slice(0, 14000);
+ }
+ export function nativeContextState(
+   jobs: CommandJob[],
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -13,3 +13,5 @@
+ export * from "./ports.js";
+ export * from "./proposal.js";
+ export * from "./progress.js";
++export * from "./operations.js";
++export * from "./public-output.js";
+diff --git a/packages/installer/src/progress-client.ts b/packages/installer/src/progress-client.ts
+--- a/packages/installer/src/progress-client.ts
++++ b/packages/installer/src/progress-client.ts
+@@ -137,42 +137,29 @@
+   }
+ }
+ 
++
++/**
++ * Renders untrusted server text as a single safe line: terminal control sequences are removed so a
++ * work title or tool summary cannot relabel the window, clear the screen, or hide later output.
++ */
+ const escape = String.fromCharCode(0x1b);
+ const operatingSystemCommand = new RegExp(`${escape}\\][\\s\\S]*?(?:\\u0007|${escape}\\\\|$)`, "g");
+ const controlSequence = new RegExp(`${escape}\\[[0-9;:?]*[ -/]*[@-~]`, "g");
+ const remainingEscape = new RegExp(`${escape}[\\s\\S]?`, "g");
+ const controlCharacters = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]", "g");
+ 
+-/**
+- * Renders untrusted server text as a single safe line: terminal control sequences are removed so a
+- * work title or tool summary cannot relabel the window, clear the screen, or hide later output.
+- */
++/** Compatibility exports for existing installer callers. Shared console output uses the core copy. */
+ export function sanitizeDisplayText(value: unknown): string {
+   if (typeof value !== "string") return "";
+-  const stripped = value
+-    .replace(operatingSystemCommand, "")
+-    .replace(controlSequence, "")
+-    .replace(remainingEscape, "")
+-    .replace(controlCharacters, " ")
+-    .replace(/\s+/gu, " ")
+-    .trim();
+-  return stripped.length <= displayTextLimit
+-    ? stripped
+-    : `${stripped.slice(0, displayTextLimit - 1)}…`;
+-}
+-
+-/** Final reports preserve paragraphs; only control codes are removed, with an explicit bound notice. */
++  const text = value.replace(operatingSystemCommand, "").replace(controlSequence, "").replace(remainingEscape, "").replace(controlCharacters, " ").replace(/\s+/gu, " ").trim();
++  return text.length <= displayTextLimit ? text : `${text.slice(0, displayTextLimit - 1)}…`;
++}
++
+ export function sanitizeResultText(value: unknown): string {
+   if (typeof value !== "string") return "";
+-  const stripped = value
+-    .replace(operatingSystemCommand, "")
+-    .replace(controlSequence, "")
+-    .replace(remainingEscape, "")
+-    .replace(/\r\n?/gu, "\n")
+-    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, " ")
+-    .trim();
++  const text = value.replace(operatingSystemCommand, "").replace(controlSequence, "").replace(remainingEscape, "").replace(/\r\n?/gu, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, " ").trim();
+   const limit = 64 * 1024;
+-  return stripped.length <= limit ? stripped : `${stripped.slice(0, limit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
++  return text.length <= limit ? text : `${text.slice(0, limit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
+ }
+ 
+ interface NativeProfileFields {
+diff --git a/packages/orca-adapter/src/capabilities.ts b/packages/orca-adapter/src/capabilities.ts
+--- a/packages/orca-adapter/src/capabilities.ts
++++ b/packages/orca-adapter/src/capabilities.ts
+@@ -10,6 +10,9 @@
+ export const MINIMUM_ORCA_VERSION = "1.4.194" as const;
+ 
+ const NonEmptyStringSchema = z.string().min(1);
++const OperationsIdSchema = z.string().min(1).max(512).refine((value) => value === value.trim(), "must not have surrounding whitespace");
++const OperationsCursorSchema = z.string().min(1).max(2048).refine((value) => value === value.trim(), "must not have surrounding whitespace");
++const OperationsBodySchema = z.string().max(8 * 1024).refine((value) => value.trim().length > 0, "body is required");
+ const OrcaOperationSchema = z.discriminatedUnion("kind", [
+   z.object({ kind: z.literal("list_projects") }).strict(),
+   z.object({
+@@ -48,7 +51,27 @@
+   z.object({
+     kind: z.literal("release_worker"),
+     dispatchId: NonEmptyStringSchema
+-  }).strict()
++  }).strict(),
++  z.object({ kind: z.literal("operations_status") }).strict(),
++  z.object({ kind: z.literal("operations_dispatch"), taskId: OperationsIdSchema, terminalHandle: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_reply"), messageId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_send"), dispatchId: OperationsIdSchema, body: OperationsBodySchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_stop"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_retain"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("operations_release"), dispatchId: OperationsIdSchema, retryRequestId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("list_runs"), limit: z.number().int().positive().max(100).optional(), cursor: OperationsCursorSchema.optional() }).strict(),
++  z.object({ kind: z.literal("show_run"), runId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("list_tasks"), runId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("list_workers"), runId: OperationsIdSchema.optional(), limit: z.number().int().positive().max(100).optional(), cursor: OperationsCursorSchema.optional() }).strict(),
++  z.object({ kind: z.literal("operations_worker_read"), dispatchId: OperationsIdSchema, source: z.enum(["transcript", "terminal"]), limit: z.number().int().positive().max(500).optional(), cursor: OperationsCursorSchema.optional() }).strict(),
++  z.object({ kind: z.literal("operations_inbox"), limit: z.number().int().positive().max(100).optional() }).strict(),
++  z.object({ kind: z.literal("operations_list_projects") }).strict(),
++  z.object({ kind: z.literal("list_project_setups"), projectId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("list_worktrees"), repoId: OperationsIdSchema, limit: z.number().int().positive().max(100).optional() }).strict(),
++  z.object({ kind: z.literal("show_worktree"), worktreeId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("list_terminals"), worktreeId: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("show_terminal"), terminalHandle: OperationsIdSchema }).strict(),
++  z.object({ kind: z.literal("read_terminal"), terminalHandle: OperationsIdSchema, limit: z.number().int().positive().max(500).optional(), cursor: OperationsCursorSchema.optional() }).strict()
+ ]);
+ 
+ export type OrcaOperation = z.input<typeof OrcaOperationSchema>;
+@@ -59,7 +82,7 @@
+   "create_task",
+   "dispatch_worker",
+   "stop_worker",
+-  "release_worker"
++  "release_worker", "operations_dispatch", "operations_reply", "operations_send", "operations_stop", "operations_retain", "operations_release"
+ ]);
+ 
+ export class OrcaIncompatibleError extends Error {
+@@ -130,5 +153,31 @@
+       return ["orchestration", "worker-stop", "--dispatch", operation.dispatchId];
+     case "release_worker":
+       return ["orchestration", "worker-release", "--dispatch", operation.dispatchId];
++    case "operations_status": return ["status"];
++    case "operations_dispatch": return ["orchestration", "dispatch", "--task", operation.taskId, "--to", operation.terminalHandle, "--retry-request", operation.retryRequestId];
++    case "operations_reply": return ["orchestration", "reply", "--id", operation.messageId, "--body", operation.body, "--retry-request", operation.retryRequestId];
++    case "operations_send": return ["orchestration", "send", "--subject", "HQ operator follow-up", "--to", `dispatch:${operation.dispatchId}`, "--type", "status", "--body", operation.body, "--retry-request", operation.retryRequestId];
++    case "operations_stop": return ["orchestration", "worker-stop", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
++    case "operations_retain": return ["orchestration", "worker-retain", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
++    case "operations_release": return ["orchestration", "worker-release", "--dispatch", operation.dispatchId, "--retry-request", operation.retryRequestId];
++    case "list_runs": return pageArgs(["orchestration", "run-list"], operation);
++    case "show_run": return ["orchestration", "run-show", "--id", operation.runId];
++    case "list_tasks": return ["orchestration", "task-list", "--run", operation.runId, "--brief"];
++    case "list_workers": return pageArgs(operation.runId === undefined ? ["orchestration", "worker-list"] : ["orchestration", "worker-list", "--run", operation.runId], operation);
++    case "operations_worker_read": return pageArgs(["orchestration", "worker-read", "--dispatch", operation.dispatchId, "--source", operation.source], operation);
++    case "operations_inbox": return pageArgs(["orchestration", "inbox"], operation);
++    case "operations_list_projects": return ["project", "list"];
++    case "list_project_setups": return ["project", "setups", "--project", operation.projectId];
++    case "list_worktrees": return pageArgs(["worktree", "list", "--repo", `id:${operation.repoId}`], operation);
++    case "show_worktree": return ["worktree", "show", "--worktree", operation.worktreeId];
++    case "list_terminals": return ["terminal", "list", "--worktree", operation.worktreeId];
++    case "show_terminal": return ["terminal", "show", "--terminal", operation.terminalHandle];
++    case "read_terminal": return pageArgs(["terminal", "read", "--terminal", operation.terminalHandle], operation);
+   }
+ }
++
++function pageArgs(args: string[], page: { readonly limit?: number | undefined; readonly cursor?: string | undefined }): readonly string[] {
++  if (page.limit !== undefined) args.push("--limit", String(page.limit));
++  if (page.cursor !== undefined) args.push("--cursor", page.cursor);
++  return args;
++}
+diff --git a/packages/orca-adapter/src/index.ts b/packages/orca-adapter/src/index.ts
+--- a/packages/orca-adapter/src/index.ts
++++ b/packages/orca-adapter/src/index.ts
+@@ -18,6 +18,7 @@
+   assertSuccessfulReceipt,
+   OrcaInvalidReceiptError,
+   parseOrcaOperationReceipt,
++  parseOrcaOperationsReceipt,
+   parseOrcaProjects,
+   parseOrcaReceipt,
+   parseOrcaSkillResponse,
+@@ -123,10 +124,19 @@
+       raw = await runOrca(operationArguments(operation), this.#options);
+       const receipt = parseOrcaReceipt(raw);
+       assertSuccessfulReceipt(receipt);
+-      const parsed = parseOrcaOperationReceipt(operation.kind, receipt);
+-      if (operation.kind === "dispatch_worker") {
+-        const result = parsed.result as { taskId?: unknown };
+-        if (result.taskId !== operation.taskId) throw new OrcaInvalidReceiptError();
++      let parsed: OrcaReceipt;
++      if (legacyReceiptOperation(operation.kind)) {
++        parsed = parseOrcaOperationReceipt(operation.kind, receipt);
++        if (operation.kind === "dispatch_worker") {
++          const result = parsed.result as { taskId?: unknown };
++          if (result.taskId !== operation.taskId) throw new OrcaInvalidReceiptError();
++        }
++      } else {
++        parsed = parseOrcaOperationsReceipt(operation.kind, receipt);
++        assertOperationsReceiptIdentity(
++          operation as Exclude<import("./capabilities.js").ValidatedOrcaOperation, { kind: import("./receipts.js").OrcaReceiptOperationKind }>,
++          parsed as import("./receipts.js").OrcaOperationsReceipt
++        );
+       }
+       return parsed;
+     } catch (error) {
+@@ -201,6 +211,48 @@
+   }
+ }
+ 
++function legacyReceiptOperation(kind: string): kind is import("./receipts.js").OrcaReceiptOperationKind {
++  return ["list_projects", "create_run", "create_task", "dispatch_worker", "show_worker", "read_worker", "stop_worker", "release_worker"].includes(kind);
++}
++
++function assertOperationsReceiptIdentity(
++  operation: Exclude<import("./capabilities.js").ValidatedOrcaOperation, { kind: import("./receipts.js").OrcaReceiptOperationKind }>,
++  receipt: import("./receipts.js").OrcaOperationsReceipt
++): void {
++  const result = receipt.result as Record<string, unknown>;
++  if (operation.kind === "operations_dispatch" && result.taskId !== operation.taskId) {
++    throw new OrcaInvalidReceiptError();
++  }
++  switch (operation.kind) {
++    case "operations_reply": {
++      const message = result.message as { id: string; thread_id: string };
++      const question = result.question as { message_id: string; answer_message_id: string } | null | undefined;
++      if (message.thread_id !== operation.messageId
++        || (question != null && (question.message_id !== operation.messageId || question.answer_message_id !== message.id))) {
++        throw new OrcaInvalidReceiptError();
++      }
++      break;
++    }
++    case "operations_send":
++      if ((result.message as { to_handle: string }).to_handle !== `dispatch:${operation.dispatchId}`) {
++        throw new OrcaInvalidReceiptError();
++      }
++      break;
++    case "operations_stop":
++    case "operations_retain":
++    case "operations_release":
++      if (result.dispatchId !== operation.dispatchId) throw new OrcaInvalidReceiptError();
++      break;
++  }
++  const mutation = result.mutation;
++  if ("retryRequestId" in operation && mutation !== undefined) {
++    if (typeof mutation !== "object" || mutation === null
++      || (mutation as { requestId?: unknown }).requestId !== operation.retryRequestId) {
++      throw new OrcaInvalidReceiptError();
++    }
++  }
++}
++
+ export {
+   MINIMUM_ORCA_VERSION,
+   REQUIRED_ORCA_CAPABILITIES,
+@@ -212,14 +264,19 @@
+   orcaConnectionArguments,
+   OrcaProcessError,
+   OrcaTimeoutError,
++  OrcaOutputLimitError,
+   type OrcaConnectionTarget,
+ } from "./process.js";
+ export {
+   OrcaCommandError,
+   OrcaInvalidReceiptError,
+   OrcaReceiptSchema,
++  OrcaOperationsReceiptSchema,
+   OrcaStaleHandleError,
+   parseOrcaOperationReceipt,
++  parseOrcaOperationsReceipt,
+   type OrcaProject,
++  type OrcaOperationsReceipt,
++  type OrcaOperationsReceiptKind,
+   type OrcaReceipt
+ } from "./receipts.js";
+diff --git a/packages/orca-adapter/src/process.ts b/packages/orca-adapter/src/process.ts
+--- a/packages/orca-adapter/src/process.ts
++++ b/packages/orca-adapter/src/process.ts
+@@ -11,6 +11,7 @@
+   readonly signal: AbortSignal;
+   readonly timeoutMs: number;
+   readonly terminationGraceMs: number;
++  readonly maxOutputBytes?: number;
+   readonly connectionTarget?: OrcaConnectionTarget;
+ }
+ 
+@@ -94,6 +95,13 @@
+   }
+ }
+ 
++export class OrcaOutputLimitError extends Error {
++  readonly code = "orca_output_limit";
++  readonly retryable = false;
++  readonly maxOutputBytes: number;
++  constructor(maxOutputBytes: number) { super("Orca CLI output exceeded its limit"); this.name = "OrcaOutputLimitError"; this.maxOutputBytes = maxOutputBytes; }
++}
++
+ function parseJsonReceiptText(stdout: string): unknown {
+   try {
+     return JSON.parse(stdout) as unknown;
+@@ -132,6 +140,8 @@
+   if (!Number.isSafeInteger(options.terminationGraceMs) || options.terminationGraceMs <= 0) {
+     throw new TypeError("terminationGraceMs must be a positive safe integer");
+   }
++  const maxOutputBytes = options.maxOutputBytes ?? 2 * 1024 * 1024;
++  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) throw new TypeError("maxOutputBytes must be a positive safe integer");
+   if (args.includes("--json")) throw new TypeError("runOrca appends --json");
+   const connectionArgs = orcaConnectionArguments(
+     options.connectionTarget ?? Object.freeze({ kind: "local" })
+@@ -144,9 +154,10 @@
+       stdio: ["ignore", "pipe", "pipe"]
+     });
+     let stdout = "";
++    let stdoutBytes = 0;
+     let finished = false;
+     let closed = false;
+-    let cancellationReason: "aborted" | "timeout" | undefined;
++    let cancellationReason: "aborted" | "timeout" | "output_limit" | undefined;
+     let processError: OrcaProcessError | undefined;
+     let timeout: ReturnType<typeof setTimeout> | undefined;
+     let terminationGrace: ReturnType<typeof setTimeout> | undefined;
+@@ -159,7 +170,7 @@
+       options.signal.removeEventListener("abort", abort);
+       action();
+     };
+-    const cancel = (reason: "aborted" | "timeout"): void => {
++    const cancel = (reason: "aborted" | "timeout" | "output_limit"): void => {
+       if (finished || cancellationReason !== undefined) return;
+       cancellationReason = reason;
+       child.kill("SIGTERM");
+@@ -171,7 +182,16 @@
+ 
+     child.stdout.setEncoding("utf8");
+     child.stderr.setEncoding("utf8");
+-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
++    child.stdout.on("data", (chunk: string) => {
++      if (cancellationReason === "output_limit") return;
++      const chunkBytes = Buffer.byteLength(chunk, "utf8");
++      if (stdoutBytes + chunkBytes > maxOutputBytes) {
++        cancel("output_limit");
++        return;
++      }
++      stdout += chunk;
++      stdoutBytes += chunkBytes;
++    });
+     child.stderr.resume();
+     child.on("error", () => {
+       processError = new OrcaProcessError(null);
+@@ -179,7 +199,9 @@
+     child.on("close", (exitCode) => {
+       closed = true;
+       finish(() => {
+-        if (cancellationReason === "aborted") {
++        if (cancellationReason === "output_limit") {
++          reject(new OrcaOutputLimitError(maxOutputBytes));
++        } else if (cancellationReason === "aborted") {
+           reject(new OrcaAbortedError());
+         } else if (cancellationReason === "timeout") {
+           reject(new OrcaTimeoutError(options.timeoutMs));
+diff --git a/packages/orca-adapter/src/receipts.ts b/packages/orca-adapter/src/receipts.ts
+--- a/packages/orca-adapter/src/receipts.ts
++++ b/packages/orca-adapter/src/receipts.ts
+@@ -196,6 +196,197 @@
+   }).strict();
+ }
+ 
++const BoundedIdSchema = z.string().trim().min(1).max(512);
++const BoundedTextSchema = z.string().max(64 * 1024);
++const CursorSchema = z.string().trim().min(1).max(2048);
++const NullableCursorSchema = CursorSchema.nullable().optional();
++const MutationSchema = z.object({ requestId: BoundedIdSchema, replayed: z.boolean() }).passthrough();
++const RunSchema = z.object({ id: BoundedIdSchema, objective: BoundedTextSchema }).passthrough();
++const TaskSchema = z.object({ id: BoundedIdSchema, status: OrcaStateSchema }).passthrough();
++const ProjectionSchema = z.object({
++  dispatchId: BoundedIdSchema,
++  taskId: BoundedIdSchema,
++  runId: BoundedIdSchema,
++  liveness: z.object({ verdict: OrcaStateSchema }).passthrough()
++}).passthrough();
++const WorkerListSchema = z.object({ dispatchId: BoundedIdSchema, projection: ProjectionSchema }).passthrough();
++const InboxMessageSchema = z.object({
++  id: BoundedIdSchema,
++  type: OrcaStateSchema,
++  subject: BoundedTextSchema,
++  body: BoundedTextSchema
++}).passthrough();
++const ProjectSchema = z.object({ id: BoundedIdSchema, displayName: BoundedTextSchema, kind: OrcaStateSchema }).passthrough();
++const SetupSchema = z.object({
++  id: BoundedIdSchema,
++  projectId: BoundedIdSchema,
++  hostId: BoundedIdSchema,
++  repoId: BoundedIdSchema,
++  path: BoundedTextSchema
++}).passthrough();
++const WorktreeSchema = z.object({
++  id: BoundedIdSchema,
++  repoId: BoundedIdSchema,
++  projectId: BoundedIdSchema,
++  hostId: BoundedIdSchema,
++  projectHostSetupId: BoundedIdSchema,
++  path: BoundedTextSchema
++}).passthrough();
++const TerminalSchema = z.object({
++  handle: BoundedIdSchema,
++  incarnationId: BoundedIdSchema,
++  worktreeId: BoundedIdSchema,
++  connected: z.boolean(),
++  writable: z.boolean(),
++  executionHostId: BoundedIdSchema
++}).passthrough();
++const HostScopeSchema = z.object({
++  hostIds: z.array(BoundedIdSchema).max(100),
++  omittedHostIds: z.array(BoundedIdSchema).max(100)
++}).passthrough();
++const DispatchResultSchema = z.object({
++  dispatchId: BoundedIdSchema,
++  taskId: BoundedIdSchema,
++  runId: BoundedIdSchema,
++  mutation: MutationSchema.optional()
++}).passthrough();
++// Public Orca 1.4.203 reply receipt: message.thread_id identifies the replied-to message.
++const OperationsMessageSchema = InboxMessageSchema.extend({
++  type: BoundedIdSchema,
++  run_id: BoundedIdSchema,
++  from_handle: BoundedIdSchema,
++  to_handle: BoundedIdSchema,
++  thread_id: BoundedIdSchema.nullable(),
++  created_at: z.string().datetime()
++});
++const MessageMutationResultSchema = z.object({
++  message: OperationsMessageSchema,
++  mutation: MutationSchema
++}).passthrough();
++const ReplyQuestionSchema = z.object({
++  message_id: BoundedIdSchema,
++  run_id: BoundedIdSchema,
++  dispatch_id: BoundedIdSchema,
++  asker_handle: BoundedIdSchema,
++  status: z.literal("answered"),
++  answer_message_id: BoundedIdSchema,
++  answer_body: BoundedTextSchema,
++  answered_by_generation: z.number().int().positive(),
++  created_at: z.string().datetime(),
++  answered_at: z.string().datetime(),
++  closed_at: z.string().datetime().nullable()
++}).passthrough();
++const ReplyMutationResultSchema = z.object({
++  message: OperationsMessageSchema.extend({ thread_id: BoundedIdSchema }),
++  question: ReplyQuestionSchema.nullish(),
++  duplicate: z.boolean(),
++  mutation: MutationSchema
++}).passthrough();
++const OperationsStateSchema = z.string().trim().min(1).max(512);
++const OperationsWorkerReadBaseSchema = z.object({
++  dispatchId: BoundedIdSchema,
++  cursor: CursorSchema,
++  status: z.object({ worker: OperationsStateSchema, terminal: OperationsStateSchema }).passthrough(),
++  warnings: z.array(BoundedTextSchema).max(100),
++  archived: z.boolean()
++}).passthrough();
++const OperationsWorkerReadResultSchema = z.discriminatedUnion("source", [
++  OperationsWorkerReadBaseSchema.extend({
++    source: z.literal("transcript"),
++    terminal: z.never().optional(),
++    transcript: z.object({
++      messages: z.array(z.object({
++        id: BoundedIdSchema,
++        role: OperationsStateSchema,
++        blocks: z.array(z.object({}).passthrough().refine(
++          (block) => JSON.stringify(block).length <= 64 * 1024,
++          "transcript block exceeds public text bound"
++        )).max(500),
++        timestamp: z.number().finite(),
++        source: OperationsStateSchema
++      }).passthrough()).max(500),
++      limited: z.boolean(),
++      nextCursor: CursorSchema,
++      returnedMessageCount: z.number().int().nonnegative().max(500)
++    }).passthrough()
++  }),
++  OperationsWorkerReadBaseSchema.extend({
++    source: z.literal("terminal"),
++    transcript: z.never().optional(),
++    terminal: z.object({
++      lines: z.array(BoundedTextSchema).max(500),
++      limited: z.boolean(),
++      nextCursor: CursorSchema
++    }).passthrough()
++  })
++]);
++const WorkerMutationResultSchema = z.object({
++  dispatchId: BoundedIdSchema,
++  state: OperationsStateSchema,
++  verdict: OperationsStateSchema,
++  mutation: MutationSchema.optional()
++}).passthrough();
++
++const operationsReceiptSchemas = {
++  operations_status: OrcaStatusReceiptSchema,
++  list_runs: successReceiptSchema(z.object({ runs: z.array(RunSchema).max(100), nextCursor: NullableCursorSchema }).passthrough()),
++  show_run: successReceiptSchema(z.object({ run: RunSchema }).passthrough()),
++  list_tasks: successReceiptSchema(z.object({ tasks: z.array(TaskSchema).max(100) }).passthrough()),
++  list_workers: successReceiptSchema(z.object({
++    workers: z.array(WorkerListSchema).max(100),
++    page: z.object({ limit: z.number().int().positive().max(100), hasMore: z.boolean(), nextCursor: NullableCursorSchema }).passthrough(),
++    scope: z.object({ source: OrcaStateSchema }).passthrough()
++  }).passthrough()),
++  operations_worker_read: successReceiptSchema(OperationsWorkerReadResultSchema),
++  operations_inbox: successReceiptSchema(z.object({ messages: z.array(InboxMessageSchema).max(100), count: z.number().int().nonnegative() }).passthrough()),
++  operations_list_projects: successReceiptSchema(z.object({ projects: z.array(ProjectSchema).max(100) }).passthrough()),
++  list_project_setups: successReceiptSchema(z.object({ setups: z.array(SetupSchema).max(100) }).passthrough()),
++  list_worktrees: successReceiptSchema(z.object({ worktrees: z.array(WorktreeSchema).max(100), hostScope: HostScopeSchema, totalCount: z.number().int().nonnegative(), truncated: z.boolean() }).passthrough()),
++  show_worktree: successReceiptSchema(z.object({ worktree: WorktreeSchema }).passthrough()),
++  list_terminals: successReceiptSchema(z.object({ terminals: z.array(TerminalSchema).max(100), hostScope: HostScopeSchema, totalCount: z.number().int().nonnegative(), truncated: z.boolean() }).passthrough()),
++  show_terminal: successReceiptSchema(z.object({ terminal: TerminalSchema }).passthrough()),
++  read_terminal: successReceiptSchema(z.object({ terminal: z.object({
++    handle: BoundedIdSchema,
++    status: OrcaStateSchema,
++    tail: z.array(BoundedTextSchema).max(500),
++    truncated: z.boolean(),
++    limited: z.boolean(),
++    nextCursor: CursorSchema,
++    source: OrcaStateSchema
++  }).passthrough() }).passthrough()),
++  operations_dispatch: successReceiptSchema(DispatchResultSchema),
++  operations_reply: successReceiptSchema(ReplyMutationResultSchema),
++  operations_send: successReceiptSchema(MessageMutationResultSchema),
++  operations_stop: successReceiptSchema(WorkerMutationResultSchema),
++  operations_retain: successReceiptSchema(WorkerMutationResultSchema),
++  operations_release: successReceiptSchema(WorkerMutationResultSchema)
++} as const;
++
++export type OrcaOperationsReceiptKind = keyof typeof operationsReceiptSchemas;
++export const OrcaOperationsReceiptSchema = z.union([
++  operationsReceiptSchemas.operations_status,
++  operationsReceiptSchemas.list_runs,
++  operationsReceiptSchemas.show_run,
++  operationsReceiptSchemas.list_tasks,
++  operationsReceiptSchemas.list_workers,
++  operationsReceiptSchemas.operations_worker_read,
++  operationsReceiptSchemas.operations_inbox,
++  operationsReceiptSchemas.operations_list_projects,
++  operationsReceiptSchemas.list_project_setups,
++  operationsReceiptSchemas.list_worktrees,
++  operationsReceiptSchemas.show_worktree,
++  operationsReceiptSchemas.list_terminals,
++  operationsReceiptSchemas.show_terminal,
++  operationsReceiptSchemas.read_terminal,
++  operationsReceiptSchemas.operations_dispatch,
++  operationsReceiptSchemas.operations_reply,
++  operationsReceiptSchemas.operations_send,
++  operationsReceiptSchemas.operations_stop,
++  operationsReceiptSchemas.operations_retain,
++  operationsReceiptSchemas.operations_release
++]);
++export type OrcaOperationsReceipt = z.infer<typeof OrcaOperationsReceiptSchema>;
++
+ export const OrcaCreateRunReceiptSchema = successReceiptSchema(OrcaRunResultSchema);
+ export const OrcaCreateTaskReceiptSchema = successReceiptSchema(OrcaTaskResultSchema);
+ export const OrcaStartWorkerReceiptSchema = successReceiptSchema(OrcaWorkerStartResultSchema);
+@@ -269,6 +460,14 @@
+   return parsed.success ? parsed.data : invalidReceipt();
+ }
+ 
++export function parseOrcaOperationsReceipt(
++  kind: OrcaOperationsReceiptKind,
++  value: unknown
++): OrcaOperationsReceipt {
++  const parsed = operationsReceiptSchemas[kind].safeParse(value);
++  return parsed.success ? parsed.data : invalidReceipt();
++}
++
+ export function parseOrcaStatusReceipt(value: unknown): OrcaStatusReceipt {
+   const parsed = OrcaStatusReceiptSchema.safeParse(value);
+   return parsed.success ? parsed.data : invalidReceipt();
+diff --git a/packages/core/src/operations.ts b/packages/core/src/operations.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/core/src/operations.ts
+@@ -0,0 +1,193 @@
++import { z } from "zod";
++
++import {
++  ContextSnapshotSchema,
++  ProgressEventKindSchema,
++  ProgressEventPayloadSchema,
++  ProgressEventSourceSchema
++} from "./progress.js";
++import { redactPublicText, sanitizeDisplayText } from "./public-output.js";
++
++const Id = z.string().trim().min(1).max(512);
++const DisplayText = z.string().max(64 * 1024).transform(sanitizeDisplayText);
++const PublicText = z.string().max(64 * 1024).transform(redactPublicText);
++const IsoDate = z.string().datetime();
++const Cursor = z.string().trim().min(1).max(2048);
++const ReceiptLinkSchema = z.object({
++  runId: Id,
++  taskId: Id,
++  dispatchId: Id,
++  terminalHandle: Id
++}).strict();
++
++export const EvidenceSchema = z.object({
++  source: z.enum(["hq_api", "hq_store", "orca_cli"]),
++  command: PublicText.pipe(z.string().max(512)).optional(),
++  observedAt: IsoDate,
++  verification: z.enum(["authoritative", "observed", "unverifiable"])
++}).strict();
++export type Evidence = z.infer<typeof EvidenceSchema>;
++
++export const SupportSchema = z.discriminatedUnion("supported", [
++  z.object({ supported: z.literal(true) }).strict(),
++  z.object({ supported: z.literal(false), reason: DisplayText.pipe(z.string().min(1).max(256)) }).strict()
++]);
++export type Support = z.infer<typeof SupportSchema>;
++
++export const OperationsStatusSchema = z.object({
++  collectedAt: IsoDate,
++  hq: z.object({
++    state: z.string().min(1),
++    capacity: z.object({
++      limit: z.union([z.number().int().positive(), z.literal("unlimited")]),
++      source: z.enum(["config", "environment", "default"]),
++      active: z.number().int().nonnegative(),
++      queued: z.number().int().nonnegative(),
++      byState: z.record(z.number().int().nonnegative()),
++      updateSupported: z.literal(false),
++      reason: DisplayText.pipe(z.string().min(1))
++    }).strict()
++  }).strict(),
++  orca: z.object({
++    state: z.string().min(1),
++    reachable: z.boolean(),
++    connectionState: z.string().min(1).optional(),
++    version: z.string().min(1),
++    runtimeId: Id.optional(),
++    features: z.record(z.unknown())
++  }).strict(),
++  metrics: z.object({
++    tokens: z.object({ available: z.literal(false), reason: z.literal("not_collected") }).strict(),
++    cost: z.object({ available: z.literal(false), reason: z.literal("not_collected") }).strict()
++  }).strict()
++}).strict();
++export type OperationsStatus = z.infer<typeof OperationsStatusSchema>;
++
++const HqEventSchema = z.object({
++  source: z.literal("hq"),
++  eventSource: ProgressEventSourceSchema,
++  seq: z.number().int().positive(),
++  eventKey: Id,
++  requestId: Id,
++  contextId: Id.nullable(),
++  kind: ProgressEventKindSchema,
++  occurredAt: IsoDate,
++  payload: ProgressEventPayloadSchema,
++  agentId: Id.optional(),
++  generation: z.number().int().positive().optional(),
++  receiptLink: ReceiptLinkSchema.optional()
++}).strict().superRefine((event, context) => {
++  if (event.receiptLink !== undefined && event.kind !== "worker.ready" && event.kind !== "worker.retained") {
++    context.addIssue({ code: "custom", path: ["receiptLink"], message: "receipt_link_kind_invalid" });
++  }
++});
++
++const PublicContextSnapshotSchema = ContextSnapshotSchema.extend({
++  title: PublicText,
++  summary: PublicText
++}).strict();
++
++export const HqContextPageSchema = z.object({
++  contexts: z.array(PublicContextSnapshotSchema).max(100),
++  cursor: Cursor.optional(),
++  compacted: z.boolean().optional()
++}).strict();
++export const HqEventPageSchema = z.object({
++  events: z.array(HqEventSchema).max(500),
++  snapshots: z.array(PublicContextSnapshotSchema).max(100),
++  cursor: Cursor.optional(),
++  compacted: z.boolean(),
++  oldestSeq: z.number().int().nonnegative(),
++  latestSeq: z.number().int().nonnegative()
++}).strict();
++export type HqContextPage = z.infer<typeof HqContextPageSchema>;
++export type HqEventPage = z.infer<typeof HqEventPageSchema>;
++
++export const HqQuestionSchema = z.object({
++  source: z.literal("hq"),
++  kind: z.enum(["router_clarification", "managed_orca_question"]),
++  requestId: Id,
++  sessionId: Id,
++  contextId: Id.optional(),
++  messageId: Id.optional(),
++  body: PublicText,
++  occurredAt: IsoDate,
++  state: z.string().min(1),
++  evidence: EvidenceSchema
++}).strict();
++export type HqQuestion = z.infer<typeof HqQuestionSchema>;
++
++const OrcaPageBase = z.object({ cursor: Cursor.optional(), warnings: z.array(PublicText).max(100).default([]) });
++export const OrcaRunPageSchema = OrcaPageBase.extend({
++  runs: z.array(z.object({ id: Id, status: z.string().min(1) }).passthrough()).max(100)
++}).strict();
++export const OrcaTaskPageSchema = OrcaPageBase.extend({
++  tasks: z.array(z.object({ id: Id, runId: Id, status: z.string().min(1) }).passthrough()).max(100)
++}).strict();
++export const OrcaWorkerPageSchema = OrcaPageBase.extend({
++  workers: z.array(z.object({ dispatchId: Id, taskId: Id.optional(), runId: Id.optional(), status: z.string().min(1) }).passthrough()).max(100)
++}).strict();
++export const OrcaWorkerDetailSchema = z.object({
++  dispatchId: Id,
++  projection: z.object({ liveness: z.object({ verdict: z.string().min(1) }).passthrough() }).passthrough(),
++  observation: z.object({ status: z.string().min(1), exactWorker: z.boolean() }).passthrough(),
++  terminal: z.object({ connected: z.boolean().optional(), writable: z.boolean().optional(), incarnation: Id.optional() }).passthrough().nullable(),
++  outcome: z.unknown().optional(),
++  resourceSettlement: z.unknown().optional()
++}).passthrough();
++
++const OrcaOutputBase = {
++  cursor: Cursor.optional(),
++  archived: z.boolean(),
++  warnings: z.array(PublicText).max(100)
++};
++export const OrcaOutputPageSchema = z.discriminatedUnion("source", [
++  z.object({
++    source: z.literal("transcript"),
++    ...OrcaOutputBase,
++    messages: z.array(z.object({ id: Id, role: z.string().min(1), text: PublicText, occurredAt: IsoDate.optional() }).strict()).max(500)
++  }).strict(),
++  z.object({ source: z.literal("terminal"), ...OrcaOutputBase, lines: z.array(PublicText).max(500) }).strict()
++]);
++export const OrcaQuestionSchema = z.object({
++  source: z.literal("orca"),
++  messageId: Id,
++  runId: Id.optional(),
++  taskId: Id.optional(),
++  dispatchId: Id.optional(),
++  terminalHandle: Id.optional(),
++  body: PublicText,
++  occurredAt: IsoDate.optional(),
++  state: z.literal("pending"),
++  evidence: EvidenceSchema
++}).strict();
++export const OrcaResourceInventorySchema = z.object({
++  projects: z.array(z.object({
++    id: Id,
++    hostScope: z.enum(["covered", "not_covered"]),
++    setups: z.array(z.object({
++      id: Id,
++      worktrees: z.array(z.object({
++        id: Id,
++        terminals: z.array(z.object({ id: Id }).passthrough()).max(100)
++      }).passthrough()).max(100)
++    }).passthrough()).max(100)
++  }).passthrough()).max(100)
++}).strict();
++export const OperationsMutationReceiptSchema = z.object({
++  requestId: Id,
++  action: z.string().min(1),
++  targetId: Id,
++  state: z.enum(["accepted", "rejected", "unknown"]),
++  observedAt: IsoDate,
++  detail: PublicText.pipe(z.string().max(1024)).optional()
++}).strict();
++
++export type OrcaRunPage = z.infer<typeof OrcaRunPageSchema>;
++export type OrcaTaskPage = z.infer<typeof OrcaTaskPageSchema>;
++export type OrcaWorkerPage = z.infer<typeof OrcaWorkerPageSchema>;
++export type OrcaWorkerDetail = z.infer<typeof OrcaWorkerDetailSchema>;
++export type OrcaOutputPage = z.infer<typeof OrcaOutputPageSchema>;
++export type OrcaQuestion = z.infer<typeof OrcaQuestionSchema>;
++export type OrcaResourceInventory = z.infer<typeof OrcaResourceInventorySchema>;
++export type OperationsMutationReceipt = z.infer<typeof OperationsMutationReceiptSchema>;
+diff --git a/packages/core/src/public-output.ts b/packages/core/src/public-output.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/core/src/public-output.ts
+@@ -0,0 +1,42 @@
++const displayTextLimit = 400;
++const resultTextLimit = 64 * 1024;
++const escape = String.fromCharCode(0x1b);
++const operatingSystemCommand = new RegExp(`${escape}\\][\\s\\S]*?(?:\\u0007|${escape}\\\\|$)`, "g");
++const controlSequence = new RegExp(`${escape}\\[[0-9;:?]*[ -/]*[@-~]`, "g");
++const remainingEscape = new RegExp(`${escape}[\\s\\S]?`, "g");
++const controlCharacters = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]", "g");
++
++function stripControls(value: string, preserveLines: boolean): string {
++  return value.replace(operatingSystemCommand, "").replace(controlSequence, "").replace(remainingEscape, "")
++    .replace(preserveLines ? /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu : controlCharacters, " ");
++}
++
++export function sanitizeDisplayText(value: unknown): string {
++  if (typeof value !== "string") return "";
++  const text = stripControls(value, false).replace(/\s+/gu, " ").trim();
++  return text.length <= displayTextLimit ? text : `${text.slice(0, displayTextLimit - 1)}…`;
++}
++
++export function sanitizeResultText(value: unknown): string {
++  if (typeof value !== "string") return "";
++  const text = stripControls(value, true).replace(/\r\n?/gu, "\n").trim();
++  return boundResultText(text);
++}
++
++/** Removes credentials before public CLI/HQ output is stored or displayed. */
++export function redactPublicText(value: unknown): string {
++  if (typeof value !== "string") return "";
++  const redacted = stripControls(value, true)
++    .replace(/\r\n?/gu, "\n")
++    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, "[REDACTED]")
++    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
++    .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/gu, "[REDACTED]")
++    .replace(/\s+/gu, " ").trim();
++  return boundResultText(redacted);
++}
++
++function boundResultText(text: string): string {
++  return text.length <= resultTextLimit
++    ? text
++    : `${text.slice(0, resultTextLimit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
++}
+diff --git a/packages/core/test/operations.test.ts b/packages/core/test/operations.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/core/test/operations.test.ts
+@@ -0,0 +1,50 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  HqEventPageSchema,
++  OrcaOutputPageSchema,
++  OperationsStatusSchema,
++  SupportSchema
++} from "../src/operations.js";
++
++describe("operations contract", () => {
++  it("keeps unavailable metrics unavailable and validates capacity provenance", () => {
++    // Break caught: a UI could show made-up zero cost or lose the capacity source.
++    expect(OperationsStatusSchema.parse({
++      collectedAt: "2026-09-15T00:00:00.000Z",
++      hq: { state: "ready", capacity: { limit: 10, source: "default", active: 1, queued: 0, byState: {}, updateSupported: false, reason: "restart_safe_mutation_contract_unavailable" } },
++      orca: { state: "ready", reachable: true, version: "1.4.203", features: {} },
++      metrics: { tokens: { available: false, reason: "not_collected" }, cost: { available: false, reason: "not_collected" } }
++    })).toMatchObject({ metrics: { tokens: { available: false }, cost: { available: false } } });
++    expect(() => OperationsStatusSchema.parse({
++      collectedAt: "2026-09-15T00:00:00.000Z", hq: { state: "ready", capacity: { limit: 0, source: "default", active: 0, queued: 0, byState: {}, updateSupported: false, reason: "x" } }, orca: { state: "ready", reachable: true, version: "1", features: {} }, metrics: { tokens: { available: true }, cost: { available: false, reason: "not_collected" } }
++    })).toThrow();
++  });
++
++  it("rejects Orca identity fields on HQ events except receipt links", () => {
++    // Break caught: merging separate HQ and Orca identities leaks inferred links into the console.
++    const base = { source: "hq", eventSource: "hq", seq: 1, eventKey: "event", requestId: "request", contextId: "context", kind: "hq.progress", occurredAt: "2026-09-15T00:00:00.000Z", payload: {} };
++    expect(HqEventPageSchema.parse({ events: [base], snapshots: [], cursor: "1", oldestSeq: 1, latestSeq: 1, compacted: false })).toMatchObject({ events: [base] });
++    expect(() => HqEventPageSchema.parse({ events: [{ ...base, dispatchId: "dispatch" }], snapshots: [], cursor: "1", oldestSeq: 1, latestSeq: 1, compacted: false })).toThrow();
++    expect(() => HqEventPageSchema.parse({ events: [{ ...base, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }], snapshots: [], oldestSeq: 1, latestSeq: 1, cursor: "1", compacted: false })).toThrow();
++    for (const kind of ["worker.ready", "worker.retained"]) expect(HqEventPageSchema.parse({
++      events: [{ ...base, kind, agentId: "agent", generation: 1, receiptLink: { runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term" } }],
++      snapshots: [], oldestSeq: 1, latestSeq: 1, compacted: false
++    })).toMatchObject({ events: [{ agentId: "agent", generation: 1 }], snapshots: [] });
++  });
++
++  it("accepts only explicit support variants", () => {
++    expect(SupportSchema.parse({ supported: true })).toEqual({ supported: true });
++    expect(SupportSchema.parse({ supported: false, reason: "not_available" })).toEqual({ supported: false, reason: "not_available" });
++    expect(() => SupportSchema.parse({ supported: false })).toThrow();
++  });
++
++  it("requires output content to match its declared source", () => {
++    // Break caught: an empty or mixed output page hides source changes from the operator.
++    const base = { cursor: "next", archived: false, warnings: [] };
++    expect(OrcaOutputPageSchema.parse({ ...base, source: "terminal", lines: ["safe"] })).toBeDefined();
++    expect(OrcaOutputPageSchema.parse({ ...base, source: "transcript", messages: [{ id: "m", role: "assistant", text: "safe" }] })).toBeDefined();
++    expect(() => OrcaOutputPageSchema.parse({ ...base, source: "terminal" })).toThrow();
++    expect(() => OrcaOutputPageSchema.parse({ ...base, source: "terminal", lines: [], messages: [] })).toThrow();
++  });
++});
+diff --git a/packages/core/test/public-output.test.ts b/packages/core/test/public-output.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/core/test/public-output.test.ts
+@@ -0,0 +1,25 @@
++import { describe, expect, it } from "vitest";
++
++import { redactPublicText, sanitizeDisplayText, sanitizeResultText } from "../src/public-output.js";
++
++describe("public output sanitizers", () => {
++  it("removes terminal controls and bounds a display line", () => {
++    // Break caught: untrusted output could clear or relabel the operator terminal.
++    expect(sanitizeDisplayText(" hello\u001b[2J\nworld ")).toBe("hello world");
++    expect(sanitizeDisplayText("x".repeat(401))).toHaveLength(400);
++  });
++
++  it("redacts credentials while preserving safe public text", () => {
++    // Break caught: an adapter error could disclose a bearer token or private key in the console.
++    expect(redactPublicText("Bearer abc.def_123\nAKIA1234567890ABCDEF\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----")).toBe("Bearer [REDACTED] [REDACTED] [REDACTED]");
++    expect(sanitizeResultText("one\r\ntwo")).toBe("one\ntwo");
++  });
++
++  it("redacts private keys before applying the public result bound", () => {
++    // Break caught: truncating away the END marker must not expose the beginning of a private key.
++    const oversized = `before\n-----BEGIN PRIVATE KEY-----\n${"secret".repeat(12_000)}\n-----END PRIVATE KEY-----\nafter`;
++    expect(redactPublicText(oversized)).toBe("before [REDACTED] after");
++    expect(redactPublicText("before\n-----BEGIN PRIVATE KEY-----\nunterminated secret"))
++      .toBe("before [REDACTED]");
++  });
++});
+diff --git a/packages/orca-adapter/test/operations.test.ts b/packages/orca-adapter/test/operations.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/orca-adapter/test/operations.test.ts
+@@ -0,0 +1,168 @@
++import { readFile } from "node:fs/promises";
++
++import { describe, expect, it } from "vitest";
++
++import { createFakeOrca } from "../../test-support/src/index.js";
++import { OrcaClient } from "../src/index.js";
++import { operationArguments, parseOrcaOperation } from "../src/capabilities.js";
++import { parseOrcaOperationsReceipt } from "../src/receipts.js";
++
++describe("operations CLI variants", () => {
++  it("builds typed argv for every operations control without JSON", () => {
++    // Break caught: a route could inject raw argv or place JSON twice.
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_status" }))).toEqual(["status"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_dispatch", taskId: "task", terminalHandle: "term", retryRequestId: "request" }))).toEqual(["orchestration", "dispatch", "--task", "task", "--to", "term", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_reply", messageId: "message", body: "answer", retryRequestId: "request" }))).toEqual(["orchestration", "reply", "--id", "message", "--body", "answer", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_send", dispatchId: "dispatch", body: "status", retryRequestId: "request" }))).toEqual(["orchestration", "send", "--subject", "HQ operator follow-up", "--to", "dispatch:dispatch", "--type", "status", "--body", "status", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_stop", dispatchId: "dispatch", retryRequestId: "request" }))).toEqual(["orchestration", "worker-stop", "--dispatch", "dispatch", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_retain", dispatchId: "dispatch", retryRequestId: "request" }))).toEqual(["orchestration", "worker-retain", "--dispatch", "dispatch", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_release", dispatchId: "dispatch", retryRequestId: "request" }))).toEqual(["orchestration", "worker-release", "--dispatch", "dispatch", "--retry-request", "request"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_runs", limit: 100, cursor: "cursor" }))).toEqual(["orchestration", "run-list", "--limit", "100", "--cursor", "cursor"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "show_run", runId: "run" }))).toEqual(["orchestration", "run-show", "--id", "run"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_tasks", runId: "run" }))).toEqual(["orchestration", "task-list", "--run", "run", "--brief"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_workers", runId: "run", cursor: "cursor" }))).toEqual(["orchestration", "worker-list", "--run", "run", "--cursor", "cursor"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_worker_read", dispatchId: "dispatch", source: "terminal", limit: 500 }))).toEqual(["orchestration", "worker-read", "--dispatch", "dispatch", "--source", "terminal", "--limit", "500"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_inbox", limit: 100 }))).toEqual(["orchestration", "inbox", "--limit", "100"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "operations_list_projects" }))).toEqual(["project", "list"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_project_setups", projectId: "project" }))).toEqual(["project", "setups", "--project", "project"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_worktrees", repoId: "repo", limit: 100 }))).toEqual(["worktree", "list", "--repo", "id:repo", "--limit", "100"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "show_worktree", worktreeId: "worktree" }))).toEqual(["worktree", "show", "--worktree", "worktree"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "list_terminals", worktreeId: "worktree" }))).toEqual(["terminal", "list", "--worktree", "worktree"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "show_terminal", terminalHandle: "term" }))).toEqual(["terminal", "show", "--terminal", "term"]);
++    expect(operationArguments(parseOrcaOperation({ kind: "read_terminal", terminalHandle: "term", cursor: "cursor" }))).toEqual(["terminal", "read", "--terminal", "term", "--cursor", "cursor"]);
++  });
++
++  it("rejects whitespace and oversized operation fields", () => {
++    // Break caught: unbounded public input can bypass the typed argv boundary and exhaust a child invocation.
++    expect(() => parseOrcaOperation({ kind: "show_run", runId: "   " })).toThrow();
++    expect(() => parseOrcaOperation({ kind: "operations_reply", messageId: "m", body: "x".repeat(8_193), retryRequestId: "r" })).toThrow();
++    expect(() => parseOrcaOperation({ kind: "read_terminal", terminalHandle: "t", cursor: "x".repeat(2_049) })).toThrow();
++  });
++
++  it("validates each operations receipt result instead of only its envelope", () => {
++    // Break caught: `{ok:true,result:{}}` must not become trusted state for any public operation.
++    const parse = parseOrcaOperationsReceipt as unknown as (kind: string, value: unknown) => unknown;
++    const valid = { id: "receipt", ok: true, result: { runs: [{ id: "run", objective: "work" }], nextCursor: "next" } };
++    expect(parse("list_runs", valid)).toMatchObject(valid);
++    for (const kind of ["operations_status", "list_runs", "show_run", "list_tasks", "list_workers", "operations_worker_read", "operations_inbox", "operations_list_projects", "list_project_setups", "list_worktrees", "show_worktree", "list_terminals", "show_terminal", "read_terminal", "operations_dispatch", "operations_reply", "operations_send", "operations_stop", "operations_retain", "operations_release"]) {
++      expect(() => parse(kind, { id: "receipt", ok: true, result: {} })).toThrow();
++    }
++  });
++
++  it("rejects nonempty malformed operation receipts", () => {
++    // Break caught: presence-only reply checks and blank lifecycle verdicts accept unusable receipts.
++    const receipt = (result: unknown) => ({ id: "receipt", ok: true, result });
++    expect(() => parseOrcaOperationsReceipt("operations_reply", receipt({ mutation: { requestId: "request", replayed: false }, reply: 42 }))).toThrow();
++  });
++
++  it("rejects blank lifecycle states and verdicts", () => {
++    // Break caught: a target identity alone cannot turn an empty verdict into a valid receipt.
++    const receipt = (result: unknown) => ({ id: "receipt", ok: true, result });
++    for (const kind of ["operations_stop", "operations_retain", "operations_release"] as const) {
++      expect(() => parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "   ", verdict: "stopped" }))).toThrow();
++      expect(() => parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "stopped", verdict: "   " }))).toThrow();
++      expect(parseOrcaOperationsReceipt(kind, receipt({ dispatchId: "dispatch", state: "stopped", verdict: "stopped" }))).toBeDefined();
++    }
++  });
++
++  it("bounds worker output and requires source-matching content", () => {
++    // Break caught: the legacy permissive read union cannot be the public operations boundary.
++    const base = { dispatchId: "dispatch", cursor: "cursor", status: { worker: "ready", terminal: "ready" }, warnings: [], archived: false };
++    const terminal = { lines: ["safe"], limited: false, nextCursor: "next" };
++    const transcript = { messages: [{ id: "message", role: "assistant", blocks: [{ type: "text", text: "safe" }], timestamp: 1, source: "transcript" }], limited: false, nextCursor: "next", returnedMessageCount: 1 };
++    const parse = (result: unknown) => parseOrcaOperationsReceipt("operations_worker_read", { id: "receipt", ok: true, result });
++    expect(parse({ ...base, source: "terminal", terminal })).toBeDefined();
++    expect(parse({ ...base, source: "transcript", transcript })).toBeDefined();
++    for (const result of [
++      { ...base, source: "transcript", terminal },
++      { ...base, source: "terminal", transcript },
++      { ...base, source: "terminal", terminal, transcript },
++      { ...base, source: "transcript", transcript, terminal },
++      { ...base, source: "terminal" },
++      { ...base, source: "terminal", terminal: { ...terminal, lines: Array(501).fill("line") } },
++      { ...base, source: "terminal", terminal: { ...terminal, lines: ["x".repeat(65_537)] } },
++      { ...base, source: "transcript", transcript: { ...transcript, messages: Array(501).fill(transcript.messages[0]) } },
++      { ...base, source: "terminal", terminal, cursor: "x".repeat(2049) },
++      { ...base, source: "terminal", terminal, dispatchId: " " },
++      { ...base, source: "terminal", terminal, warnings: Array(101).fill("warning") },
++      { ...base, source: "transcript", transcript: { ...transcript, messages: [{ ...transcript.messages[0], blocks: [{ text: "x".repeat(65_537) }] }] } }
++    ]) expect(() => parse(result)).toThrow();
++  });
++
++  it("validates public reply/message structure and returned identities", async () => {
++    // Shape observed in Orca 1.4.203 reply to msg_af1d64d147f0 (coordinator evidence msg_5c6866844d09).
++    // Break caught: another message, question, Dispatch, or retry request cannot satisfy this invocation.
++    const message = { id: "answer", run_id: "run", from_handle: "run:run", to_handle: "dispatch:dispatch", subject: "Re: Question", body: "answer", type: "status", priority: "normal", thread_id: "wanted", payload: null, created_at: "2026-09-15T08:24:00Z", delivered_at: null, delivery_contract: "current_delivery" };
++    const question = { message_id: "wanted", run_id: "run", dispatch_id: "dispatch", asker_handle: "term", status: "answered", answer_message_id: "answer", answer_body: "answer", answered_by_generation: 1, created_at: "2026-09-15T08:23:00Z", answered_at: "2026-09-15T08:24:00Z", closed_at: null };
++    const mutation = { requestId: "request", replayed: false };
++    const result = { message, question, duplicate: false, mutation };
++    const receipt = (value: unknown) => ({ id: "receipt", ok: true, result: value });
++    expect(parseOrcaOperationsReceipt("operations_reply", receipt(result))).toBeDefined();
++    expect(parseOrcaOperationsReceipt("operations_reply", receipt({ message, duplicate: false, mutation }))).toBeDefined();
++    for (const value of [{ ...result, message: 42 }, { ...result, message: { ...message, thread_id: " " } }, { ...result, question: 42 }, { ...result, question: { ...question, message_id: " " } }]) {
++      expect(() => parseOrcaOperationsReceipt("operations_reply", receipt(value))).toThrow();
++    }
++    const fake = await createFakeOrca();
++    try {
++      const status = JSON.parse(await readFile(new URL("./fixtures/status-1.4.194.json", import.meta.url), "utf8")) as unknown;
++      await fake.enqueueJson(["status", "--json"], status);
++      for (const name of ["orca-cli", "orchestration"] as const) await fake.enqueueJson(["skills", "get", name, "--json"], { name, full: false, markdown: "public contract" });
++      const client = new OrcaClient({ executablePath: fake.executablePath, signal: new AbortController().signal, timeoutMs: 5_000, expectedVersionRange: ">=1.4.194" });
++      const reply = { kind: "operations_reply", messageId: "wanted", body: "answer", retryRequestId: "request" } as const;
++      for (const value of [
++        { ...result, message: { ...message, thread_id: "other" } },
++        { ...result, question: { ...question, message_id: "other" } },
++        { ...result, question: { ...question, answer_message_id: "other" } },
++        { ...result, mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(reply), "--json"], receipt(value));
++        await expect(client.execute(reply)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
++      await fake.enqueueJson([...operationArguments(reply), "--json"], receipt(result));
++      await expect(client.execute(reply)).resolves.toMatchObject({ result: { message: { thread_id: "wanted" } } });
++      const send = { kind: "operations_send", dispatchId: "dispatch", body: "answer", retryRequestId: "request" } as const;
++      for (const value of [
++        { message: { ...message, to_handle: "dispatch:other", thread_id: null }, mutation },
++        { message: { ...message, thread_id: null }, mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(send), "--json"], receipt(value));
++        await expect(client.execute(send)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
++      await fake.enqueueJson([...operationArguments(send), "--json"], receipt({ message: { ...message, thread_id: null }, mutation }));
++      await expect(client.execute(send)).resolves.toMatchObject({ result: { message: { to_handle: "dispatch:dispatch" } } });
++    } finally { await fake.cleanup(); }
++  });
++
++  it("rejects a mutation receipt for a different target", async () => {
++    // Break caught: a successful receipt for another Dispatch must not authorize the requested control.
++    const fake = await createFakeOrca();
++    try {
++      const status = JSON.parse(await readFile(new URL("./fixtures/status-1.4.194.json", import.meta.url), "utf8")) as unknown;
++      await fake.enqueueJson(["status", "--json"], status);
++      for (const name of ["orca-cli", "orchestration"] as const) {
++        await fake.enqueueJson(["skills", "get", name, "--json"], { name, full: false, markdown: "public contract" });
++      }
++      const client = new OrcaClient({ executablePath: fake.executablePath, signal: new AbortController().signal, timeoutMs: 5_000, expectedVersionRange: ">=1.4.194" });
++      for (const kind of ["operations_stop", "operations_retain", "operations_release"] as const) {
++        const operation = { kind, dispatchId: "wanted", retryRequestId: "request" };
++        for (const result of [
++          { dispatchId: "other", state: "stopped", verdict: "stopped" },
++          { dispatchId: "wanted", state: "stopped", verdict: "stopped", mutation: { requestId: "other", replayed: false } }
++        ]) {
++          await fake.enqueueJson([...operationArguments(operation), "--json"], { id: "receipt", ok: true, result });
++          await expect(client.execute(operation)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++        }
++      }
++      const dispatch = { kind: "operations_dispatch", taskId: "task", terminalHandle: "term", retryRequestId: "request" } as const;
++      for (const result of [
++        { dispatchId: "dispatch", taskId: "other", runId: "run" },
++        { dispatchId: "dispatch", taskId: "task", runId: "run", mutation: { requestId: "other", replayed: false } }
++      ]) {
++        await fake.enqueueJson([...operationArguments(dispatch), "--json"], { id: "receipt", ok: true, result });
++        await expect(client.execute(dispatch)).rejects.toMatchObject({ code: "invalid_orca_receipt" });
++      }
++    } finally {
++      await fake.cleanup();
++    }
++  });
++});
+diff --git a/packages/orca-adapter/test/process.test.ts b/packages/orca-adapter/test/process.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/orca-adapter/test/process.test.ts
+@@ -0,0 +1,19 @@
++import { describe, expect, it } from "vitest";
++
++import { runOrca } from "../src/process.js";
++
++describe("bounded Orca process", () => {
++  it("bounds output and SIGKILLs a child that ignores overflow SIGTERM", async () => {
++    // Break caught: overflow must use the hard cancellation path instead of buffering until command timeout.
++    const source = "process.on('SIGTERM',()=>{}); setInterval(()=>process.stdout.write('x'.repeat(4096)),5)";
++    const startedAt = Date.now();
++    await expect(runOrca(["-e", source, "--"], {
++      executablePath: process.execPath,
++      signal: new AbortController().signal,
++      timeoutMs: 5_000,
++      terminationGraceMs: 20,
++      maxOutputBytes: 1_024
++    })).rejects.toMatchObject({ code: "orca_output_limit", retryable: false, maxOutputBytes: 1_024 });
++    expect(Date.now() - startedAt).toBeLessThan(1_000);
++  });
++});
+```

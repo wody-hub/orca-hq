@@ -1,57 +1,52 @@
 import { useEffect, useRef, useState } from "react";
+import { createOperationsApi, OperationsApiError, type OperationsApi } from "./api.js";
+import { AsyncState } from "./components/async-state.js";
+import { OperationsCompose } from "./routes/operations-compose.js";
+import { HqDetail, OrcaDetail } from "./routes/operations-detail.js";
+import { OperationsEvidence } from "./routes/operations-evidence.js";
+import { OperationsList } from "./routes/operations-list.js";
+import { OperationsOverview } from "./routes/operations-overview.js";
+import { OperationsQuestions } from "./routes/operations-questions.js";
+import { OperationsResources } from "./routes/operations-resources.js";
+import { OperationsSettings } from "./routes/operations-settings.js";
+import { OperationsMutationRegistry } from "./operations-state.js";
 
-import { createDashboardApi, DashboardApiError, type CommandDetail, type CommandSummary, type DashboardApi } from "./api.js";
-import { CommandDetailView } from "./routes/command-detail.js";
-import { CommandList } from "./routes/command-list.js";
+const nav = [
+  ["/overview", "운영 개요"], ["/work", "업무 목록"], ["/compose", "새 지시"], ["/questions", "질문함"],
+  ["/resources", "프로젝트/터미널"], ["/settings", "운영 설정"], ["/evidence", "리서치/기획"],
+] as const;
 
-type ViewState = "loading" | "ready" | "error" | "not-found";
-function commandIdFromPath(): string | undefined {
-  const match = window.location.pathname.match(/^\/commands\/([^/]+)$/);
-  return match?.[1] === undefined ? undefined : decodeURIComponent(match[1]);
+function Screen({ path, api, mutations, navigate }: Readonly<{ path: string; api: OperationsApi; mutations: OperationsMutationRegistry; navigate: (path: string) => void }>) {
+  const hq = path.match(/^\/work\/hq\/([^/]+)$/);
+  const orca = path.match(/^\/work\/orca\/([^/]+)$/);
+  if (hq?.[1]) return <HqDetail api={api} contextId={decodeURIComponent(hq[1])} navigate={navigate} />;
+  if (orca?.[1]) return <OrcaDetail api={api} mutations={mutations} dispatchId={decodeURIComponent(orca[1])} navigate={navigate} />;
+  if (path === "/work") return <OperationsList api={api} navigate={navigate} />;
+  if (path === "/resources") return <OperationsResources api={api} />;
+  if (path === "/settings") return <OperationsSettings api={api} />;
+  if (path === "/evidence") return <OperationsEvidence api={api} />;
+  if (path === "/questions") return <OperationsQuestions api={api} mutations={mutations} />;
+  if (path === "/compose") return <OperationsCompose api={api} mutations={mutations} />;
+  return <OperationsOverview api={api} navigate={navigate} />;
 }
-function message(error: unknown): string {
-  const status = error instanceof DashboardApiError ? error.status : undefined;
-  if (status === 401) return "로그인 또는 세션을 다시 확인해 주세요.";
-  if (status === 403) return "이 정보에 접근할 권한이 없습니다.";
-  if (status === 409) return "제안이 변경되었습니다. 최신 정보를 확인해 주세요.";
-  if (status === 404) return "요청한 명령을 찾을 수 없습니다.";
-  return "정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.";
-}
-export function App({ api = createDashboardApi(), initialCommandId }: Readonly<{ api?: DashboardApi; initialCommandId?: string }>) {
-  const [commands, setCommands] = useState<readonly CommandSummary[]>([]);
-  const [detail, setDetail] = useState<CommandDetail>();
-  const [state, setState] = useState<ViewState>("loading");
-  const [error, setError] = useState("");
-  const requestEpoch = useRef(0);
-  const loadList = async () => { const epoch = ++requestEpoch.current; setState("loading"); setDetail(undefined); try { const result = await api.listCommands(); if (epoch !== requestEpoch.current) return; setCommands(result.commands); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState("error"); } };
-  const loadDetail = async (id: string, push: boolean) => { const epoch = ++requestEpoch.current; setState("loading"); try { const result = await api.getCommand(id); if (epoch !== requestEpoch.current) return; setDetail(result); if (push) window.history.pushState({}, "", `/commands/${encodeURIComponent(id)}`); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState(cause instanceof DashboardApiError && cause.status === 404 ? "not-found" : "error"); } };
-  const loadPath = async (push = false) => {
-    const commandId = commandIdFromPath();
-    if (commandId === undefined) await loadList();
-    else await loadDetail(commandId, push);
-  };
+
+export function App({ api = createOperationsApi() }: Readonly<{ api?: OperationsApi }>) {
+  const [path, setPath] = useState(window.location.pathname === "/" ? "/overview" : window.location.pathname);
+  const [session, setSession] = useState<"loading" | "ready" | "error">("loading");
+  const [sessionError, setSessionError] = useState("");
+  const mutations = useRef(new OperationsMutationRegistry()).current;
+  const navigate = (next: string) => { window.history.pushState({}, "", next); setPath(next); };
   useEffect(() => {
-    const initialPath = initialCommandId === undefined ? commandIdFromPath() : initialCommandId;
-    const epoch = ++requestEpoch.current;
-    const start = async () => {
-      try {
-        await api.bootstrap();
-        if (epoch !== requestEpoch.current) return;
-        if (initialPath === undefined) await loadList();
-        else await loadDetail(initialPath, false);
-      } catch (cause) { if (epoch === requestEpoch.current) { setError(message(cause)); setState("error"); } }
-    };
-    const onPopState = () => { void loadPath(); };
-    window.addEventListener("popstate", onPopState);
-    void start();
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-  const back = () => { window.history.pushState({}, "", "/commands"); void loadList(); };
-  const connectionLabel = state === "ready" ? "연결됨 · 최신 정보" : state === "loading" ? "정보 갱신 중" : state === "error" ? "갱신 실패 · 재시도 필요" : "요청한 명령 확인 필요";
-  return <><header><nav aria-label="주요 탐색"><a href="/commands" onClick={(event) => { event.preventDefault(); back(); }}>Orca HQ</a><span>{connectionLabel}</span></nav></header><main>
-    {state === "loading" && <p role="status">정보를 불러오는 중입니다.</p>}
-    {state === "error" && <section className="card" role="alert"><h1>확인 필요</h1><p>{error}</p><button type="button" onClick={() => void loadPath()}>다시 시도</button></section>}
-    {state === "not-found" && <section className="card" role="alert"><h1>명령을 찾을 수 없음</h1><p>{error}</p><button type="button" onClick={back}>명령 목록으로</button></section>}
-    {state === "ready" && (detail ? <CommandDetailView command={detail} api={api} onBack={back} onRefresh={() => void loadDetail(detail.id, false)} /> : <CommandList commands={commands} onSelect={(id) => void loadDetail(id, true)} />)}
-  </main></>;
+    let active = true;
+    const start = async () => { try { await api.bootstrap(); if (active) setSession("ready"); } catch (error) { if (active) { setSession("error"); setSessionError(error instanceof OperationsApiError ? error.code : "session_required"); } } };
+    const pop = () => setPath(window.location.pathname);
+    window.addEventListener("popstate", pop); void start();
+    return () => { active = false; window.removeEventListener("popstate", pop); };
+  }, [api]);
+  const activeBase = path.startsWith("/work/") ? "/work" : path;
+  return <div className="app-shell"><aside className="sidebar"><div className="brand"><strong>HQ / Orca Operations</strong><small>실제 읽기 콘솔</small></div><nav aria-label="주요 화면">{nav.map(([href, label]) => <a className={activeBase === href ? "active" : ""} href={href} key={href} onClick={(event) => { event.preventDefault(); navigate(href); }}><span className="nav-dot" />{label}</a>)}</nav><p className="nav-footer">단일 운영자용 로컬 콘솔<br />HQ와 Orca 출처를 분리합니다.</p></aside>
+    <div className="content-shell"><header className="topbar"><span className={`connection ${session}`}><i />{session === "loading" ? "세션 확인 중" : session === "ready" ? "로컬 세션" : "인증 필요"}</span><span>same-origin · reviewed controls</span></header><main className="main-content">
+      {session === "loading" ? <AsyncState state="loading" /> : session === "error" ? <section className="auth-error" role="alert"><h1>로컬 세션을 열 수 없습니다</h1><p>터미널에서 <code>hq console</code>을 실행해 새 단일 사용 링크로 접속하세요.</p><small>{sessionError}</small></section> : <Screen key={path} path={path} api={api} mutations={mutations} navigate={navigate} />}
+    </main></div>
+  </div>;
 }

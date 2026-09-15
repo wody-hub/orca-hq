@@ -1,0 +1,118 @@
+--- a/apps/web/src/routes/operations-list.tsx
++++ b/apps/web/src/routes/operations-list.tsx
+@@ -32,19 +32,23 @@
+ 
+   useEffect(() => {
+     if (!read.data || contextSignature === undefined || workerSignature === undefined) return;
++    let invalidated = false;
+     if (contextFirstPage.current !== contextSignature) {
+       contextFirstPage.current = contextSignature;
+       setMoreContexts([]);
+       setContextCursor(read.data.contexts.cursor);
+-      pageRequest.current.generation++;
+-      pageRequest.current.controller?.abort();
++      invalidated = true;
+     }
+     if (workerFirstPage.current !== workerSignature) {
+       workerFirstPage.current = workerSignature;
+       setMoreWorkers([]);
+       setWorkerCursor(read.data.workers.page.nextCursor ?? undefined);
++      invalidated = true;
++    }
++    if (invalidated) {
+       pageRequest.current.generation++;
+       pageRequest.current.controller?.abort();
++      setPageState("ready");
+     }
+   }, [read.data, contextSignature, workerSignature]);
+ 
+--- a/apps/web/src/app.test.tsx
++++ b/apps/web/src/app.test.tsx
+@@ -1,4 +1,4 @@
+-import { cleanup, render, screen, within } from "@testing-library/react";
++import { act, cleanup, render, screen, within } from "@testing-library/react";
+ import { userEvent } from "@testing-library/user-event";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { App } from "./app.js";
+@@ -107,6 +107,26 @@
+     expect(screen.queryByText("오래된 두 번째 페이지")).toBeNull();
+   });
+ 
++  it("restores pagination after a changed first page supersedes an in-flight page", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    const replacement = { ...context, contextId: "context-3", title: "교체된 첫 페이지" };
++    const stale = { ...context, contextId: "context-2", title: "취소된 두 번째 페이지" };
++    let changed = false;
++    let resolvePage!: (value: Awaited<ReturnType<OperationsApi["contexts"]>>) => void;
++    const contexts = vi.fn().mockImplementation((cursor?: string) => cursor
++      ? new Promise((resolve) => { resolvePage = resolve; })
++      : Promise.resolve(changed ? { contexts: [replacement], cursor: "200" } : { contexts: [context], cursor: "100" }));
++    render(<App api={apiFor({ contexts })} />); await screen.findByText("정산 배치 확인");
++    await user.click(await screen.findByRole("button", { name: "다음 페이지 읽기" }));
++    const pageSignal = contexts.mock.calls.find(([cursor]) => cursor === "100")?.[1] as AbortSignal | undefined;
++    changed = true; document.dispatchEvent(new Event("visibilitychange"));
++    expect(await screen.findByText("교체된 첫 페이지")).toBeTruthy();
++    expect(pageSignal?.aborted).toBe(true);
++    expect((await screen.findByRole("button", { name: "다음 페이지 읽기" }) as HTMLButtonElement).disabled).toBe(false);
++    await act(async () => resolvePage({ contexts: [stale] }));
++    expect(screen.queryByText("취소된 두 번째 페이지")).toBeNull();
++  });
++
+   it("loads Orca detail and logs only when its detail tab is selected", async () => {
+     window.history.replaceState({}, "", "/work/orca/dispatch-1"); const api = apiFor(); const user = userEvent.setup();
+     render(<App api={api} />); await screen.findByText("Dispatch / projection");
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,11 +1,13 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 fix round 1 review Spec PASS / Quality BLOCK; Task 4 pending
++- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 Q4 fix implemented/verified and awaiting independent re-review; Task 4 pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
+ 
++- Task 3 fix round 2 addresses the remaining Q4 pagination state defect: changed first-page reconciliation now advances one generation fence, aborts obsolete pagination, and restores readiness without permitting late settlement to mutate rows, cursors, or state. TDD red reproduced the disabled “읽는 중” control; green passed the focused regression, **31 web tests / 2 files**, and web typecheck. See `2026-09-15-hq-orca-operations-task3-fix2.md` and `task3-fix2.diff`; independent re-review is pending and Task 4 remains out of scope.
++
+ - Task 3 fix round 1 independent review: **S1/S2/Q1/Q2/Q3 addressed; Spec PASS / Quality BLOCK** in `2026-09-15-hq-orca-operations-task3-fix1-review.md`. The review reused the recorded 30 tests plus typecheck/build and found one deterministic remaining quality defect: a changed first-page poll can abort in-flight pagination without restoring `pageState`, permanently disabling load-more. Task 4 remains out of scope.
+ 
+ - Task 3 fix round 1 addresses review S1/S2/Q1/Q2/Q3: source-honest Orca inbox observations, native Run/Task inspection, AbortSignal/generation fencing, stable exhausted and invalidated pagination chains, and actual-contract response bounds/discriminants. TDD red established 12 failures; green passed **30 tests / 2 files**, typecheck, and build (39 modules). See `2026-09-15-hq-orca-operations-task3-fix1.md` and `task3-fix1.diff`; independent re-review completed with Spec PASS / Quality BLOCK, and Task 4 remains out of scope.
+@@ -46,4 +48,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 and Task 2 final reviews passed both Spec and Quality. Task 3 fix round 1 addresses all five original findings and now passes Spec, but Quality remains blocked because a first-page refresh can strand cancelled pagination in a permanent loading state; the recorded 30 focused web tests plus typecheck/build otherwise pass. Task 4 remains responsible for controls, launcher/static serving, and full browser E2E; Task 5 still requires a fresh reviewer.
++Task 1 and Task 2 final reviews passed both Spec and Quality. Task 3 already passes Spec, and fix round 2 now addresses its remaining Q4 pagination cancellation defect with a focused red/green regression, 31 passing web tests, and web typecheck; independent Quality re-review is pending. Task 4 remains responsible for controls, launcher/static serving, and full browser E2E; Task 5 still requires a fresh reviewer.
+--- /dev/null
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task3-fix2.md
+@@ -0,0 +1,29 @@
++# Task 3 fix round 2 — Q4 pagination cancellation state
++
++Date: 2026-09-15 KST
++Status: implemented and focused verification passed; independent re-review pending
++
++## Implemented fix
++
++- First-page reconciliation now records whether either HQ or Orca signature invalidated the current pagination chain, then advances the shared generation fence once, aborts the obsolete request, and restores `pageState` to `ready`.
++- Resetting readiness happens only in the reconciliation branch that owns the newer first-page data. The superseded continuation still checks both its aborted signal and captured generation before it can append rows, change cursors, or update request state.
++- The existing unchanged-poll exhaustion behavior and separate HQ/Orca page reconciliation remain intact. Task 4 controls, launcher/static serving, and browser E2E were not touched.
++
++## TDD evidence
++
++- Red: the new deferred regression failed because, after the changed first page rendered and the stale page signal was aborted, no enabled “다음 페이지 읽기” control existed; the DOM retained a disabled “읽는 중” button.
++- Green targeted: `pnpm --filter @orca-hq/web exec vitest run --environment=jsdom --config vite.config.ts src/app.test.tsx -t "restores pagination after a changed first page supersedes an in-flight page"` — **1 passed / 14 skipped**.
++- Full web tests: `pnpm --filter @orca-hq/web test` — **31 tests / 2 files passed**.
++- Web typecheck: `pnpm --filter @orca-hq/web typecheck` — passed.
++- Build was not rerun: no dependency, asset, bundler, or build-configuration surface changed, and the production TypeScript change plus test import are covered by the fresh typecheck and full web suite.
++
++## Changed paths and boundary
++
++- Frontend: `apps/web/src/routes/operations-list.tsx`, `apps/web/src/app.test.tsx`.
++- Reports: this report, `2026-09-15-hq-orca-operations-task3-fix2.diff`, and the progress entry.
++- The overlay uses explicit pre-edit copies under `/tmp/orca-task3-fix2.HL0v9r`; it does not use a whole-worktree diff.
++- No install, nested agent/worktree, commit, push, production restart, real Orca control mutation, Task 4 work, protected document, or unrelated file change was performed.
++
++## Handoff
++
++Independent Task 3 fix round 2 review should verify Q4 and update the final Quality verdict. The earlier S1/S2/Q1/Q2/Q3 Spec PASS evidence remains unchanged.

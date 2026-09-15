@@ -1,0 +1,1433 @@
+--- a/apps/web/package.json
++++ b/apps/web/package.json
+@@ -6,6 +6,7 @@
+   "scripts": {
+     "dev": "vite",
+     "build": "tsc -p tsconfig.json && vite build",
++    "typecheck": "tsc -p tsconfig.json --noEmit",
+     "test": "vitest run --environment=jsdom --config vite.config.ts src/app.test.tsx src/api.test.ts",
+     "test:e2e": "playwright test"
+   },
+--- a/apps/web/src/api.ts
++++ b/apps/web/src/api.ts
+@@ -1,132 +1,86 @@
+-export type RiskLevel = "L0" | "L1" | "L2" | "L3" | "unknown";
+-export type DeliveryStatus = "pending" | "sent" | "failed";
+-export type VerificationStatus = "passed" | "pending" | "failed";
+-
+-export interface CommandSummary {
+-  readonly id: string;
+-  readonly summary: string;
+-  readonly status: string;
+-  readonly projectKey: string;
+-  readonly riskLevel: RiskLevel;
+-  readonly updatedAt: string;
++type JsonRecord = Record<string, unknown>;
++export interface Evidence { source: "hq_api" | "hq_store" | "orca_cli"; command?: string; observedAt: string; verification: "authoritative" | "observed" | "unverifiable" }
++export interface OperationsStatus {
++  collectedAt: string;
++  hq: { state: string; capacity: { limit: number | "unlimited"; source: "config" | "environment" | "default"; active: number; queued: number; byState: Record<string, number>; updateSupported: false; reason: string } };
++  orca: { state: string; reachable: boolean; connectionState?: string; version: string; runtimeId?: string; features: JsonRecord };
++  metrics: { tokens: { available: false; reason: "not_collected" }; cost: { available: false; reason: "not_collected" } };
+ }
+-
+-export interface CommandDetail extends CommandSummary {
+-  readonly createdAt: string;
+-  readonly project: Readonly<{ key: string; displayName: string; path: string }>;
+-  readonly routing: Readonly<{ score: number; selectedReason: string; candidates: readonly string[] }>;
+-  readonly contract: Readonly<{
+-    base: string;
+-    allowedScope: readonly string[];
+-    prohibitedEffects: readonly string[];
+-    testCommands: readonly string[];
+-  }>;
+-  readonly tasks: readonly Readonly<{
+-    id: string;
+-    title: string;
+-    status: string;
+-    dependencies: readonly string[];
+-    workerFamily: string;
+-    verifierFamily: string;
+-    dispatchId: string;
+-    dispatchStatus: string;
+-    canStop: boolean;
+-    canRetry: boolean;
+-  }>[];
+-  readonly verification: Readonly<{ status: VerificationStatus; commands: readonly string[] }>;
+-  readonly diff: Readonly<{ summary: string }>;
+-  readonly approval: Readonly<{
+-    id: string;
+-    level: "L2" | "L3" | "unknown";
+-    digest: string;
+-    expiresAt: string;
+-    operationPhrase?: string;
+-    status: "pending" | "approved" | "expired" | "denied";
+-    permitted: boolean;
+-  }>;
+-  readonly audit: Readonly<{ reference: string; summary: string }>;
+-  readonly approvalHistory: readonly Readonly<{
+-    id: string;
+-    level: "L2" | "L3";
+-    digest: string;
+-    operationPhrase?: string;
+-    status: "pending" | "approved" | "consumed" | "expired" | "invalidated";
+-    approvedAt: string;
+-    expiresAt: string;
+-  }>[];
+-  readonly auditHistory: readonly Readonly<{
+-    reference: string;
+-    subjectId: string;
+-    summary: string;
+-    occurredAt: string;
+-  }>[];
+-  readonly delivery: readonly Readonly<{ channel: string; status: DeliveryStatus }>[];
++export interface HqContext { contextId: string; title: string; state: string; summary: string; projectIds: string[]; jobIds: string[]; createdAt: string; updatedAt: string; lastSeq: number }
++export interface HqContextPage { contexts: HqContext[]; cursor?: string; compacted?: boolean }
++export interface HqContextDetail { source: "hq"; context: HqContext; evidence: Evidence }
++export interface ReceiptLink { runId: string; taskId: string; dispatchId: string; terminalHandle: string }
++export interface HqEvent { source: "hq"; eventSource: "hq" | "tool" | "orca" | "system"; seq: number; eventKey: string; requestId: string; contextId: string | null; kind: string; occurredAt: string; payload: JsonRecord; agentId?: string; generation?: number; receiptLink?: ReceiptLink }
++export interface HqEventPage { events: HqEvent[]; snapshots: HqContext[]; cursor?: string; compacted: boolean; oldestSeq: number; latestSeq: number }
++export interface HqQuestion { source: "hq"; kind: "router_clarification" | "managed_orca_question"; requestId: string; sessionId: string; contextId?: string; messageId?: string; body: string; occurredAt: string; state: string; evidence: Evidence }
++export interface HqQuestionPage { source: "hq"; questions: HqQuestion[]; cursor: string; compacted: boolean }
++export interface OrcaRun { id: string; objective: string; coordinator_handle?: string; consumer_generation?: number; [key: string]: unknown }
++export interface OrcaRunPage { source: "orca"; runs: OrcaRun[]; nextCursor?: string | null; evidence: Evidence; [key: string]: unknown }
++export interface OrcaWorkerSummary { dispatchId: string; projection: { dispatchId: string; taskId: string; runId: string; liveness: { verdict: string; [key: string]: unknown }; [key: string]: unknown }; [key: string]: unknown }
++export interface OrcaWorkerPage { source: "orca"; workers: OrcaWorkerSummary[]; page: { hasMore: boolean; nextCursor?: string | null; [key: string]: unknown }; scope: { source: string; [key: string]: unknown }; evidence: Evidence; [key: string]: unknown }
++export interface OrcaWorkerDetail {
++  source: "orca"; dispatch: { id: string; runId: string; taskId: string; status: string; processIncarnation?: string | null; [key: string]: unknown };
++  worker: { dispatchId: string; state: string; stage: string; agentTerminalHandle: string | null; [key: string]: unknown };
++  projection: { dispatchId: string; taskId: string; runId: string; liveness: { verdict: string; [key: string]: unknown }; outcome?: string; resource?: { state: string; ownerDispatchId?: string | null; releaseState: string; [key: string]: unknown }; [key: string]: unknown };
++  observation: { status: string; exactWorker: boolean; [key: string]: unknown };
++  terminal: null | { handle: string; incarnationId: string; connected: boolean; writable: boolean; executionHostId: string; worktreeId: string; [key: string]: unknown };
++  terminalResource: { id: string; ownershipState: string; releaseState: string; ownerDispatchId?: string | null; terminalHandle?: string; endpointIncarnation?: string; [key: string]: unknown };
++  evidence: Evidence; [key: string]: unknown;
+ }
++export type OrcaOutputPage = { source: "terminal"; cursor?: string; archived: boolean; warnings: string[]; lines: string[] } | { source: "transcript"; cursor?: string; archived: boolean; warnings: string[]; messages: { id: string; role: string; text: string; occurredAt?: string }[] };
++export interface OrcaQuestionPage { source: "orca"; messages: { id: string; type: string; subject: string; body: string; run_id?: string | null; from_handle?: string; to_handle?: string; created_at?: string; question?: { status: string; [key: string]: unknown }; [key: string]: unknown }[]; count: number; support: { pendingState: { supported: true } | { supported: false; reason: string } }; evidence: Evidence; [key: string]: unknown }
++export interface OrcaTerminal { id: string; [key: string]: unknown }
++export interface OrcaWorktree { id: string; terminals: OrcaTerminal[]; hostScope?: { hostIds: string[]; omittedHostIds: string[] }; truncated?: boolean; [key: string]: unknown }
++export interface OrcaSetup { id: string; worktrees: OrcaWorktree[]; covered?: boolean; truncated?: boolean; [key: string]: unknown }
++export interface OrcaResources { source: "orca"; projects: { id: string; hostScope: "covered" | "not_covered"; setups: OrcaSetup[]; [key: string]: unknown }[]; evidence: Evidence; [key: string]: unknown }
++export interface OperationsMutationReceipt { requestId: string; action: string; targetId: string; state: "accepted" | "rejected" | "unknown"; observedAt: string; detail?: string }
+ 
+-export interface DashboardApi {
+-  bootstrap(): Promise<void>;
+-  listCommands(): Promise<Readonly<{ commands: readonly CommandSummary[] }>>;
+-  getCommand(id: string): Promise<CommandDetail>;
+-  confirmApproval(id: string, input: Readonly<{ digest: string; phrase?: string }>): Promise<void>;
+-  stopDispatch(dispatchId: string): Promise<void>;
+-  retryDispatch(dispatchId: string): Promise<void>;
+-}
++interface Schema<T> { parse(value: unknown): T }
++function malformed(): never { throw new OperationsApiError(502, "malformed_response"); }
++function record(value: unknown): JsonRecord { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : malformed(); }
++function text(value: unknown): string { return typeof value === "string" && value.length > 0 ? value : malformed(); }
++function maybeText(value: unknown): string | undefined { return value === undefined ? undefined : text(value); }
++function nullableText(value: unknown): string | null | undefined { return value === undefined || value === null ? value : text(value); }
++function nullOrText(value: unknown): string | null { return value === null ? null : text(value); }
++function bool(value: unknown): boolean { return typeof value === "boolean" ? value : malformed(); }
++function integer(value: unknown): number { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : malformed(); }
++function array<T>(value: unknown, parser: (item: unknown) => T, max = 500): T[] { if (!Array.isArray(value) || value.length > max) malformed(); return value.map(parser); }
++function literal<T extends string | boolean>(value: unknown, allowed: readonly T[]): T { return allowed.includes(value as T) ? value as T : malformed(); }
++function iso(value: unknown): string { const result = text(value); return Number.isNaN(Date.parse(result)) ? malformed() : result; }
++function strings(value: unknown, max = 500): string[] { return array(value, text, max); }
++function evidence(value: unknown): Evidence { const r = record(value); return { source: literal(r.source, ["hq_api", "hq_store", "orca_cli"] as const), ...(r.command === undefined ? {} : { command: text(r.command) }), observedAt: iso(r.observedAt), verification: literal(r.verification, ["authoritative", "observed", "unverifiable"] as const) }; }
++function context(value: unknown): HqContext { const r = record(value); return { contextId: text(r.contextId), title: text(r.title), state: text(r.state), summary: typeof r.summary === "string" ? r.summary : malformed(), projectIds: strings(r.projectIds, 64), jobIds: strings(r.jobIds, 100), createdAt: iso(r.createdAt), updatedAt: iso(r.updatedAt), lastSeq: integer(r.lastSeq) }; }
++function link(value: unknown): ReceiptLink { const r = record(value); return { runId: text(r.runId), taskId: text(r.taskId), dispatchId: text(r.dispatchId), terminalHandle: text(r.terminalHandle) }; }
+ 
+-export class DashboardApiError extends Error {
+-  constructor(readonly status?: number) { super("dashboard_api_error"); }
+-}
++export const operationsStatusSchema: Schema<OperationsStatus> = { parse(value) { const r = record(value), hq = record(r.hq), capacity = record(hq.capacity), orca = record(r.orca), metrics = record(r.metrics), tokens = record(metrics.tokens), cost = record(metrics.cost), rawLimit = capacity.limit; const byState = record(capacity.byState); for (const count of Object.values(byState)) integer(count); return { collectedAt: iso(r.collectedAt), hq: { state: text(hq.state), capacity: { limit: rawLimit === "unlimited" ? rawLimit : integer(rawLimit), source: literal(capacity.source, ["config", "environment", "default"] as const), active: integer(capacity.active), queued: integer(capacity.queued), byState: byState as Record<string, number>, updateSupported: literal(capacity.updateSupported, [false] as const), reason: text(capacity.reason) } }, orca: { state: text(orca.state), reachable: bool(orca.reachable), ...(orca.connectionState === undefined ? {} : { connectionState: text(orca.connectionState) }), version: text(orca.version), ...(orca.runtimeId === undefined ? {} : { runtimeId: text(orca.runtimeId) }), features: record(orca.features) }, metrics: { tokens: { available: literal(tokens.available, [false] as const), reason: literal(tokens.reason, ["not_collected"] as const) }, cost: { available: literal(cost.available, [false] as const), reason: literal(cost.reason, ["not_collected"] as const) } } }; } };
++export const hqContextPageSchema: Schema<HqContextPage> = { parse(value) { const r = record(value); return { contexts: array(r.contexts, context, 100), ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), ...(r.compacted === undefined ? {} : { compacted: bool(r.compacted) }) }; } };
++export const hqContextDetailSchema: Schema<HqContextDetail> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), context: context(r.context), evidence: evidence(r.evidence) }; } };
++export const hqEventPageSchema: Schema<HqEventPage> = { parse(value) { const r = record(value); return { events: array(r.events, (item) => { const e = record(item); return { source: literal(e.source, ["hq"] as const), eventSource: literal(e.eventSource, ["hq", "tool", "orca", "system"] as const), seq: integer(e.seq), eventKey: text(e.eventKey), requestId: text(e.requestId), contextId: e.contextId === null ? null : text(e.contextId), kind: text(e.kind), occurredAt: iso(e.occurredAt), payload: record(e.payload), ...(e.agentId === undefined ? {} : { agentId: text(e.agentId) }), ...(e.generation === undefined ? {} : { generation: integer(e.generation) }), ...(e.receiptLink === undefined ? {} : { receiptLink: link(e.receiptLink) }) }; }), snapshots: array(r.snapshots, context, 100), ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), compacted: bool(r.compacted), oldestSeq: integer(r.oldestSeq), latestSeq: integer(r.latestSeq) }; } };
++export const hqQuestionPageSchema: Schema<HqQuestionPage> = { parse(value) { const r = record(value); return { source: literal(r.source, ["hq"] as const), questions: array(r.questions, (item) => { const q = record(item); return { source: literal(q.source, ["hq"] as const), kind: literal(q.kind, ["router_clarification", "managed_orca_question"] as const), requestId: text(q.requestId), sessionId: text(q.sessionId), ...(q.contextId === undefined ? {} : { contextId: text(q.contextId) }), ...(q.messageId === undefined ? {} : { messageId: text(q.messageId) }), body: typeof q.body === "string" ? q.body : malformed(), occurredAt: iso(q.occurredAt), state: text(q.state), evidence: evidence(q.evidence) }; }, 100), cursor: text(r.cursor), compacted: bool(r.compacted) }; } };
++export const orcaRunPageSchema: Schema<OrcaRunPage> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), runs: array(r.runs, (item) => { const run = record(item); return { ...run, id: text(run.id), objective: typeof run.objective === "string" ? run.objective : malformed(), ...(run.coordinator_handle === undefined ? {} : { coordinator_handle: text(run.coordinator_handle) }), ...(run.consumer_generation === undefined ? {} : { consumer_generation: integer(run.consumer_generation) }) }; }, 100), ...(r.nextCursor === undefined ? {} : { nextCursor: r.nextCursor === null ? null : text(r.nextCursor) }), evidence: evidence(r.evidence) }; } };
++function projection(value: unknown): OrcaWorkerDetail["projection"] { const p = record(value), liveness = record(p.liveness), resource = p.resource === undefined ? undefined : record(p.resource); return { ...p, dispatchId: text(p.dispatchId), taskId: text(p.taskId), runId: text(p.runId), liveness: { ...liveness, verdict: text(liveness.verdict) }, ...(p.outcome === undefined ? {} : { outcome: text(p.outcome) }), ...(resource === undefined ? {} : { resource: { ...resource, state: text(resource.state), releaseState: text(resource.releaseState), ...(resource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrText(resource.ownerDispatchId) }) } }) }; }
++export const orcaWorkerPageSchema: Schema<OrcaWorkerPage> = { parse(value) { const r = record(value), page = record(r.page), scope = record(r.scope); return { ...r, source: literal(r.source, ["orca"] as const), workers: array(r.workers, (item) => { const worker = record(item); return { ...worker, dispatchId: text(worker.dispatchId), projection: projection(worker.projection) }; }, 100), page: { ...page, hasMore: bool(page.hasMore), ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor === null ? null : text(page.nextCursor) }) }, scope: { ...scope, source: text(scope.source) }, evidence: evidence(r.evidence) }; } };
++export const orcaWorkerDetailSchema: Schema<OrcaWorkerDetail> = { parse(value) { const r = record(value), dispatch = record(r.dispatch), worker = record(r.worker), projected = projection(r.projection), observation = record(r.observation), terminalResource = record(r.terminalResource); const terminal = r.terminal === null ? null : record(r.terminal); return { ...r, source: literal(r.source, ["orca"] as const), dispatch: { ...dispatch, id: text(dispatch.id), runId: text(dispatch.runId), taskId: text(dispatch.taskId), status: text(dispatch.status), ...(dispatch.processIncarnation === undefined ? {} : { processIncarnation: nullOrText(dispatch.processIncarnation) }) }, worker: { ...worker, dispatchId: text(worker.dispatchId), state: text(worker.state), stage: text(worker.stage), agentTerminalHandle: nullOrText(worker.agentTerminalHandle) }, projection: projected, observation: { ...observation, status: text(observation.status), exactWorker: bool(observation.exactWorker) }, terminal: terminal === null ? null : { ...terminal, handle: text(terminal.handle), incarnationId: text(terminal.incarnationId), connected: bool(terminal.connected), writable: bool(terminal.writable), executionHostId: text(terminal.executionHostId), worktreeId: text(terminal.worktreeId) }, terminalResource: { ...terminalResource, id: text(terminalResource.id), ownershipState: text(terminalResource.ownershipState), releaseState: text(terminalResource.releaseState), ...(terminalResource.ownerDispatchId === undefined ? {} : { ownerDispatchId: nullOrText(terminalResource.ownerDispatchId) }), ...(terminalResource.terminalHandle === undefined ? {} : { terminalHandle: text(terminalResource.terminalHandle) }), ...(terminalResource.endpointIncarnation === undefined ? {} : { endpointIncarnation: text(terminalResource.endpointIncarnation) }) }, evidence: evidence(r.evidence) }; } };
++export const orcaOutputPageSchema: Schema<OrcaOutputPage> = { parse(value) { const r = record(value), base = { ...(r.cursor === undefined ? {} : { cursor: text(r.cursor) }), archived: bool(r.archived), warnings: strings(r.warnings, 100) }; if (r.source === "terminal") return { source: "terminal", ...base, lines: strings(r.lines, 500) }; if (r.source === "transcript") return { source: "transcript", ...base, messages: array(r.messages, (item) => { const m = record(item); return { id: text(m.id), role: text(m.role), text: typeof m.text === "string" ? m.text : malformed(), ...(m.occurredAt === undefined ? {} : { occurredAt: iso(m.occurredAt) }) }; }, 500) }; return malformed(); } };
++export const orcaQuestionPageSchema: Schema<OrcaQuestionPage> = { parse(value) { const r = record(value), support = record(r.support), pending = record(support.pendingState); const pendingState = bool(pending.supported) ? { supported: true as const } : { supported: false as const, reason: text(pending.reason) }; return { ...r, source: literal(r.source, ["orca"] as const), messages: array(r.messages, (item) => { const m = record(item); return { ...m, id: text(m.id), type: text(m.type), subject: typeof m.subject === "string" ? m.subject : malformed(), body: typeof m.body === "string" ? m.body : malformed(), ...(m.run_id === undefined ? {} : { run_id: nullOrText(m.run_id) }), ...(m.from_handle === undefined ? {} : { from_handle: text(m.from_handle) }), ...(m.to_handle === undefined ? {} : { to_handle: text(m.to_handle) }), ...(m.created_at === undefined ? {} : { created_at: text(m.created_at) }), ...(m.question === undefined ? {} : { question: { ...record(m.question), status: text(record(m.question).status) } }) }; }, 100), count: integer(r.count), support: { pendingState }, evidence: evidence(r.evidence) }; } };
++export const orcaResourcesSchema: Schema<OrcaResources> = { parse(value) { const r = record(value); return { ...r, source: literal(r.source, ["orca"] as const), projects: array(r.projects, (item) => { const project = record(item); return { ...project, id: text(project.id), hostScope: literal(project.hostScope, ["covered", "not_covered"] as const), setups: array(project.setups, (setupValue) => { const setup = record(setupValue); return { ...setup, id: text(setup.id), ...(setup.covered === undefined ? {} : { covered: bool(setup.covered) }), ...(setup.truncated === undefined ? {} : { truncated: bool(setup.truncated) }), worktrees: array(setup.worktrees, (worktreeValue) => { const worktree = record(worktreeValue), hostScope = worktree.hostScope === undefined ? undefined : record(worktree.hostScope); return { ...worktree, id: text(worktree.id), terminals: array(worktree.terminals, (terminalValue) => { const terminal = record(terminalValue); return { ...terminal, id: text(terminal.id) }; }, 100), ...(hostScope === undefined ? {} : { hostScope: { hostIds: strings(hostScope.hostIds, 100), omittedHostIds: strings(hostScope.omittedHostIds, 100) } }), ...(worktree.truncated === undefined ? {} : { truncated: bool(worktree.truncated) }) }; }, 100) }; }, 100) }; }, 100), evidence: evidence(r.evidence) }; } };
++export const mutationReceiptSchema: Schema<OperationsMutationReceipt> = { parse(value) { const r = record(value); return { requestId: text(r.requestId), action: text(r.action), targetId: text(r.targetId), state: literal(r.state, ["accepted", "rejected", "unknown"] as const), observedAt: iso(r.observedAt), ...(r.detail === undefined ? {} : { detail: text(r.detail) }) }; } };
++const authSchema: Schema<{ csrf: string; expiresAt: string }> = { parse(value) { const r = record(value); return { csrf: text(r.csrf), expiresAt: iso(r.expiresAt) }; } };
+ 
+-function idempotencyKey(): string {
+-  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
++export class OperationsApiError extends Error { constructor(readonly status?: number, readonly code = "operations_api_error") { super(code); } }
++export interface OperationsApi {
++  bootstrap(): Promise<void>; status(signal?: AbortSignal): Promise<OperationsStatus>; contexts(cursor?: string, signal?: AbortSignal): Promise<HqContextPage>; context(id: string, signal?: AbortSignal): Promise<HqContextDetail>; events(contextId: string, after?: string, signal?: AbortSignal): Promise<HqEventPage>; hqQuestions(after?: string, signal?: AbortSignal): Promise<HqQuestionPage>; runs(cursor?: string, signal?: AbortSignal): Promise<OrcaRunPage>; workers(cursor?: string, signal?: AbortSignal): Promise<OrcaWorkerPage>; worker(id: string, signal?: AbortSignal): Promise<OrcaWorkerDetail>; output(id: string, source: "terminal" | "transcript", cursor?: string, signal?: AbortSignal): Promise<OrcaOutputPage>; orcaQuestions(signal?: AbortSignal): Promise<OrcaQuestionPage>; resources(signal?: AbortSignal): Promise<OrcaResources>; mutate(path: string, body: object, requestId: string): Promise<OperationsMutationReceipt>;
+ }
+ 
+-export function createDashboardApi(fetcher: typeof fetch = fetch): DashboardApi {
+-  let csrfToken: string | undefined;
+-  const bootstrap = async (): Promise<void> => {
+-    try {
+-      const response = await fetcher("/auth/session", { method: "POST", credentials: "same-origin" });
+-      if (!response.ok) throw new DashboardApiError(response.status);
+-      csrfToken = response.headers.get("x-csrf-token") ?? undefined;
+-    } catch (error) {
+-      if (error instanceof DashboardApiError) throw error;
+-      throw new DashboardApiError();
+-    }
+-  };
+-  const request = async <T>(path: string, init: RequestInit | (() => RequestInit) = {}, canRecover = true): Promise<T> => {
+-    try {
+-      const requestInit = typeof init === "function" ? init() : init;
+-      const response = await fetcher(path, { credentials: "same-origin", ...requestInit });
+-      if (!response.ok) {
+-        if (response.status === 401 && canRecover) {
+-          await bootstrap();
+-          return request(path, init, false);
+-        }
+-        throw new DashboardApiError(response.status);
+-      }
+-      return response.status === 204 ? undefined as T : await response.json() as T;
+-    } catch (error) {
+-      if (error instanceof DashboardApiError) throw error;
+-      throw new DashboardApiError();
+-    }
+-  };
+-  const mutation = async (path: string, body: object): Promise<void> => {
+-    const key = idempotencyKey();
+-    await request(path, () => ({
+-      method: "POST",
+-      headers: {
+-        "content-type": "application/json",
+-        "x-csrf-token": csrfToken ?? "",
+-        "idempotency-key": key
+-      },
+-      body: JSON.stringify(body)
+-    }));
+-  };
++type SessionStore = Pick<Storage, "getItem" | "setItem" | "removeItem">;
++export function createOperationsApi(fetcher: typeof fetch = fetch, storage: SessionStore = sessionStorage): OperationsApi {
++  const storageKey = "orca-hq.operations.csrf"; let csrf = storage.getItem(storageKey) ?? undefined, refreshPromise: Promise<void> | undefined;
++  const parseError = async (response: Response) => { let code = "operations_api_error"; try { const value = record(await response.json()); code = typeof value.error === "string" ? value.error : code; } catch { /* keep generic */ } return new OperationsApiError(response.status, code); };
++  const send = async <T>(path: string, schema: Schema<T>, init: RequestInit = {}): Promise<T> => { try { const response = await fetcher(path, { credentials: "same-origin", ...init }); if (!response.ok) throw await parseError(response); return schema.parse(await response.json()); } catch (error) { if (error instanceof OperationsApiError || (error instanceof DOMException && error.name === "AbortError")) throw error; throw new OperationsApiError(undefined, "network_error"); } };
++  const refresh = () => { if (!refreshPromise) refreshPromise = (async () => { if (!csrf) throw new OperationsApiError(401, "session_required"); const result = await send("/auth/local/refresh", authSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf }, body: "{}" }); csrf = result.csrf; storage.setItem(storageKey, csrf); })().finally(() => { refreshPromise = undefined; }); return refreshPromise; };
++  const read = async <T>(path: string, schema: Schema<T>, signal?: AbortSignal, recover = true): Promise<T> => { try { return await send(path, schema, signal ? { signal } : {}); } catch (error) { if (recover && error instanceof OperationsApiError && error.status === 401 && csrf) { try { await refresh(); } catch (refreshError) { storage.removeItem(storageKey); csrf = undefined; throw refreshError; } return read(path, schema, signal, false); } throw error; } };
+   return {
+-    bootstrap,
+-    listCommands: () => request("/api/commands"),
+-    getCommand: (id) => request(`/api/commands/${encodeURIComponent(id)}`),
+-    confirmApproval: (id, input) => mutation(`/api/approvals/${encodeURIComponent(id)}/confirm`, input),
+-    stopDispatch: (dispatchId) => mutation("/api/actions/stop", { dispatchId }),
+-    retryDispatch: (dispatchId) => mutation("/api/actions/retry", { dispatchId })
++    async bootstrap() { const hash = location.hash; if (!hash.startsWith("#claim=")) return; history.replaceState(history.state, "", `${location.pathname}${location.search}`); const claim = hash.slice(7); if (!/^[A-Za-z0-9_-]{43}$/.test(claim)) throw new OperationsApiError(400, "claim_invalid"); const result = await send("/auth/local/claim", authSchema, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim }) }); csrf = result.csrf; storage.setItem(storageKey, csrf); },
++    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate: (path, body, requestId) => send(path, mutationReceiptSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) }),
+   };
+ }
+--- a/apps/web/src/api.test.ts
++++ b/apps/web/src/api.test.ts
+@@ -1,76 +1,92 @@
+-import { describe, expect, it, vi } from "vitest";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createOperationsApi, OperationsApiError } from "./api.js";
+ 
+-import { createDashboardApi, DashboardApiError } from "./api.js";
++const observedAt = "2026-09-15T09:00:00.000Z";
++function response(status: number, body?: unknown): Response { return new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } }); }
++function status() { return { collectedAt: observedAt, hq: { state: "running", capacity: { limit: 10, source: "default", active: 1, queued: 0, byState: { executing: 1 }, updateSupported: false, reason: "restart_safe_mutation_contract_unavailable" } }, orca: { state: "ready", reachable: true, version: "1.4.203", features: {} }, metrics: { tokens: { available: false, reason: "not_collected" }, cost: { available: false, reason: "not_collected" } } }; }
++function store(initial?: string) { let value = initial; return { getItem: vi.fn(() => value ?? null), setItem: vi.fn((_key: string, next: string) => { value = next; }), removeItem: vi.fn(() => { value = undefined; }) }; }
+ 
+-function response(status: number, body?: unknown, headers?: HeadersInit): Response {
+-  const init: ResponseInit = { status };
+-  if (headers !== undefined) init.headers = headers;
+-  return new Response(body === undefined ? null : JSON.stringify(body), init);
+-}
++describe("operations API", () => {
++  afterEach(() => { window.history.replaceState({}, "", "/"); });
+ 
+-describe("dashboard API session recovery", () => {
+-  it("reestablishes a session once before retrying a query that receives 401", async () => {
+-    const fetcher = vi.fn<typeof fetch>()
+-      .mockResolvedValueOnce(response(401))
+-      .mockResolvedValueOnce(response(204, undefined, { "x-csrf-token": "fresh-csrf" }))
+-      .mockResolvedValueOnce(response(200, { commands: [] }));
+-    const api = createDashboardApi(fetcher);
++  it("redeems a single-use claim and removes the fragment before the request settles", async () => {
++    window.history.replaceState({}, "", `/#claim=${"a".repeat(43)}`);
++    let hashDuringFetch = "not-called";
++    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => { hashDuringFetch = window.location.hash; return response(200, { csrf: "csrf", expiresAt: observedAt }); });
++    const storage = store();
++    await createOperationsApi(fetcher, storage).bootstrap();
++    expect(hashDuringFetch).toBe("");
++    expect(fetcher).toHaveBeenCalledWith("/auth/local/claim", expect.objectContaining({ credentials: "same-origin", body: JSON.stringify({ claim: "a".repeat(43) }) }));
++    expect(storage.setItem).toHaveBeenCalledWith("orca-hq.operations.csrf", "csrf");
++  });
+ 
+-    await expect(api.listCommands()).resolves.toEqual({ commands: [] });
++  it("removes a failed claim fragment without exposing it in the error URL", async () => {
++    window.history.replaceState({}, "", `/#claim=${"b".repeat(43)}`);
++    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(401, { error: "claim_expired" })), store());
++    await expect(api.bootstrap()).rejects.toMatchObject({ status: 401, code: "claim_expired" });
++    expect(window.location.hash).toBe("");
++  });
+ 
+-    expect(fetcher.mock.calls.map(([path]) => path)).toEqual(["/api/commands", "/auth/session", "/api/commands"]);
++  it("also clears a malformed claim fragment before rejecting locally", async () => {
++    window.history.replaceState({}, "", "/#claim=short-secret");
++    const fetcher = vi.fn<typeof fetch>();
++    await expect(createOperationsApi(fetcher, store()).bootstrap()).rejects.toMatchObject({ status: 400, code: "claim_invalid" });
++    expect(window.location.hash).toBe("");
++    expect(fetcher).not.toHaveBeenCalled();
+   });
+ 
+-  it("reuses a mutation idempotency key while retrying with a fresh CSRF token", async () => {
++  it("refreshes an existing session once for reads and preserves the opaque cursor", async () => {
+     const fetcher = vi.fn<typeof fetch>()
+-      .mockResolvedValueOnce(response(204, undefined, { "x-csrf-token": "stale-csrf" }))
+-      .mockResolvedValueOnce(response(401))
+-      .mockResolvedValueOnce(response(204, undefined, { "x-csrf-token": "fresh-csrf" }))
+-      .mockResolvedValueOnce(response(204));
+-    const api = createDashboardApi(fetcher);
+-    await api.bootstrap();
++      .mockResolvedValueOnce(response(401, { error: "session_required" }))
++      .mockResolvedValueOnce(response(200, { csrf: "new-csrf", expiresAt: observedAt }))
++      .mockResolvedValueOnce(response(200, { source: "orca", runs: [], nextCursor: "opaque/+==", evidence: { source: "orca_cli", observedAt, verification: "observed" } }));
++    const api = createOperationsApi(fetcher, store("old-csrf"));
++    await expect(api.runs("opaque/+==")).resolves.toMatchObject({ nextCursor: "opaque/+==" });
++    expect(fetcher.mock.calls.map(([path]) => path)).toEqual(["/api/operations/orca/runs?cursor=opaque%2F%2B%3D%3D", "/auth/local/refresh", "/api/operations/orca/runs?cursor=opaque%2F%2B%3D%3D"]);
++    expect(new Headers(fetcher.mock.calls[1]?.[1]?.headers).get("x-csrf-token")).toBe("old-csrf");
++  });
+ 
+-    await expect(api.stopDispatch("dispatch-42")).resolves.toBeUndefined();
++  it("coalesces concurrent read recovery into one CSRF refresh", async () => {
++    let refreshCalls = 0, statusCalls = 0;
++    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path) => {
++      if (path === "/auth/local/refresh") { refreshCalls++; await Promise.resolve(); return response(200, { csrf: "new-csrf", expiresAt: observedAt }); }
++      statusCalls++; return statusCalls <= 2 ? response(401, { error: "session_required" }) : response(200, status());
++    });
++    const api = createOperationsApi(fetcher, store("old-csrf"));
++    await expect(Promise.all([api.status(), api.status()])).resolves.toHaveLength(2);
++    expect(refreshCalls).toBe(1);
++  });
+ 
+-    expect(fetcher.mock.calls.map(([path]) => path)).toEqual(["/auth/session", "/api/actions/stop", "/auth/session", "/api/actions/stop"]);
+-    const firstAttempt = new Headers(fetcher.mock.calls[1]?.[1]?.headers);
+-    const retryAttempt = new Headers(fetcher.mock.calls[3]?.[1]?.headers);
+-    expect(firstAttempt.get("x-csrf-token")).toBe("stale-csrf");
+-    expect(retryAttempt.get("x-csrf-token")).toBe("fresh-csrf");
+-    expect(retryAttempt.get("idempotency-key")).toBe(firstAttempt.get("idempotency-key"));
+-    expect(fetcher.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({ dispatchId: "dispatch-42" }));
+-    expect(fetcher.mock.calls[3]?.[1]?.body).toBe(JSON.stringify({ dispatchId: "dispatch-42" }));
++  it("does not invent an unauthenticated bootstrap when CSRF is absent", async () => {
++    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(401, { error: "session_required" }));
++    await expect(createOperationsApi(fetcher, store()).status()).rejects.toMatchObject({ status: 401 });
++    expect(fetcher).toHaveBeenCalledOnce();
+   });
+ 
+-  it("stops after one recovery attempt when a query remains unauthorized", async () => {
+-    const fetcher = vi.fn<typeof fetch>()
+-      .mockResolvedValueOnce(response(401))
+-      .mockResolvedValueOnce(response(204, undefined, { "x-csrf-token": "fresh-csrf" }))
+-      .mockResolvedValueOnce(response(401));
+-    const api = createDashboardApi(fetcher);
++  it("rejects malformed payloads instead of returning unchecked values", async () => {
++    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(200, { ...status(), hq: { state: "running", capacity: { active: "one" } } })), store());
++    await expect(api.status()).rejects.toEqual(expect.objectContaining<Partial<OperationsApiError>>({ status: 502, code: "malformed_response" }));
++  });
+ 
+-    await expect(api.listCommands()).rejects.toEqual(expect.objectContaining<Partial<DashboardApiError>>({ status: 401 }));
+-
+-    expect(fetcher.mock.calls.map(([path]) => path)).toEqual(["/api/commands", "/auth/session", "/api/commands"]);
++  it("passes read abort signals through to fetch", async () => {
++    const fetcher = vi.fn<typeof fetch>().mockImplementation((_path, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))));
++    const controller = new AbortController();
++    const pending = createOperationsApi(fetcher, store()).status(controller.signal);
++    controller.abort();
++    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+   });
+ 
+-  it("does not retry when session recovery itself fails", async () => {
+-    const fetcher = vi.fn<typeof fetch>()
+-      .mockResolvedValueOnce(response(401))
+-      .mockResolvedValueOnce(response(503));
+-    const api = createDashboardApi(fetcher);
+-
+-    await expect(api.listCommands()).rejects.toEqual(expect.objectContaining<Partial<DashboardApiError>>({ status: 503 }));
+-
+-    expect(fetcher.mock.calls.map(([path]) => path)).toEqual(["/api/commands", "/auth/session"]);
++  it("does not retry mutations and preserves accepted as queued evidence", async () => {
++    const receipt = { requestId: "request-1", action: "dispatch", targetId: "task-1", state: "accepted", observedAt };
++    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(202, receipt));
++    await expect(createOperationsApi(fetcher, store("csrf")).mutate("/api/operations/orca/dispatches", { taskId: "task-1" }, "request-1")).resolves.toEqual(receipt);
++    expect(fetcher).toHaveBeenCalledOnce();
++    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("idempotency-key")).toBe("request-1");
+   });
+ 
+-  it("does not retry a failed session bootstrap request", async () => {
+-    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(response(401));
+-    const api = createDashboardApi(fetcher);
+-
+-    await expect(api.bootstrap()).rejects.toEqual(expect.objectContaining<Partial<DashboardApiError>>({ status: 401 }));
+-
++  it("never replays an unknown mutation response", async () => {
++    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(502, { error: "mutation_unknown" }));
++    await expect(createOperationsApi(fetcher, store("csrf")).mutate("/api/operations/orca/dispatches", {}, "request-2")).rejects.toMatchObject({ status: 502, code: "mutation_unknown" });
+     expect(fetcher).toHaveBeenCalledOnce();
+   });
+ });
+--- a/apps/web/src/app.tsx
++++ b/apps/web/src/app.tsx
+@@ -1,57 +1,62 @@
+-import { useEffect, useRef, useState } from "react";
++import { useEffect, useState } from "react";
++import { createOperationsApi, OperationsApiError, type OperationsApi } from "./api.js";
++import { AsyncState } from "./components/async-state.js";
++import { SourceBadge } from "./components/source-badge.js";
++import { useRead } from "./hooks.js";
++import { HqDetail, OrcaDetail } from "./routes/operations-detail.js";
++import { OperationsEvidence } from "./routes/operations-evidence.js";
++import { OperationsList } from "./routes/operations-list.js";
++import { OperationsOverview } from "./routes/operations-overview.js";
++import { OperationsResources } from "./routes/operations-resources.js";
++import { OperationsSettings } from "./routes/operations-settings.js";
+ 
+-import { createDashboardApi, DashboardApiError, type CommandDetail, type CommandSummary, type DashboardApi } from "./api.js";
+-import { CommandDetailView } from "./routes/command-detail.js";
+-import { CommandList } from "./routes/command-list.js";
++const nav = [
++  ["/overview", "운영 개요"], ["/work", "업무 목록"], ["/compose", "새 지시"], ["/questions", "질문함"],
++  ["/resources", "프로젝트/터미널"], ["/settings", "운영 설정"], ["/evidence", "리서치/기획"],
++] as const;
+ 
+-type ViewState = "loading" | "ready" | "error" | "not-found";
+-function commandIdFromPath(): string | undefined {
+-  const match = window.location.pathname.match(/^\/commands\/([^/]+)$/);
+-  return match?.[1] === undefined ? undefined : decodeURIComponent(match[1]);
++function Questions({ api }: Readonly<{ api: OperationsApi }>) {
++  const read = useRead(async (signal) => {
++    const [hq, orca] = await Promise.all([api.hqQuestions("0", signal), api.orcaQuestions(signal)]);
++    return { hq, orca };
++  }, [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  return <><div className="view-head"><h1>질문함</h1><p>질문은 실제 읽기 전용입니다. 답변 폼은 Task 4에서 안전한 mutation으로 연결합니다.</p></div><div className="grid-2">
++    <section className="card card-body"><h2><SourceBadge source="hq" /> HQ 질문</h2>{read.data.hq.questions.length === 0 ? <p className="empty-copy">대기 질문 없음</p> : <ul className="question-list">{read.data.hq.questions.map((item) => <li key={`${item.requestId}:${item.occurredAt}`}><strong>{item.body}</strong><small>{item.requestId} · {item.state}</small><button disabled>Task 4에서 답변</button></li>)}</ul>}</section>
++    <section className="card card-body"><h2><SourceBadge source="orca" /> Orca inbox</h2>{read.data.orca.messages.length === 0 ? <p className="empty-copy">관찰된 질문 없음</p> : <ul className="question-list">{read.data.orca.messages.map((item) => <li key={item.id}><strong>{item.subject || item.body}</strong><small>{item.run_id ?? "Run 미제공"}</small><button disabled>Task 4에서 답변</button></li>)}</ul>}<p className="muted">pending 여부는 공개 inbox에서 권위 있게 제공되지 않습니다.</p></section>
++  </div></>;
+ }
+-function message(error: unknown): string {
+-  const status = error instanceof DashboardApiError ? error.status : undefined;
+-  if (status === 401) return "로그인 또는 세션을 다시 확인해 주세요.";
+-  if (status === 403) return "이 정보에 접근할 권한이 없습니다.";
+-  if (status === 409) return "제안이 변경되었습니다. 최신 정보를 확인해 주세요.";
+-  if (status === 404) return "요청한 명령을 찾을 수 없습니다.";
+-  return "정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.";
++
++function Screen({ path, api, navigate }: Readonly<{ path: string; api: OperationsApi; navigate: (path: string) => void }>) {
++  const hq = path.match(/^\/work\/hq\/([^/]+)$/);
++  const orca = path.match(/^\/work\/orca\/([^/]+)$/);
++  if (hq?.[1]) return <HqDetail api={api} contextId={decodeURIComponent(hq[1])} navigate={navigate} />;
++  if (orca?.[1]) return <OrcaDetail api={api} dispatchId={decodeURIComponent(orca[1])} navigate={navigate} />;
++  if (path === "/work") return <OperationsList api={api} navigate={navigate} />;
++  if (path === "/resources") return <OperationsResources api={api} />;
++  if (path === "/settings") return <OperationsSettings api={api} />;
++  if (path === "/evidence") return <OperationsEvidence api={api} />;
++  if (path === "/questions") return <Questions api={api} />;
++  if (path === "/compose") return <><div className="view-head"><h1>새 지시</h1><p>Task 4에서 idempotency와 결과 관찰을 포함한 실제 제출 폼을 연결합니다.</p></div><section className="card placeholder"><strong>읽기 전용 단계</strong><p>시뮬레이션 응답이나 임시 요청은 생성하지 않습니다.</p><button disabled>Task 4에서 지시 작성</button></section></>;
++  return <OperationsOverview api={api} navigate={navigate} />;
+ }
+-export function App({ api = createDashboardApi(), initialCommandId }: Readonly<{ api?: DashboardApi; initialCommandId?: string }>) {
+-  const [commands, setCommands] = useState<readonly CommandSummary[]>([]);
+-  const [detail, setDetail] = useState<CommandDetail>();
+-  const [state, setState] = useState<ViewState>("loading");
+-  const [error, setError] = useState("");
+-  const requestEpoch = useRef(0);
+-  const loadList = async () => { const epoch = ++requestEpoch.current; setState("loading"); setDetail(undefined); try { const result = await api.listCommands(); if (epoch !== requestEpoch.current) return; setCommands(result.commands); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState("error"); } };
+-  const loadDetail = async (id: string, push: boolean) => { const epoch = ++requestEpoch.current; setState("loading"); try { const result = await api.getCommand(id); if (epoch !== requestEpoch.current) return; setDetail(result); if (push) window.history.pushState({}, "", `/commands/${encodeURIComponent(id)}`); setState("ready"); } catch (cause) { if (epoch !== requestEpoch.current) return; setError(message(cause)); setState(cause instanceof DashboardApiError && cause.status === 404 ? "not-found" : "error"); } };
+-  const loadPath = async (push = false) => {
+-    const commandId = commandIdFromPath();
+-    if (commandId === undefined) await loadList();
+-    else await loadDetail(commandId, push);
+-  };
++
++export function App({ api = createOperationsApi() }: Readonly<{ api?: OperationsApi }>) {
++  const [path, setPath] = useState(window.location.pathname === "/" ? "/overview" : window.location.pathname);
++  const [session, setSession] = useState<"loading" | "ready" | "error">("loading");
++  const [sessionError, setSessionError] = useState("");
++  const navigate = (next: string) => { window.history.pushState({}, "", next); setPath(next); };
+   useEffect(() => {
+-    const initialPath = initialCommandId === undefined ? commandIdFromPath() : initialCommandId;
+-    const epoch = ++requestEpoch.current;
+-    const start = async () => {
+-      try {
+-        await api.bootstrap();
+-        if (epoch !== requestEpoch.current) return;
+-        if (initialPath === undefined) await loadList();
+-        else await loadDetail(initialPath, false);
+-      } catch (cause) { if (epoch === requestEpoch.current) { setError(message(cause)); setState("error"); } }
+-    };
+-    const onPopState = () => { void loadPath(); };
+-    window.addEventListener("popstate", onPopState);
+-    void start();
+-    return () => window.removeEventListener("popstate", onPopState);
+-  }, []);
+-  const back = () => { window.history.pushState({}, "", "/commands"); void loadList(); };
+-  const connectionLabel = state === "ready" ? "연결됨 · 최신 정보" : state === "loading" ? "정보 갱신 중" : state === "error" ? "갱신 실패 · 재시도 필요" : "요청한 명령 확인 필요";
+-  return <><header><nav aria-label="주요 탐색"><a href="/commands" onClick={(event) => { event.preventDefault(); back(); }}>Orca HQ</a><span>{connectionLabel}</span></nav></header><main>
+-    {state === "loading" && <p role="status">정보를 불러오는 중입니다.</p>}
+-    {state === "error" && <section className="card" role="alert"><h1>확인 필요</h1><p>{error}</p><button type="button" onClick={() => void loadPath()}>다시 시도</button></section>}
+-    {state === "not-found" && <section className="card" role="alert"><h1>명령을 찾을 수 없음</h1><p>{error}</p><button type="button" onClick={back}>명령 목록으로</button></section>}
+-    {state === "ready" && (detail ? <CommandDetailView command={detail} api={api} onBack={back} onRefresh={() => void loadDetail(detail.id, false)} /> : <CommandList commands={commands} onSelect={(id) => void loadDetail(id, true)} />)}
+-  </main></>;
++    let active = true;
++    const start = async () => { try { await api.bootstrap(); if (active) setSession("ready"); } catch (error) { if (active) { setSession("error"); setSessionError(error instanceof OperationsApiError ? error.code : "session_required"); } } };
++    const pop = () => setPath(window.location.pathname);
++    window.addEventListener("popstate", pop); void start();
++    return () => { active = false; window.removeEventListener("popstate", pop); };
++  }, [api]);
++  const activeBase = path.startsWith("/work/") ? "/work" : path;
++  return <div className="app-shell"><aside className="sidebar"><div className="brand"><strong>HQ / Orca Operations</strong><small>실제 읽기 콘솔</small></div><nav aria-label="주요 화면">{nav.map(([href, label]) => <a className={activeBase === href ? "active" : ""} href={href} key={href} onClick={(event) => { event.preventDefault(); navigate(href); }}><span className="nav-dot" />{label}</a>)}</nav><p className="nav-footer">단일 운영자용 로컬 콘솔<br />HQ와 Orca 출처를 분리합니다.</p></aside>
++    <div className="content-shell"><header className="topbar"><span className={`connection ${session}`}><i />{session === "loading" ? "세션 확인 중" : session === "ready" ? "로컬 세션" : "인증 필요"}</span><span>same-origin · read-first</span></header><main className="main-content">
++      {session === "loading" ? <AsyncState state="loading" /> : session === "error" ? <section className="auth-error" role="alert"><h1>로컬 세션을 열 수 없습니다</h1><p>터미널에서 <code>hq console</code>을 실행해 새 단일 사용 링크로 접속하세요.</p><small>{sessionError}</small></section> : <Screen key={path} path={path} api={api} navigate={navigate} />}
++    </main></div>
++  </div>;
+ }
+--- a/apps/web/src/app.test.tsx
++++ b/apps/web/src/app.test.tsx
+@@ -1,275 +1,111 @@
+ import { cleanup, render, screen, within } from "@testing-library/react";
+ import { userEvent } from "@testing-library/user-event";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-
+ import { App } from "./app.js";
+-import { DashboardApiError, type DashboardApi, type CommandDetail } from "./api.js";
++import { OperationsApiError, type OperationsApi } from "./api.js";
+ 
+-const detail: CommandDetail = {
+-  id: "cmd-42",
+-  summary: "승인 대시보드를 배포합니다",
+-  projectKey: "hq",
+-  status: "진행 중",
+-  createdAt: "2026-09-01T08:00:00Z",
+-  updatedAt: "2026-09-01T08:10:00Z",
+-  riskLevel: "L3",
+-  project: { key: "hq", displayName: "Orca HQ", path: "/redacted/hq" },
+-  routing: { score: 92, selectedReason: "보호된 경로와 일치", candidates: ["primary: 92", "fallback: 61"] },
+-  contract: {
+-    base: "main",
+-    allowedScope: ["apps/web/**"],
+-    prohibitedEffects: ["외부 메시지 전송"],
+-    testCommands: ["pnpm --filter @orca-hq/web test"]
+-  },
+-  tasks: [{ id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running", canStop: true, canRetry: true }],
+-  verification: { status: "passed", commands: ["pnpm test"] },
+-  diff: { summary: "3 files changed, 20 insertions" },
+-  approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
+-  audit: { reference: "audit:cmd-42", summary: "승인 대기 이벤트" },
+-  approvalHistory: [
+-    { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", approvedAt: "", operationPhrase: "APPROVE RELEASE", status: "pending" },
+-    { id: "approval-expired", level: "L2", digest: "b".repeat(64), expiresAt: "2026-09-01T08:15:00Z", approvedAt: "2026-09-01T08:00:00Z", status: "expired" },
+-    { id: "approval-invalidated", level: "L2", digest: "c".repeat(64), expiresAt: "", approvedAt: "", status: "invalidated" }
+-  ],
+-  auditHistory: [
+-    { reference: "audit:denied", subjectId: "approval-invalidated", summary: "approval.denied", occurredAt: "2026-09-01T08:12:00Z" },
+-    { reference: "audit:invalidated", subjectId: "approval-invalidated", summary: "approval.invalidated", occurredAt: "2026-09-01T08:11:00Z" },
+-    { reference: "audit:expired", subjectId: "approval-expired", summary: "approval.expired", occurredAt: "2026-09-01T08:10:00Z" },
+-    { reference: "audit:cmd-42", subjectId: "cmd-42", summary: "승인 대기 이벤트", occurredAt: "2026-09-01T08:09:00Z" }
+-  ],
+-  delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
+-};
+-
+-const secondTask = {
+-  id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued", canStop: true, canRetry: true
+-};
+-
+-function apiFor(overrides: Partial<DashboardApi> = {}): DashboardApi {
++const at = "2026-09-15T09:00:00.000Z";
++const evidence = { source: "orca_cli" as const, observedAt: at, verification: "observed" as const };
++const hqEvidence = { ...evidence, source: "hq_store" as const };
++const context = { contextId: "context-1", title: "정산 배치 확인", state: "executing", summary: "실제 HQ 문맥", projectIds: ["project-1"], jobIds: [], createdAt: at, updatedAt: at, lastSeq: 3 };
++const worker = { dispatchId: "dispatch-1", projection: { dispatchId: "dispatch-1", taskId: "task-1", runId: "run-1", liveness: { verdict: "live" } } };
++function apiFor(overrides: Partial<OperationsApi> = {}): OperationsApi {
+   return {
+     bootstrap: vi.fn().mockResolvedValue(undefined),
+-    listCommands: vi.fn().mockResolvedValue({ commands: [detail] }),
+-    getCommand: vi.fn().mockResolvedValue(detail),
+-    confirmApproval: vi.fn().mockResolvedValue(undefined),
+-    stopDispatch: vi.fn().mockResolvedValue(undefined),
+-    retryDispatch: vi.fn().mockResolvedValue(undefined),
+-    ...overrides
++    status: vi.fn().mockResolvedValue({ collectedAt: at, hq: { state: "running", capacity: { limit: 10, source: "default", active: 1, queued: 0, byState: { executing: 1 }, updateSupported: false, reason: "restart_safe_mutation_contract_unavailable" } }, orca: { state: "ready", reachable: true, version: "1.4.203", features: {} }, metrics: { tokens: { available: false, reason: "not_collected" }, cost: { available: false, reason: "not_collected" } } }),
++    contexts: vi.fn().mockResolvedValue({ contexts: [context] }),
++    context: vi.fn().mockResolvedValue({ source: "hq", context, evidence: hqEvidence }),
++    events: vi.fn().mockResolvedValue({ events: [{ source: "hq", eventSource: "hq", seq: 3, eventKey: "event-3", requestId: "request-1", contextId: "context-1", kind: "worker.ready", occurredAt: at, payload: {}, receiptLink: { runId: "run-1", taskId: "task-1", dispatchId: "dispatch-1", terminalHandle: "term-1" } }], snapshots: [context], cursor: "3", compacted: false, oldestSeq: 1, latestSeq: 3 }),
++    hqQuestions: vi.fn().mockResolvedValue({ source: "hq", questions: [], cursor: "3", compacted: false }),
++    runs: vi.fn().mockResolvedValue({ source: "orca", runs: [{ id: "run-1", objective: "검증" }], evidence }),
++    workers: vi.fn().mockResolvedValue({ source: "orca", workers: [worker], page: { hasMore: false }, scope: { source: "all" }, evidence }),
++    worker: vi.fn().mockResolvedValue({ source: "orca", dispatch: { id: "dispatch-1", runId: "run-1", taskId: "task-1", status: "dispatched" }, worker: { dispatchId: "dispatch-1", state: "ready", stage: "working", agentTerminalHandle: "term-1" }, projection: { dispatchId: "dispatch-1", taskId: "task-1", runId: "run-1", liveness: { verdict: "live" }, resource: { state: "owned", releaseState: "active" } }, observation: { status: "ready", exactWorker: true }, terminal: { handle: "term-1", incarnationId: "inc-1", connected: true, writable: true, executionHostId: "host-1", worktreeId: "wt-1" }, terminalResource: { id: "term-1", ownershipState: "owned", releaseState: "active" }, evidence }),
++    output: vi.fn().mockResolvedValue({ source: "terminal", cursor: "opaque-1", archived: false, warnings: [], lines: ["real output"] }),
++    orcaQuestions: vi.fn().mockResolvedValue({ source: "orca", messages: [], count: 0, support: { pendingState: { supported: false, reason: "inbox_has_no_authoritative_pending_question_state" } }, evidence }),
++    resources: vi.fn().mockResolvedValue({ source: "orca", projects: [{ id: "project-1", hostScope: "covered", setups: [{ id: "setup-1", worktrees: [{ id: "wt-1", terminals: [{ id: "term-1" }] }] }] }], evidence }),
++    mutate: vi.fn(),
++    ...overrides,
+   };
+ }
+ 
+-describe("private dashboard", () => {
++describe("read-first operations console", () => {
++  beforeEach(() => window.history.replaceState({}, "", "/overview"));
+   afterEach(cleanup);
+-  beforeEach(() => { window.history.replaceState({}, "", "/commands"); });
+ 
+-  it("shows verification and pending Slack delivery as independent evidence", async () => {
+-    const user = userEvent.setup();
++  it("keeps HQ and Orca sources separate and renders unavailable metrics honestly", async () => {
+     render(<App api={apiFor()} />);
+-    await screen.findByText("승인 대시보드를 배포합니다");
+-    await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
+-    expect(await screen.findByText("검증 완료")).toBeTruthy();
+-    expect(screen.getByText("Slack 전송 대기")).toBeTruthy();
++    expect(await screen.findByRole("heading", { name: "운영 개요" })).toBeTruthy();
++    expect(screen.getByRole("heading", { name: /HQ 업무/ })).toBeTruthy();
++    expect(screen.getByRole("heading", { name: /Orca 실행/ })).toBeTruthy();
++    expect(screen.getAllByText("수집되지 않음")).toHaveLength(2);
+   });
+ 
+-  it("shows bounded approval and audit histories as separate evidence", async () => {
+-    // Break caught: the React detail view ignores history arrays and collapses both evidence streams into one latest row.
+-    render(<App api={apiFor()} initialCommandId="cmd-42" />);
+-
+-    const approvals = (await screen.findByRole("heading", { name: "승인 이력" })).closest("section")!;
+-    expect(within(approvals).getByText("approval-expired")).toBeTruthy();
+-    expect(within(approvals).getByText("expired")).toBeTruthy();
+-    expect(within(approvals).getByText("approval-invalidated")).toBeTruthy();
+-    expect(within(approvals).getByText("invalidated")).toBeTruthy();
+-
+-    const audits = screen.getByRole("heading", { name: "감사 이력" }).closest("section")!;
+-    for (const event of ["approval.denied", "approval.invalidated", "approval.expired"]) {
+-      expect(within(audits).getByText(event)).toBeTruthy();
+-    }
++  it("filters the work list without merging source-specific rows", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    render(<App api={apiFor()} />); await screen.findByText("정산 배치 확인");
++    await user.click(screen.getByRole("button", { name: "Orca" }));
++    expect(screen.queryByText("정산 배치 확인")).toBeNull();
++    expect(screen.getByText("dispatch-1")).toBeTruthy();
+   });
+ 
+-  it("allows L3 approval only for the exact server phrase and sends digest and phrase", async () => {
+-    const user = userEvent.setup();
+-    const api = apiFor();
+-    render(<App api={api} />);
+-    await screen.findByText("승인 대시보드를 배포합니다");
+-    await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
+-    expect(await screen.findByText("APPROVE RELEASE")).toBeTruthy();
+-    for (const text of ["main", "apps/web/**", "외부 메시지 전송", "pnpm --filter @orca-hq/web test"]) {
+-      expect(within(screen.getByRole("heading", { name: "승인" }).closest("section")!).getByText(text)).toBeTruthy();
+-    }
+-    const approve = await screen.findByRole("button", { name: "L3 승인" });
+-    const phrase = screen.getByLabelText("승인 문구 입력");
+-    await user.type(phrase, "approve release");
+-    expect((approve as HTMLButtonElement).disabled).toBe(true);
+-    await user.clear(phrase);
+-    await user.type(phrase, "APPROVE RELEASE");
+-    expect((approve as HTMLButtonElement).disabled).toBe(false);
+-    await user.click(approve);
+-    expect(api.confirmApproval).toHaveBeenCalledWith("approval-42", { digest: "a".repeat(64), phrase: "APPROVE RELEASE" });
++  it("advances list cursors once and appends the next page", async () => {
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    const next = { ...context, contextId: "context-2", title: "다음 실제 문맥" };
++    const contexts = vi.fn().mockImplementation((cursor?: string) => Promise.resolve(cursor ? { contexts: [next] } : { contexts: [context], cursor: "100" }));
++    render(<App api={apiFor({ contexts })} />); await screen.findByText("정산 배치 확인");
++    await user.click(screen.getByRole("button", { name: "다음 페이지 읽기" }));
++    expect(await screen.findByText("다음 실제 문맥")).toBeTruthy();
++    expect(contexts).toHaveBeenCalledWith("100");
++    expect(screen.queryByRole("button", { name: "다음 페이지 읽기" })).toBeNull();
+   });
+ 
+-  it("renders complete evidence and sends only dispatch ids for control actions", async () => {
+-    const user = userEvent.setup();
+-    const api = apiFor();
+-    render(<App api={api} />);
+-    await screen.findByText("승인 대시보드를 배포합니다");
+-    await user.click(screen.getByRole("link", { name: "승인 대시보드를 배포합니다" }));
+-    for (const label of ["/redacted/hq", "경로 선택 근거", "worker: gpt-5 · verifier: gpt-5", "3 files changed, 20 insertions", "audit:cmd-42", "Telegram 전송 완료"]) {
+-      expect(await screen.findByText(label)).toBeTruthy();
+-    }
+-    expect(within(screen.getByRole("heading", { name: "Task DAG" }).closest("section")!).getByText("task-ui")).toBeTruthy();
+-    await user.click(screen.getByRole("button", { name: "Dispatch 중지: 모바일 화면 (dispatch-42)" }));
+-    expect(await screen.findByText("Dispatch 중지 요청이 완료되었습니다.")).toBeTruthy();
+-    await user.click(screen.getByRole("button", { name: "Dispatch 재시도: 모바일 화면 (dispatch-42)" }));
+-    expect(api.stopDispatch).toHaveBeenCalledWith("dispatch-42");
+-    expect(api.retryDispatch).toHaveBeenCalledWith("dispatch-42");
++  it("loads Orca detail and logs only when its detail tab is selected", async () => {
++    window.history.replaceState({}, "", "/work/orca/dispatch-1"); const api = apiFor(); const user = userEvent.setup();
++    render(<App api={api} />); await screen.findByText("Dispatch / projection");
++    expect(api.output).not.toHaveBeenCalled();
++    expect(screen.getByText("live")).toBeTruthy();
++    expect(screen.getAllByText("true").length).toBeGreaterThan(0);
++    await user.click(screen.getByRole("tab", { name: "터미널 로그" }));
++    expect(await screen.findByText("real output")).toBeTruthy();
++    expect(api.output).toHaveBeenCalledWith("dispatch-1", "terminal", undefined);
+   });
+ 
+-  it("explains unauthorized access without rendering server response text", async () => {
+-    render(<App api={apiFor({ listCommands: vi.fn().mockRejectedValue(new DashboardApiError(401)) })} />);
+-    expect(await screen.findByText("로그인 또는 세션을 다시 확인해 주세요.")).toBeTruthy();
+-    expect(screen.queryByText("secret server detail")).toBeNull();
++  it("shows only receipt-backed HQ event links and reports compaction", async () => {
++    window.history.replaceState({}, "", "/work/hq/context-1");
++    const api = apiFor({ events: vi.fn().mockResolvedValue({ events: [{ source: "hq", eventSource: "hq", seq: 3, eventKey: "event-3", requestId: "request-1", contextId: "context-1", kind: "history.compacted", occurredAt: at, payload: {} }], snapshots: [context], cursor: "3", compacted: true, oldestSeq: 3, latestSeq: 3 }) });
++    render(<App api={api} />); await screen.findByText("history.compacted");
++    expect(screen.queryByRole("button", { name: "연결된 Dispatch 보기" })).toBeNull();
++    expect(screen.getByText("연결 영수증 아직 없음")).toBeTruthy();
++    expect(screen.getAllByText(/compacted/).length).toBeGreaterThan(0);
+   });
+ 
+-  it("makes expired, unauthorized, and pending approvals unavailable", async () => {
+-    const expired = { ...detail, approval: { ...detail.approval, expiresAt: "2020-01-01T00:00:00Z" } };
+-    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(expired) })} initialCommandId="cmd-42" />);
+-    expect((await screen.findByRole("button", { name: "L3 승인" })) as HTMLButtonElement).toHaveProperty("disabled", true);
+-    expect(screen.getByText("만료되어 승인할 수 없습니다.")).toBeTruthy();
++  it("aborts stale overview reads when navigation changes", async () => {
++    const signals: AbortSignal[] = [];
++    const api = apiFor({ status: vi.fn().mockImplementation((next?: AbortSignal) => { if (next) signals.push(next); return new Promise(() => undefined); }) });
++    const user = userEvent.setup(); render(<App api={api} />);
++    await user.click(screen.getByRole("link", { name: "운영 설정" }));
++    expect(signals[0]?.aborted).toBe(true);
+   });
+ 
+-  it("does not present failed verification as complete", async () => {
+-    const failed = { ...detail, verification: { ...detail.verification, status: "실패" } };
+-    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(failed) })} initialCommandId="cmd-42" />);
+-    expect(await screen.findByText("검증 실패")).toBeTruthy();
+-    expect(screen.queryByText("검증 완료")).toBeNull();
++  it("renders resource scope hierarchy and disabled capacity updates", async () => {
++    window.history.replaceState({}, "", "/resources"); const user = userEvent.setup(); render(<App api={apiFor()} />);
++    expect(await screen.findByText("setup-1")).toBeTruthy(); expect(screen.getByText("term-1")).toBeTruthy();
++    await user.click(screen.getByRole("link", { name: "운영 설정" }));
++    expect(await screen.findByRole("button", { name: "용량 변경 지원 안 함" })).toHaveProperty("disabled", true);
++    expect(screen.getByText("restart_safe_mutation_contract_unavailable")).toBeTruthy();
+   });
+ 
+-  it("controls only the selected task dispatch in a multi-task DAG", async () => {
+-    const user = userEvent.setup();
+-    const api = apiFor({ getCommand: vi.fn().mockResolvedValue({ ...detail, tasks: [...detail.tasks, secondTask] }) });
+-    render(<App api={api} initialCommandId="cmd-42" />);
+-    const stop = await screen.findByRole("button", { name: "Dispatch 중지: 검증 실행 (dispatch-99)" });
+-    const retry = screen.getByRole("button", { name: "Dispatch 재시도: 검증 실행 (dispatch-99)" });
+-    await user.click(stop);
+-    await user.click(retry);
+-    expect(api.stopDispatch).toHaveBeenCalledWith("dispatch-99");
+-    expect(api.retryDispatch).toHaveBeenCalledWith("dispatch-99");
+-    expect(api.stopDispatch).not.toHaveBeenCalledWith("dispatch-42");
+-    expect(api.retryDispatch).not.toHaveBeenCalledWith("dispatch-42");
++  it("shows actionable hq console guidance for failed claim authentication", async () => {
++    render(<App api={apiFor({ bootstrap: vi.fn().mockRejectedValue(new OperationsApiError(401, "claim_expired")) })} />);
++    const alert = await screen.findByRole("alert");
++    expect(within(alert).getByText("hq console")).toBeTruthy();
++    expect(within(alert).queryByText(/secret/)).toBeNull();
+   });
+ 
+-  it("disables both dispatch controls when durable task policy marks them unavailable", async () => {
+-    // Break caught: a server-calculated false control state still leaves a mutating UI button enabled.
+-    const blocked = {
+-      ...detail,
+-      tasks: [{ ...detail.tasks[0]!, canStop: false, canRetry: false }]
+-    };
+-    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(blocked) })} initialCommandId="cmd-42" />);
+-    expect((await screen.findByRole("button", { name: "Dispatch 중지: 모바일 화면 (dispatch-42)" })) as HTMLButtonElement).toHaveProperty("disabled", true);
+-    expect(screen.getByRole("button", { name: "Dispatch 재시도: 모바일 화면 (dispatch-42)" })).toHaveProperty("disabled", true);
++  it("keeps compose and question responses explicitly pending Task 4", async () => {
++    window.history.replaceState({}, "", "/compose"); const user = userEvent.setup(); render(<App api={apiFor()} />);
++    expect(await screen.findByText("시뮬레이션 응답이나 임시 요청은 생성하지 않습니다.")).toBeTruthy();
++    await user.click(screen.getByRole("link", { name: "질문함" }));
++    expect(await screen.findByText(/Task 4에서 안전한 mutation/)).toBeTruthy();
+   });
+-
+-  it("places dispatch controls after approval and audit evidence", async () => {
+-    window.history.replaceState({}, "", "/commands/cmd-42");
+-    render(<App api={apiFor()} initialCommandId="cmd-42" />);
+-    await screen.findByRole("heading", { name: "Dispatch 제어" });
+-
+-    const cardHeadings = Array.from(document.querySelectorAll("article.detail > section > h2"), (heading) => heading.textContent);
+-    expect(cardHeadings).toEqual(["경로 선택 근거", "변경 계약", "Task DAG", "diff/test", "승인", "승인 이력", "감사 이력", "채널 전달", "Dispatch 제어"]);
+-  });
+-
+-  it("returns to the command list when browser history goes back", async () => {
+-    const user = userEvent.setup();
+-    render(<App api={apiFor()} />);
+-    await user.click(await screen.findByRole("link", { name: "승인 대시보드를 배포합니다" }));
+-    expect(window.location.pathname).toBe("/commands/cmd-42");
+-    window.history.back();
+-    window.dispatchEvent(new PopStateEvent("popstate"));
+-    expect(await screen.findByRole("heading", { name: "명령" })).toBeTruthy();
+-    expect(window.location.pathname).toBe("/commands");
+-  });
+-
+-  it("does not claim to be connected when loading fails", async () => {
+-    render(<App api={apiFor({ listCommands: vi.fn().mockRejectedValue(new DashboardApiError()) })} />);
+-    expect(await screen.findByText("정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")).toBeTruthy();
+-    expect(screen.queryByText(/연결됨/)).toBeNull();
+-    expect(screen.getByText("갱신 실패 · 재시도 필요")).toBeTruthy();
+-  });
+-
+-  it.each([
+-    [403, "이 정보에 접근할 권한이 없습니다."],
+-    [404, "요청한 명령을 찾을 수 없습니다."],
+-    [409, "제안이 변경되었습니다. 최신 정보를 확인해 주세요."],
+-    [undefined, "정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."]
+-  ])("shows a generalized error and retry for status %s", async (status, expected) => {
+-    render(<App api={apiFor({ listCommands: vi.fn().mockRejectedValue(new DashboardApiError(status)) })} />);
+-    expect(await screen.findByText(expected)).toBeTruthy();
+-    expect(screen.getByRole("button", { name: "다시 시도" })).toBeTruthy();
+-  });
+-
+-  it("shows an empty command list", async () => {
+-    render(<App api={apiFor({ listCommands: vi.fn().mockResolvedValue({ commands: [] }) })} />);
+-    expect(await screen.findByText("표시할 명령이 없습니다.")).toBeTruthy();
+-  });
+-
+-  it.each([
+-    ["권한 없음", { permitted: false }, "이 역할에는 승인 권한이 없습니다."],
+-    ["처리됨", { status: "approved" as const }, "이미 처리되어 승인할 수 없습니다."],
+-    ["문구 없음", { operationPhrase: undefined }, "서버가 승인 문구를 제공하지 않았습니다."]
+-  ])("makes %s approval unavailable", async (_caseName, approval, explanation) => {
+-    const command = { ...detail, approval: { ...detail.approval, ...approval } };
+-    render(<App api={apiFor({ getCommand: vi.fn().mockResolvedValue(command) })} initialCommandId="cmd-42" />);
+-    expect((await screen.findByRole("button", { name: "L3 승인" })) as HTMLButtonElement).toHaveProperty("disabled", true);
+-    expect(screen.getByText(explanation)).toBeTruthy();
+-  });
+-
+-  it("keeps approval unavailable while a mutation is in progress", async () => {
+-    let resolveApproval: (() => void) | undefined;
+-    const api = apiFor({ confirmApproval: vi.fn().mockImplementation(() => new Promise<void>((resolve) => { resolveApproval = resolve; })) });
+-    const user = userEvent.setup();
+-    render(<App api={api} initialCommandId="cmd-42" />);
+-    const approve = await screen.findByRole("button", { name: "L3 승인" });
+-    await user.type(screen.getByLabelText("승인 문구 입력"), "APPROVE RELEASE");
+-    await user.click(approve);
+-    expect(approve).toHaveProperty("disabled", true);
+-    resolveApproval?.();
+-  });
+-
+-  it("allows approval to be retried after a mutation error", async () => {
+-    const user = userEvent.setup();
+-    const api = apiFor({ confirmApproval: vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(undefined) });
+-    render(<App api={api} initialCommandId="cmd-42" />);
+-    const approve = await screen.findByRole("button", { name: "L3 승인" });
+-    await user.type(screen.getByLabelText("승인 문구 입력"), "APPROVE RELEASE");
+-    await user.click(approve);
+-    expect(await screen.findByText("승인 요청을 처리하지 못했습니다.")).toBeTruthy();
+-    expect(approve).toHaveProperty("disabled", false);
+-    await user.click(approve);
+-    expect(api.confirmApproval).toHaveBeenCalledTimes(2);
+-  });
+-
+-  it("keeps the command list after a stale detail request resolves", async () => {
+-    let resolveDetail: ((command: CommandDetail) => void) | undefined;
+-    const api = apiFor({ getCommand: vi.fn().mockImplementation(() => new Promise<CommandDetail>((resolve) => { resolveDetail = resolve; })) });
+-    const user = userEvent.setup();
+-    render(<App api={api} />);
+-    await user.click(await screen.findByRole("link", { name: "승인 대시보드를 배포합니다" }));
+-    await user.click(screen.getByRole("link", { name: "Orca HQ" }));
+-    resolveDetail?.(detail);
+-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+-    expect(window.location.pathname).toBe("/commands");
+-    expect(screen.getByRole("heading", { name: "명령" })).toBeTruthy();
+-  });
+-
+-  it("keeps the main content out of a broad live region", async () => {
+-    render(<App api={apiFor()} />);
+-    await screen.findByRole("heading", { name: "명령" });
+-    expect(document.querySelector("main")?.getAttribute("aria-live")).toBeNull();
+-  });
+-
+-  it("bootstraps the same-origin session before loading a direct command URL", async () => {
+-    const api = apiFor();
+-    render(<App api={api} initialCommandId="cmd-42" />);
+-    await screen.findByText("승인 대시보드를 배포합니다");
+-    expect(api.bootstrap).toHaveBeenCalledOnce();
+-  });
+ });
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -1,2 +1,103 @@
+-:root { color: #17212b; background: #f4f6f8; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; font-size: 16px; }
+-* { box-sizing: border-box; } body { margin: 0; line-height: 1.55; } header { background: #102a43; color: white; padding: 1rem; } nav, main { max-width: 1120px; margin: auto; } nav { display: flex; align-items: center; justify-content: space-between; gap: 1rem; } nav a { color: white; font-size: 1.25rem; font-weight: 750; } main { padding: 1rem; } .card { background: white; border: 1px solid #cbd5e1; border-radius: .5rem; margin: 0 0 1rem; padding: 1rem; box-shadow: 0 1px 2px #0f172a0d; } h1, h2 { line-height: 1.25; } h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; } ul { padding-left: 1.25rem; } li + li { margin-top: .6rem; } a { color: #075985; } button, input { min-height: 44px; font: inherit; } button { background: #075985; border: 1px solid #075985; border-radius: .3rem; color: white; cursor: pointer; margin: .25rem .5rem .25rem 0; padding: .5rem .8rem; } button:disabled { background: #64748b; border-color: #64748b; cursor: not-allowed; } input { display: block; width: 100%; max-width: 32rem; margin-top: .3rem; padding: .4rem; } code { overflow-wrap: anywhere; white-space: pre-wrap; } dl { display: grid; grid-template-columns: minmax(7rem, max-content) 1fr; gap: .4rem 1rem; } dt { font-weight: 700; } dd { margin: 0; min-width: 0; } .status { border: 1px solid #64748b; border-radius: 999px; display: inline-block; padding: .1rem .5rem; } :focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; } @media (min-width: 900px) { main { display: grid; grid-template-columns: minmax(18rem, 1fr) minmax(0, 2fr); gap: 1rem; align-items: start; } main > .card, main > .detail { grid-column: 1 / -1; } .detail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 1rem; } .detail > .back { grid-column: 1 / -1; justify-self: start; } } @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
++:root {
++  --bg: #f6f4ef; --surface: #fff; --surface-alt: #f0ede6; --border: #e2ddd2; --text: #1f2430;
++  --muted: #68707e; --faint: #96a0ab; --navy: #0e1a2b; --navy-alt: #152238; --emerald: #04815f;
++  --blue: #1d4ed8; --blue-bg: #e9f0ff; --emerald-bg: #e5f4ee; --amber: #92400e; --amber-bg: #fbf0dd;
++  color: var(--text); background: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", sans-serif;
++  font-size: 14px; line-height: 1.5; color-scheme: light;
++}
++* { box-sizing: border-box; }
++body { margin: 0; }
++button, input { font: inherit; }
++button { cursor: pointer; }
++button:disabled { cursor: not-allowed; opacity: .62; }
++.app-shell { min-height: 100vh; display: flex; }
++.sidebar { width: 216px; flex: none; background: var(--navy); color: #c9d3e0; display: flex; flex-direction: column; padding: 16px 10px; }
++.brand { padding: 7px 10px 17px; border-bottom: 1px solid #ffffff14; margin-bottom: 12px; }
++.brand strong, .brand small { display: block; }
++.brand strong { color: white; font-size: 14.5px; }
++.brand small { color: #7f8ea3; margin-top: 3px; }
++.sidebar nav { display: flex; flex-direction: column; gap: 2px; }
++.sidebar nav a { color: #c9d3e0; text-decoration: none; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; }
++.sidebar nav a:hover, .sidebar nav a.active { background: var(--navy-alt); color: white; }
++.sidebar nav a.active { font-weight: 650; }
++.nav-dot { width: 6px; height: 6px; border-radius: 50%; background: #7f8ea3; }
++.sidebar nav a.active .nav-dot { background: var(--emerald); }
++.nav-footer { margin-top: auto; padding: 10px; border-top: 1px solid #ffffff14; color: #7f8ea3; font-size: 11px; }
++.content-shell { flex: 1; min-width: 0; }
++.topbar { min-height: 52px; background: white; border-bottom: 1px solid var(--border); padding: 10px 26px; display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 12px; }
++.connection { display: inline-flex; align-items: center; gap: 7px; background: var(--surface-alt); border: 1px solid #cfc8b8; border-radius: 99px; padding: 4px 10px; color: var(--text); font-weight: 650; }
++.connection i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
++.connection.ready i { background: var(--emerald); }
++.connection.error i { background: #a3241a; }
++.main-content { padding: 24px 26px 60px; }
++.view-head { margin-bottom: 16px; }
++.view-head h1 { margin: 0 0 4px; font-size: clamp(1.25rem, 2vw, 1.5rem); letter-spacing: -.02em; }
++.view-head p, .muted { margin: 0; color: var(--muted); }
++.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
++.section-gap { margin-top: 16px; }
++.card { background: white; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 2px #14140a0d, 0 4px 14px #14140a0f; overflow: hidden; }
++.card-body { padding: 16px; }
++.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--border); }
++.card h2, .card-head h2 { margin: 0 0 12px; font-size: 1rem; }
++.card-head h2 { margin: 0; }
++.card-head > span { color: var(--faint); font-size: 11.5px; }
++.stat-row { display: grid; grid-template-columns: repeat(4, minmax(145px, 1fr)); gap: 10px; margin-bottom: 16px; }
++.stat { background: white; border: 1px solid var(--border); border-radius: 10px; padding: 13px 14px; }
++.stat span, .stat small, .stat strong { display: block; }
++.stat span { color: var(--muted); font-size: 11.5px; }
++.stat strong { font-size: 1.45rem; margin: 3px 0; }
++.stat small { color: var(--faint); }
++.badge { display: inline-flex; align-items: center; width: fit-content; padding: 2px 7px; border-radius: 6px; font-size: 11.5px; font-weight: 650; border: 1px solid transparent; }
++.badge.hq { background: var(--blue-bg); color: var(--blue); border-color: #c3d6fb; }
++.badge.orca, .badge.ok { background: var(--emerald-bg); color: var(--emerald); border-color: #bfe3d3; }
++.badge.unknown { background: #eceae4; color: #5c5748; border-color: #d8d3c6; }
++.attention-list { display: grid; gap: 1px; }
++.attention { width: 100%; border: 0; border-bottom: 1px solid var(--border); background: transparent; text-align: left; padding: 10px 0; display: flex; align-items: center; gap: 9px; color: var(--text); }
++.attention:last-child { border-bottom: 0; }
++.empty-copy { color: var(--muted); text-align: center; padding: 18px; }
++.table-wrap { overflow-x: auto; }
++table { width: 100%; border-collapse: collapse; }
++th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
++th { color: var(--faint); font-size: 11px; }
++tbody tr { cursor: pointer; }
++tbody tr:hover { background: var(--surface-alt); }
++.mono, code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
++.kv { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 7px 10px; margin: 8px 0; }
++.kv dt { color: var(--faint); text-transform: uppercase; font-size: 11px; }
++.kv dd { margin: 0; overflow-wrap: anywhere; }
++.async-state, .auth-error, .placeholder { padding: 34px 20px; text-align: center; background: white; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); }
++.async-state strong { display: block; margin-bottom: 12px; }
++.async-state.disconnected, .auth-error { border-color: #f2c9c4; background: #fbeae8; color: #7f1d1d; }
++.async-state button, .back, .load-more, .timeline button, .tabs button, .filters button { border: 1px solid #cfc8b8; background: white; color: var(--text); border-radius: 7px; padding: 7px 10px; }
++.back { margin-bottom: 14px; }
++.filters, .tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
++.filters button.active, .tabs button[aria-selected="true"] { background: var(--navy); color: white; border-color: var(--navy); }
++.load-more { margin-top: 16px; }
++.timeline { list-style: none; padding: 0 16px 12px; margin: 0; }
++.timeline li { display: grid; grid-template-columns: 150px minmax(140px, 1fr) 90px auto; align-items: center; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--border); }
++.timeline time, .timeline span, .timeline em { color: var(--muted); font-size: 12px; }
++.log-card pre { max-height: 32rem; overflow: auto; background: var(--navy); color: #d6e6ff; padding: 14px; border-radius: 8px; white-space: pre-wrap; }
++.question-list, .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
++.question-list li { display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border); }
++.question-list small { color: var(--muted); }
++.question-list button { width: fit-content; }
++.tree ul { padding-left: 22px; }
++.tree-row { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 8px; }
++.tree-row:hover { background: var(--surface-alt); }
++.evidence-line { margin: 18px 0 0; color: var(--muted); font-size: 12px; }
++:focus-visible { outline: 3px solid #f59e0b; outline-offset: 2px; }
++@media (max-width: 980px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
++@media (max-width: 760px) {
++  .app-shell { display: block; }
++  .sidebar { width: 100%; padding: 9px 10px; }
++  .brand { margin: 0; padding: 4px 5px 8px; border: 0; }
++  .brand small, .nav-footer { display: none; }
++  .sidebar nav { flex-direction: row; overflow-x: auto; }
++  .sidebar nav a { white-space: nowrap; }
++  .topbar { padding: 9px 14px; }
++  .main-content { padding: 17px 14px 50px; }
++  .grid-2, .stat-row { grid-template-columns: 1fr; }
++  .timeline li { grid-template-columns: 1fr; }
++  .kv { grid-template-columns: 95px minmax(0, 1fr); }
++}
++@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+--- /dev/null
++++ b/apps/web/src/hooks.ts
+@@ -0,0 +1,48 @@
++import { useEffect, useRef, useState } from "react";
++import { OperationsApiError } from "./api.js";
++import type { LoadState } from "./components/async-state.js";
++
++export function stateForError(error: unknown): LoadState {
++  if (error instanceof OperationsApiError && error.status === 401) return "disconnected";
++  if (error instanceof OperationsApiError && (error.code === "runtime_unverifiable" || error.code === "source_changed")) return "unknown";
++  return "error";
++}
++
++export function useRead<T>(loader: (signal: AbortSignal) => Promise<T>, deps: readonly unknown[] = []) {
++  const [data, setData] = useState<T>();
++  const [state, setState] = useState<LoadState>("loading");
++  const [version, setVersion] = useState(0);
++  useEffect(() => {
++    let active = true;
++    const controller = new AbortController();
++    setState((value) => data === undefined ? "loading" : value);
++    void loader(controller.signal).then((value) => { if (active) { setData(value); setState("ready"); } }).catch((error: unknown) => {
++      if (active && !(error instanceof DOMException && error.name === "AbortError")) setState(stateForError(error));
++    });
++    return () => { active = false; controller.abort(); };
++  }, [...deps, version]);
++  return { data, state, reload: () => setVersion((value) => value + 1) };
++}
++
++export function useVisiblePolling<T>(loader: (signal: AbortSignal) => Promise<T>, intervalMs: number, deps: readonly unknown[] = []) {
++  const [data, setData] = useState<T>();
++  const [state, setState] = useState<LoadState>("loading");
++  const reload = useRef<() => void>(() => undefined);
++  useEffect(() => {
++    let stopped = false, timer: number | undefined, controller: AbortController | undefined, generation = 0;
++    const run = async (current: number) => {
++      if (stopped || document.hidden || current !== generation) return;
++      controller = new AbortController();
++      try { const value = await loader(controller.signal); if (!stopped) { setData(value); setState("ready"); } }
++      catch (error) { if (!stopped && !(error instanceof DOMException && error.name === "AbortError")) setState(stateForError(error)); }
++      finally { if (!stopped && !document.hidden && current === generation) timer = window.setTimeout(() => void run(current), intervalMs); }
++    };
++    const restart = () => { generation++; if (timer !== undefined) clearTimeout(timer); controller?.abort(); if (!document.hidden) void run(generation); };
++    reload.current = restart;
++    const visibility = () => restart();
++    document.addEventListener("visibilitychange", visibility);
++    restart();
++    return () => { stopped = true; generation++; controller?.abort(); if (timer !== undefined) clearTimeout(timer); document.removeEventListener("visibilitychange", visibility); };
++  }, deps);
++  return { data, state, reload: () => reload.current() };
++}
+--- a/apps/web/src/components/approval-card.tsx
++++ /dev/null
+@@ -1,44 +0,0 @@
+-import { useState } from "react";
+-
+-import type { CommandDetail, DashboardApi } from "../api.js";
+-
+-export function ApprovalCard({ approval, contract, api, onDone }: Readonly<{
+-  approval: CommandDetail["approval"];
+-  contract: CommandDetail["contract"];
+-  api: DashboardApi;
+-  onDone(): void;
+-}>) {
+-  const [phrase, setPhrase] = useState("");
+-  const [state, setState] = useState<"idle" | "working" | "done" | "error">("idle");
+-  const expired = Date.parse(approval.expiresAt) <= Date.now() || approval.status === "expired";
+-  const phraseMissing = approval.level === "L3" && !approval.operationPhrase;
+-  const unavailable = expired || approval.status !== "pending" || !approval.permitted || phraseMissing || state === "working" || state === "done";
+-  const phraseMatches = approval.level !== "L3" || (!phraseMissing && phrase === approval.operationPhrase);
+-  const submit = async () => {
+-    setState("working");
+-    try {
+-      await api.confirmApproval(approval.id, approval.level === "L3"
+-        ? { digest: approval.digest, phrase }
+-        : { digest: approval.digest });
+-      setPhrase("");
+-      setState("done");
+-      onDone();
+-    } catch {
+-      setState("error");
+-    }
+-  };
+-  return <section className="card" aria-labelledby="approval-heading">
+-    <h2 id="approval-heading">승인</h2>
+-    <p><strong>{approval.level}</strong> · 상태: {approval.status}</p>
+-    <dl><dt>위험 등급</dt><dd>{approval.level}</dd><dt>변경 digest</dt><dd><code>{approval.digest}</code></dd><dt>만료 시각</dt><dd>{approval.expiresAt}</dd><dt>base</dt><dd><code>{contract.base}</code></dd><dt>허용 scope</dt><dd>{contract.allowedScope.map((scope) => <code key={scope}>{scope} </code>)}</dd><dt>금지 효과</dt><dd>{contract.prohibitedEffects.join(", ")}</dd><dt>검증 명령</dt><dd>{contract.testCommands.map((command) => <code key={command}>{command} </code>)}</dd></dl>
+-    {approval.level === "L3" && <><p>승인 문구: <code>{approval.operationPhrase ?? "제공되지 않음"}</code></p><label>승인 문구 입력
+-      <input aria-label="승인 문구 입력" autoComplete="off" spellCheck={false} value={phrase} onChange={(event) => setPhrase(event.target.value)} disabled={unavailable} />
+-    </label></>}
+-    {!approval.permitted && <p role="status">이 역할에는 승인 권한이 없습니다.</p>}
+-    {expired && <p role="status">만료되어 승인할 수 없습니다.</p>}
+-    {approval.status !== "pending" && !expired && <p role="status">이미 처리되어 승인할 수 없습니다.</p>}
+-    {phraseMissing && <p role="status">서버가 승인 문구를 제공하지 않았습니다.</p>}
+-    <button type="button" onClick={submit} disabled={unavailable || !phraseMatches}>{approval.level} 승인</button>
+-    <p aria-live="polite">{state === "working" ? "승인 요청 중입니다." : state === "done" ? "승인되었습니다." : state === "error" ? "승인 요청을 처리하지 못했습니다." : ""}</p>
+-  </section>;
+-}
+--- /dev/null
++++ b/apps/web/src/components/async-state.tsx
+@@ -0,0 +1,17 @@
++import type { ReactNode } from "react";
++
++export type LoadState = "loading" | "ready" | "empty" | "disconnected" | "error" | "unknown";
++export function AsyncState({ state, children, onRetry }: Readonly<{ state: LoadState; children?: ReactNode; onRetry?: () => void }>) {
++  if (state === "ready") return <>{children}</>;
++  const labels: Record<Exclude<LoadState, "ready">, string> = {
++    loading: "실제 운영 데이터를 불러오는 중입니다.",
++    empty: "표시할 운영 데이터가 없습니다.",
++    disconnected: "운영 브리지 연결이 끊겼습니다. hq console을 다시 실행해 주세요.",
++    error: "데이터 형식 또는 요청을 확인할 수 없습니다.",
++    unknown: "현재 상태를 판정할 수 없습니다. 자동 조작 없이 관찰만 계속합니다.",
++  };
++  return <section className={`async-state ${state}`} role={state === "loading" ? "status" : "alert"}>
++    <strong>{labels[state]}</strong>
++    {onRetry && state !== "loading" ? <button type="button" onClick={onRetry}>다시 읽기</button> : null}
++  </section>;
++}
+--- /dev/null
++++ b/apps/web/src/components/source-badge.tsx
+@@ -0,0 +1,3 @@
++export function SourceBadge({ source }: Readonly<{ source: "hq" | "orca" }>) {
++  return <span className={`badge ${source}`}>{source === "hq" ? "HQ" : "Orca"}</span>;
++}
+--- a/apps/web/src/routes/command-list.tsx
++++ /dev/null
+@@ -1,11 +0,0 @@
+-import type { CommandSummary } from "../api.js";
+-
+-export function CommandList({ commands, onSelect }: Readonly<{ commands: readonly CommandSummary[]; onSelect(id: string): void }>) {
+-  return <section className="card command-list" aria-labelledby="commands-heading">
+-    <h1 id="commands-heading">명령</h1>
+-    {commands.length === 0 ? <p>표시할 명령이 없습니다.</p> : <ul>{commands.map((command) => <li key={command.id}>
+-      <a href={`/commands/${encodeURIComponent(command.id)}`} onClick={(event) => { event.preventDefault(); onSelect(command.id); }}>{command.summary}</a>
+-      <p>{command.projectKey} · 위험 {command.riskLevel} · {command.status}</p><time dateTime={command.updatedAt}>최근 갱신 {command.updatedAt}</time>
+-    </li>)}</ul>}
+-  </section>;
+-}
+--- a/apps/web/src/routes/command-detail.tsx
++++ /dev/null
+@@ -1,56 +0,0 @@
+-import { useState } from "react";
+-
+-import type { CommandDetail, DashboardApi } from "../api.js";
+-import { ApprovalCard } from "../components/approval-card.js";
+-
+-function Status({ children }: Readonly<{ children: string }>) { return <span className="status">상태: {children}</span>; }
+-function CodeList({ values }: Readonly<{ values: readonly string[] }>) { return <ul>{values.map((value) => <li key={value}><code>{value}</code></li>)}</ul>; }
+-function deliveryLabel(channel: string, status: CommandDetail["delivery"][number]["status"]): string {
+-  return `${channel} 전송 ${status === "pending" ? "대기" : status === "sent" ? "완료" : "실패"}`;
+-}
+-function verificationLabel(status: CommandDetail["verification"]["status"]): string {
+-  if (status === "passed") return "검증 완료";
+-  if (status === "pending") return "검증 대기";
+-  return "검증 실패";
+-}
+-
+-export function CommandDetailView({ command, api, onBack, onRefresh }: Readonly<{
+-  command: CommandDetail; api: DashboardApi; onBack(): void; onRefresh(): void;
+-}>) {
+-  const [actionState, setActionState] = useState<"idle" | "working" | "stopped" | "retried" | "error">("idle");
+-  const action = async (kind: "stop" | "retry", dispatchId: string) => {
+-    setActionState("working");
+-    try {
+-      kind === "stop" ? await api.stopDispatch(dispatchId) : await api.retryDispatch(dispatchId);
+-      setActionState(kind === "stop" ? "stopped" : "retried");
+-    } catch { setActionState("error"); }
+-  };
+-  return <article className="detail">
+-    <button type="button" className="back" onClick={onBack}>목록으로 돌아가기</button>
+-    <section className="card"><h1>{command.summary}</h1><Status>{command.status}</Status><p>프로젝트: {command.project.displayName} (<code>{command.project.path}</code>)</p><p>현재 단계: {command.tasks[0]?.title ?? "대기"}</p></section>
+-    <section className="card"><h2>경로 선택 근거</h2><p>선택 점수: {command.routing.score}</p><p>{command.routing.selectedReason}</p><CodeList values={command.routing.candidates} /></section>
+-    <section className="card"><h2>변경 계약</h2><dl><dt>base</dt><dd><code>{command.contract.base}</code></dd><dt>허용 scope</dt><dd><CodeList values={command.contract.allowedScope} /></dd><dt>금지 효과</dt><dd><CodeList values={command.contract.prohibitedEffects} /></dd><dt>test commands</dt><dd><CodeList values={command.contract.testCommands} /></dd></dl></section>
+-    <section className="card"><h2>Task DAG</h2><ul>{command.tasks.map((task) => <li key={task.id}><strong>{task.id}</strong> — {task.title} <Status>{task.status}</Status><p>의존성: {task.dependencies.join(", ") || "없음"}</p><p>{`worker: ${task.workerFamily} · verifier: ${task.verifierFamily}`}</p><p>Dispatch: <code>{task.dispatchId}</code> ({task.dispatchStatus})</p></li>)}</ul></section>
+-    <section className="card"><h2>diff/test</h2><p>{command.diff.summary}</p><p>{verificationLabel(command.verification.status)}</p><p>상태: {command.verification.status}</p><CodeList values={command.verification.commands} /></section>
+-    <ApprovalCard approval={command.approval} contract={command.contract} api={api} onDone={onRefresh} />
+-    <section className="card"><h2>승인 이력</h2>{command.approvalHistory.length === 0
+-      ? <p>승인 이력이 없습니다.</p>
+-      : <ol>{command.approvalHistory.map((approval) => <li key={approval.id}>
+-          <p><code>{approval.id}</code> · {approval.level} · <span>{approval.status}</span></p>
+-          <p>digest: <code>{approval.digest}</code></p>
+-          {approval.approvedAt && <p>승인 시각: <time dateTime={approval.approvedAt}>{approval.approvedAt}</time></p>}
+-          {approval.expiresAt && <p>만료 시각: <time dateTime={approval.expiresAt}>{approval.expiresAt}</time></p>}
+-        </li>)}</ol>}</section>
+-    <section className="card"><h2>감사 이력</h2>{command.auditHistory.length === 0
+-      ? <p>감사 참조: <code>{command.audit.reference}</code> · {command.audit.summary}</p>
+-      : <ol>{command.auditHistory.map((audit) => <li key={audit.reference}>
+-          <p><code>{audit.subjectId}</code> · <span>{audit.summary}</span></p>
+-          <p>감사 참조: <code>{audit.reference}</code></p>
+-          <time dateTime={audit.occurredAt}>{audit.occurredAt}</time>
+-        </li>)}</ol>}</section>
+-    <section className="card"><h2>채널 전달</h2>{command.delivery.length === 0
+-      ? <p>전달 이력이 없습니다.</p>
+-      : <ul>{command.delivery.map((delivery) => <li key={delivery.channel}>{deliveryLabel(delivery.channel, delivery.status)}</li>)}</ul>}</section>
+-    <section className="card"><h2>Dispatch 제어</h2><p>중지는 Dispatch만 중지하며 worktree를 삭제하지 않습니다.</p><ul>{command.tasks.map((task) => <li key={task.id}><strong>{task.id}</strong> — {task.title} <p>Dispatch: <code>{task.dispatchId}</code> ({task.dispatchStatus})</p><button type="button" disabled={actionState === "working" || !task.canStop} onClick={() => void action("stop", task.dispatchId)} aria-label={`Dispatch 중지: ${task.title} (${task.dispatchId})`}>Dispatch 중지</button><button type="button" disabled={actionState === "working" || !task.canRetry} onClick={() => void action("retry", task.dispatchId)} aria-label={`Dispatch 재시도: ${task.title} (${task.dispatchId})`}>Dispatch 재시도</button></li>)}</ul><p role="status">{actionState === "working" ? "Dispatch 요청 처리 중입니다." : actionState === "stopped" ? "Dispatch 중지 요청이 완료되었습니다." : actionState === "retried" ? "Dispatch 재시도 요청이 완료되었습니다." : actionState === "error" ? "Dispatch 요청을 처리하지 못했습니다." : ""}</p></section>
+-  </article>;
+-}
+--- /dev/null
++++ b/apps/web/src/routes/operations-overview.tsx
+@@ -0,0 +1,42 @@
++import type { OperationsApi } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { useVisiblePolling } from "../hooks.js";
++
++export function OperationsOverview({ api, navigate }: Readonly<{ api: OperationsApi; navigate: (path: string) => void }>) {
++  const read = useVisiblePolling(async (signal) => {
++    const [status, contexts, workers, hqQuestions, orcaQuestions] = await Promise.all([
++      api.status(signal), api.contexts(undefined, signal), api.workers(undefined, signal), api.hqQuestions("0", signal), api.orcaQuestions(signal),
++    ]);
++    return { status, contexts, workers, hqQuestions, orcaQuestions };
++  }, 5000, [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  const { status, contexts, workers, hqQuestions, orcaQuestions } = read.data;
++  const uncertain = workers.workers.filter((item) => ["unknown", "unverifiable"].includes(item.projection.liveness.verdict));
++  const attention = hqQuestions.questions.length + orcaQuestions.messages.length + uncertain.length;
++  return <>
++    <div className="view-head"><h1>운영 개요</h1><p>HQ 업무와 Orca 실행은 서로 다른 실제 출처로 분리해 표시합니다.</p></div>
++    <div className="stat-row">
++      <div className="stat"><span>HQ 진행중 업무</span><strong>{status.hq.capacity.active}</strong><small>HQ admission 기준</small></div>
++      <div className="stat"><span>Orca 관찰 워커</span><strong>{workers.workers.length}</strong><small>외부 fleet는 HQ 용량에서 제외</small></div>
++      <div className="stat"><span>관심 필요</span><strong>{attention}</strong><small>질문 · 불확실 상태</small></div>
++      <div className="stat"><span>HQ 용량</span><strong>{status.hq.capacity.active} / {status.hq.capacity.limit}</strong><small>{status.hq.capacity.source} 설정</small></div>
++    </div>
++    <div className="grid-2">
++      <section className="card"><div className="card-head"><h2>관심함</h2><span>실제 읽기</span></div><div className="card-body attention-list">
++        {attention === 0 ? <p className="empty-copy">대기 중인 관심 항목이 없습니다.</p> : null}
++        {hqQuestions.questions.map((question) => <button className="attention" key={question.requestId} onClick={() => navigate(question.contextId ? `/work/hq/${encodeURIComponent(question.contextId)}` : "/questions")}><SourceBadge source="hq" /><span>{question.body}</span></button>)}
++        {orcaQuestions.messages.map((question) => <button className="attention" key={question.id} onClick={() => navigate("/questions")}><SourceBadge source="orca" /><span>{question.subject || question.body}</span></button>)}
++        {uncertain.map((worker) => <button className="attention" key={worker.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(worker.dispatchId)}`)}><SourceBadge source="orca" /><span>{worker.dispatchId} · 상태 판정 필요</span></button>)}
++      </div></section>
++      <section className="card"><div className="card-head"><h2>연결 및 수집</h2><span>{new Date(status.collectedAt).toLocaleTimeString()}</span></div><dl className="kv card-body">
++        <dt>HQ</dt><dd>{status.hq.state}</dd><dt>Orca</dt><dd>{status.orca.reachable ? `연결됨 · ${status.orca.version}` : `연결 안 됨 · ${status.orca.state}`}</dd>
++        <dt>tokens</dt><dd>수집되지 않음</dd><dt>cost</dt><dd>수집되지 않음</dd>
++      </dl></section>
++    </div>
++    <div className="grid-2 section-gap">
++      <section className="card"><div className="card-head"><h2>HQ 업무</h2><span>{contexts.contexts.length}건</span></div><div className="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>갱신</th></tr></thead><tbody>{contexts.contexts.slice(0, 5).map((item) => <tr key={item.contextId} onClick={() => navigate(`/work/hq/${encodeURIComponent(item.contextId)}`)}><td>{item.title}</td><td>{item.state}</td><td>{new Date(item.updatedAt).toLocaleTimeString()}</td></tr>)}</tbody></table></div></section>
++      <section className="card"><div className="card-head"><h2>Orca 실행</h2><span>{workers.workers.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Dispatch</th><th>liveness</th><th>Run</th></tr></thead><tbody>{workers.workers.slice(0, 5).map((item) => <tr key={item.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(item.dispatchId)}`)}><td>{item.dispatchId}</td><td>{item.projection.liveness.verdict}</td><td>{item.projection.runId}</td></tr>)}</tbody></table></div></section>
++    </div>
++  </>;
++}
+--- /dev/null
++++ b/apps/web/src/routes/operations-list.tsx
+@@ -0,0 +1,32 @@
++import { useState } from "react";
++import type { HqContext, OperationsApi, OrcaWorkerPage } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { useVisiblePolling } from "../hooks.js";
++
++type Worker = OrcaWorkerPage["workers"][number];
++export function OperationsList({ api, navigate }: Readonly<{ api: OperationsApi; navigate: (path: string) => void }>) {
++  const [filter, setFilter] = useState<"all" | "hq" | "orca">("all");
++  const [moreContexts, setMoreContexts] = useState<readonly HqContext[]>([]);
++  const [moreWorkers, setMoreWorkers] = useState<readonly Worker[]>([]);
++  const [contextCursor, setContextCursor] = useState<string>();
++  const [workerCursor, setWorkerCursor] = useState<string>();
++  const read = useVisiblePolling(async (signal) => {
++    const [contexts, workers, runs] = await Promise.all([api.contexts(undefined, signal), api.workers(undefined, signal), api.runs(undefined, signal)]);
++    setContextCursor(contexts.cursor); setWorkerCursor(workers.page.nextCursor ?? undefined);
++    return { contexts, workers, runs };
++  }, 5000, [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  const contexts = [...read.data.contexts.contexts, ...moreContexts].filter((row, index, all) => all.findIndex((candidate) => candidate.contextId === row.contextId) === index);
++  const workers = [...read.data.workers.workers, ...moreWorkers].filter((row, index, all) => all.findIndex((candidate) => candidate.dispatchId === row.dispatchId) === index);
++  const loadMore = async () => {
++    if (filter !== "orca" && contextCursor) { const page = await api.contexts(contextCursor); if (page.cursor !== contextCursor) { setMoreContexts((value) => [...value, ...page.contexts]); setContextCursor(page.cursor); } else setContextCursor(undefined); }
++    if (filter !== "hq" && workerCursor) { const page = await api.workers(workerCursor); const next = page.page.nextCursor ?? undefined; if (next !== workerCursor) { setMoreWorkers((value) => [...value, ...page.workers]); setWorkerCursor(next); } else setWorkerCursor(undefined); }
++  };
++  return <><div className="view-head"><h1>업무 목록</h1><p>HQ 문맥과 Orca Run/Task/Dispatch를 합성하지 않고 나란히 조회합니다.</p></div>
++    <div className="filters" aria-label="출처 필터">{(["all", "hq", "orca"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value === "all" ? "전체" : value === "hq" ? "HQ" : "Orca"}</button>)}</div>
++    {(filter === "all" || filter === "hq") && <section className="card"><div className="card-head"><h2><SourceBadge source="hq" /> 문맥/요청</h2><span>{contexts.length}건</span></div><div className="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>문맥 ID</th><th>갱신</th></tr></thead><tbody>{contexts.map((item) => <tr key={item.contextId} onClick={() => navigate(`/work/hq/${encodeURIComponent(item.contextId)}`)}><td>{item.title}</td><td>{item.state}</td><td className="mono">{item.contextId}</td><td>{new Date(item.updatedAt).toLocaleString()}</td></tr>)}</tbody></table>{contexts.length === 0 ? <p className="empty-copy">HQ 문맥이 없습니다.</p> : null}</div></section>}
++    {(filter === "all" || filter === "orca") && <section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Dispatch</h2><span>Run {read.data.runs.runs.length}건 · Dispatch {workers.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Dispatch</th><th>liveness</th><th>Task</th><th>Run</th></tr></thead><tbody>{workers.map((item) => <tr key={item.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(item.dispatchId)}`)}><td className="mono">{item.dispatchId}</td><td>{item.projection.liveness.verdict}</td><td>{item.projection.taskId}</td><td>{item.projection.runId}</td></tr>)}</tbody></table>{workers.length === 0 ? <p className="empty-copy">Orca Dispatch가 없습니다.</p> : null}</div></section>}
++    {((filter !== "orca" && contextCursor) || (filter !== "hq" && workerCursor)) ? <button className="load-more" onClick={() => void loadMore()}>다음 페이지 읽기</button> : null}
++  </>;
++}
+--- /dev/null
++++ b/apps/web/src/routes/operations-detail.tsx
+@@ -0,0 +1,72 @@
++import { useEffect, useRef, useState } from "react";
++import type { HqEventPage, OperationsApi, OrcaOutputPage } from "../api.js";
++import { AsyncState, type LoadState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { stateForError, useRead } from "../hooks.js";
++
++export function HqDetail({ api, contextId, navigate }: Readonly<{ api: OperationsApi; contextId: string; navigate: (path: string) => void }>) {
++  const detail = useRead((signal) => api.context(contextId, signal), [api, contextId]);
++  const [events, setEvents] = useState<HqEventPage["events"]>([]);
++  const [eventState, setEventState] = useState<LoadState>("loading");
++  const [compacted, setCompacted] = useState(false);
++  const cursor = useRef("0");
++  useEffect(() => {
++    let stopped = false, timer: number | undefined, controller: AbortController | undefined, generation = 0;
++    const poll = async (current: number) => {
++      if (stopped || document.hidden || current !== generation) return;
++      controller = new AbortController();
++      try {
++        const page = await api.events(contextId, cursor.current, controller.signal);
++        if (stopped) return;
++        setCompacted((value) => value || page.compacted);
++        setEvents((current) => [...current, ...page.events].filter((row, index, all) => all.findIndex((candidate) => candidate.seq === row.seq) === index).slice(-500));
++        if (page.cursor && Number(page.cursor) >= Number(cursor.current)) cursor.current = page.cursor;
++        setEventState("ready");
++      } catch (error) { if (!stopped && !(error instanceof DOMException && error.name === "AbortError")) setEventState(stateForError(error)); }
++      finally { if (!stopped && !document.hidden && current === generation) timer = window.setTimeout(() => void poll(current), 2000); }
++    };
++    const restart = () => { generation++; controller?.abort(); if (timer !== undefined) clearTimeout(timer); if (!document.hidden) void poll(generation); };
++    const visibility = () => restart();
++    document.addEventListener("visibilitychange", visibility); restart();
++    return () => { stopped = true; generation++; controller?.abort(); if (timer !== undefined) clearTimeout(timer); document.removeEventListener("visibilitychange", visibility); };
++  }, [api, contextId]);
++  if (!detail.data || detail.state !== "ready") return <AsyncState state={detail.state} onRetry={detail.reload} />;
++  return <><button className="back" onClick={() => navigate("/work")}>← 업무 목록</button><div className="view-head"><h1><SourceBadge source="hq" /> {detail.data.context.title}</h1><p>{detail.data.context.summary || "요약 없음"}</p></div>
++    <div className="grid-2"><section className="card card-body"><h2>문맥</h2><dl className="kv"><dt>context</dt><dd className="mono">{detail.data.context.contextId}</dd><dt>state</dt><dd>{detail.data.context.state}</dd><dt>projects</dt><dd>{detail.data.context.projectIds.join(", ") || "아직 없음"}</dd><dt>updated</dt><dd>{detail.data.context.updatedAt}</dd></dl></section>
++      <section className="card card-body"><h2>출처 증거</h2><dl className="kv"><dt>source</dt><dd>{detail.data.evidence.source}</dd><dt>verification</dt><dd>{detail.data.evidence.verification}</dd><dt>observed</dt><dd>{detail.data.evidence.observedAt}</dd></dl></section></div>
++    <section className="card section-gap"><div className="card-head"><h2>HQ 이벤트</h2><span>cursor {cursor.current}{compacted ? " · 이전 이력 compacted" : ""}</span></div>
++      {eventState !== "ready" ? <AsyncState state={eventState} /> : events.length === 0 ? <AsyncState state="empty" /> : <ol className="timeline">{events.map((event) => <li key={event.seq}><time>{new Date(event.occurredAt).toLocaleString()}</time><strong>{event.kind}</strong><span>{event.eventSource}</span>{event.receiptLink ? <button onClick={() => navigate(`/work/orca/${encodeURIComponent(event.receiptLink!.dispatchId)}`)}>연결된 Dispatch 보기</button> : <em>연결 영수증 아직 없음</em>}</li>)}</ol>}
++    </section>
++  </>;
++}
++
++export function OrcaDetail({ api, dispatchId, navigate }: Readonly<{ api: OperationsApi; dispatchId: string; navigate: (path: string) => void }>) {
++  const detail = useRead((signal) => api.worker(dispatchId, signal), [api, dispatchId]);
++  const [tab, setTab] = useState<"state" | "terminal" | "transcript" | "evidence">("state");
++  const [log, setLog] = useState<OrcaOutputPage>();
++  const [logState, setLogState] = useState<LoadState>("loading");
++  const lastRequestedCursor = useRef<string | undefined>(undefined);
++  const loadLog = async (source: "terminal" | "transcript", next?: string) => {
++    const prior = log?.source === source ? log : undefined;
++    if (next && lastRequestedCursor.current === next) return;
++    lastRequestedCursor.current = next;
++    setLogState("loading");
++    try {
++      const page = await api.output(dispatchId, source, next);
++      if (prior && prior.source === page.source) {
++        if (page.source === "terminal" && prior.source === "terminal") setLog({ ...page, lines: [...prior.lines, ...page.lines].slice(-500) });
++        else if (page.source === "transcript" && prior.source === "transcript") setLog({ ...page, messages: [...prior.messages, ...page.messages].filter((row, index, all) => all.findIndex((candidate) => candidate.id === row.id) === index).slice(-500) });
++      } else setLog(page);
++      setLogState("ready");
++    } catch (error) { setLogState(stateForError(error)); }
++  };
++  const selectTab = (next: typeof tab) => { setTab(next); if ((next === "terminal" || next === "transcript") && log?.source !== next) { lastRequestedCursor.current = undefined; void loadLog(next); } };
++  if (!detail.data || detail.state !== "ready") return <AsyncState state={detail.state} onRetry={detail.reload} />;
++  const item = detail.data;
++  return <><button className="back" onClick={() => navigate("/work")}>← 업무 목록</button><div className="view-head"><h1><SourceBadge source="orca" /> {item.dispatch.id}</h1><p>Dispatch, worker projection, PTY 상태를 각각 표시합니다.</p></div>
++    <div className="tabs" role="tablist">{(["state", "terminal", "transcript", "evidence"] as const).map((value) => <button role="tab" aria-selected={tab === value} key={value} onClick={() => selectTab(value)}>{value === "state" ? "상태" : value === "terminal" ? "터미널 로그" : value === "transcript" ? "대화 로그" : "증거"}</button>)}</div>
++    {tab === "state" && <div className="grid-2"><section className="card card-body"><h2>Dispatch / projection</h2><dl className="kv"><dt>dispatch status</dt><dd>{item.dispatch.status}</dd><dt>worker stage</dt><dd>{item.worker.stage}</dd><dt>liveness</dt><dd>{item.projection.liveness.verdict}</dd><dt>observation</dt><dd>{item.observation.status}</dd><dt>outcome</dt><dd>{item.projection.outcome ?? "아직 없음"}</dd></dl></section><section className="card card-body"><h2>PTY / resource</h2><dl className="kv"><dt>connected</dt><dd>{item.terminal ? String(item.terminal.connected) : "터미널 없음"}</dd><dt>writable</dt><dd>{item.terminal ? String(item.terminal.writable) : "터미널 없음"}</dd><dt>incarnation</dt><dd className="mono">{item.terminal?.incarnationId ?? "아직 없음"}</dd><dt>ownership</dt><dd>{item.terminalResource.ownershipState}</dd><dt>release</dt><dd>{item.terminalResource.releaseState}</dd></dl></section></div>}
++    {(tab === "terminal" || tab === "transcript") && <section className="card card-body log-card"><h2>{tab === "terminal" ? "Orca 터미널 출력" : "Orca transcript"}</h2>{logState !== "ready" ? <AsyncState state={logState} /> : log?.source === "terminal" ? <pre>{log.lines.join("\n") || "출력 없음"}</pre> : log?.source === "transcript" ? <ol>{log.messages.map((message) => <li key={message.id}><strong>{message.role}</strong><p>{message.text}</p></li>)}</ol> : null}{log?.cursor && log.cursor !== lastRequestedCursor.current ? <button onClick={() => void loadLog(tab, log.cursor)}>다음 로그 페이지</button> : null}</section>}
++    {tab === "evidence" && <section className="card card-body"><h2>Orca 관찰 증거</h2><dl className="kv"><dt>source</dt><dd>{item.evidence.source}</dd><dt>verification</dt><dd>{item.evidence.verification}</dd><dt>observed</dt><dd>{item.evidence.observedAt}</dd><dt>exact worker</dt><dd>{String(item.observation.exactWorker)}</dd></dl></section>}
++  </>;
++}
+--- /dev/null
++++ b/apps/web/src/routes/operations-resources.tsx
+@@ -0,0 +1,13 @@
++import type { OperationsApi } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { useRead } from "../hooks.js";
++
++export function OperationsResources({ api }: Readonly<{ api: OperationsApi }>) {
++  const read = useRead((signal) => api.resources(signal), [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  return <><div className="view-head"><h1>프로젝트 / 터미널</h1><p>공개 Orca 인벤토리의 bounded hierarchy와 host scope를 그대로 표시합니다.</p></div><section className="card card-body"><h2><SourceBadge source="orca" /> 리소스 계층</h2>
++    {read.data.projects.length === 0 ? <AsyncState state="empty" /> : <ul className="tree">{read.data.projects.map((project) => <li key={project.id}><div className="tree-row"><strong>Project</strong><span className="mono">{project.id}</span><span className={`badge ${project.hostScope === "covered" ? "ok" : "unknown"}`}>{project.hostScope}</span></div><ul>{project.setups.map((setup) => <li key={setup.id}><div className="tree-row"><strong>Setup</strong><span className="mono">{setup.id}</span>{setup.truncated ? <span className="badge unknown">truncated</span> : null}</div><ul>{setup.worktrees.map((worktree) => <li key={worktree.id}><div className="tree-row"><strong>Worktree</strong><span className="mono">{worktree.id}</span>{worktree.truncated ? <span className="badge unknown">truncated</span> : null}</div><ul>{worktree.terminals.map((terminal) => <li className="tree-row" key={terminal.id}><strong>Terminal</strong><span className="mono">{terminal.id}</span></li>)}</ul></li>)}</ul></li>)}</ul></li>)}</ul>}
++    <p className="evidence-line">{read.data.evidence.source} · {read.data.evidence.verification} · {read.data.evidence.observedAt}</p>
++  </section></>;
++}
+--- /dev/null
++++ b/apps/web/src/routes/operations-settings.tsx
+@@ -0,0 +1,13 @@
++import type { OperationsApi } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { useRead } from "../hooks.js";
++
++export function OperationsSettings({ api }: Readonly<{ api: OperationsApi }>) {
++  const read = useRead((signal) => api.status(signal), [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  const status = read.data;
++  return <><div className="view-head"><h1>운영 설정</h1><p>안전하게 변경할 수 없는 값은 실제 지원 상태와 이유를 표시합니다.</p></div><div className="grid-2">
++    <section className="card card-body"><h2>HQ 용량</h2><dl className="kv"><dt>limit</dt><dd>{status.hq.capacity.limit}</dd><dt>source</dt><dd>{status.hq.capacity.source}</dd><dt>active</dt><dd>{status.hq.capacity.active}</dd><dt>queued</dt><dd>{status.hq.capacity.queued}</dd></dl><button disabled>용량 변경 지원 안 함</button><p className="muted">{status.hq.capacity.reason}</p></section>
++    <section className="card card-body"><h2>계측</h2><dl className="kv"><dt>tokens</dt><dd>수집되지 않음</dd><dt>cost</dt><dd>수집되지 않음</dd><dt>currency</dt><dd>수집되지 않음</dd><dt>ETA / percent</dt><dd>수집되지 않음</dd></dl></section>
++  </div></>;
++}
+--- /dev/null
++++ b/apps/web/src/routes/operations-evidence.tsx
+@@ -0,0 +1,16 @@
++import type { OperationsApi } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { useRead } from "../hooks.js";
++
++export function OperationsEvidence({ api }: Readonly<{ api: OperationsApi }>) {
++  const read = useRead(async (signal) => {
++    const [workers, hqQuestions, orcaQuestions] = await Promise.all([api.workers(undefined, signal), api.hqQuestions("0", signal), api.orcaQuestions(signal)]);
++    return { workers, hqQuestions, orcaQuestions };
++  }, [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  return <><div className="view-head"><h1>리서치 / 기획 증거</h1><p>운영 화면이 사용한 실제 공개 출처와 검증 수준을 확인합니다.</p></div><div className="grid-2">
++    <section className="card card-body"><h2><SourceBadge source="hq" /> HQ store</h2>{read.data.hqQuestions.questions.length === 0 ? <p>현재 질문 증거 없음</p> : read.data.hqQuestions.questions.map((item) => <dl className="kv" key={item.requestId}><dt>request</dt><dd>{item.requestId}</dd><dt>observed</dt><dd>{item.evidence.observedAt}</dd><dt>verification</dt><dd>{item.evidence.verification}</dd></dl>)}</section>
++    <section className="card card-body"><h2><SourceBadge source="orca" /> Orca CLI</h2><dl className="kv"><dt>workers</dt><dd>{read.data.workers.workers.length}</dd><dt>questions</dt><dd>{read.data.orcaQuestions.count}</dd><dt>pending state</dt><dd>{read.data.orcaQuestions.support.pendingState.supported ? "supported" : `지원 안 함 · ${read.data.orcaQuestions.support.pendingState.reason}`}</dd><dt>observed</dt><dd>{read.data.workers.evidence.observedAt}</dd></dl></section>
++  </div></>;
++}
+--- /dev/null
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task3.md
+@@ -0,0 +1,50 @@
++# Task 3 — Real read-first React operations console
++
++Date: 2026-09-15 KST
++Status: implemented and focused verification passed; Task 4 controls/E2E pending
++
++## Delivered routes
++
++- `/overview`: real status, HQ capacity, source-separated context/Dispatch summaries, connection state, questions, uncertainty attention list, and unavailable metrics.
++- `/work`: HQ contexts and Orca Runs/Dispatches remain separate, with source filters, deduplication, and guarded cursor pagination.
++- `/work/hq/:contextId`: HQ context/evidence plus a bounded 2-second incremental event stream; compaction is explicit and only valid receipt links navigate to Orca.
++- `/work/orca/:dispatchId`: native Dispatch/worker projection, liveness, observation, PTY, incarnation, ownership, and release state; terminal/transcript logs are separate tabs and load only on demand.
++- `/resources`: bounded project → setup → worktree → terminal hierarchy with covered/not-covered and truncation evidence.
++- `/settings`: real capacity source/counts, disabled unsupported capacity update and reason, and tokens/cost/currency/ETA/percent as “수집되지 않음.”
++- `/evidence`: source/verification/timestamp evidence from HQ store and public Orca CLI reads, including explicit unsupported authoritative pending-question state.
++- `/compose` and `/questions`: compose remains an honest Task 4 placeholder; questions are real read-only HQ/Orca lists with reply controls explicitly disabled until Task 4.
++
++## API and session contract
++
++- `createOperationsApi` exposes typed status, contexts/events/questions, Runs/workers/detail/output, resources, and mutation receipt methods against the final Task 2 routes.
++- Dependency-free runtime schema parsers validate required fields, discriminants, bounds, native snake_case Run fields, nested worker/PTY/resource identities, source tags, evidence, cursors, and terminal-vs-transcript output before values reach React. They intentionally preserve verified extra native fields without `any` or response casts.
++- A `#claim=` fragment is removed before validation/network settlement, then a valid 43-character claim is redeemed exactly once. CSRF is retained only in `sessionStorage`; refresh requires that existing token, rotates it, and only a read may retry once.
++- No unauthenticated bootstrap is invented. Missing/expired auth gives actionable `hq console` guidance; mutations neither auto-retry nor mint IDs, and accepted receipts remain accepted rather than completed.
++- Same-origin credentials are used throughout. AbortSignals cancel reads on route unmount/hidden page; completion-scheduled 5-second overview/list polling and 2-second HQ event polling prevent overlap.
++- HQ event cursors advance monotonically and deduplicate by sequence. Opaque Orca cursors are encoded unchanged; repeated terminal/transcript pages are suppressed and logs are bounded to 500 entries.
++
++## Visual and interaction result
++
++- Ported the approved warm-gray surfaces, navy sidebar, blue HQ/emerald Orca badges, attention list, compact cards/tables, responsive typography, mobile navigation, keyboard focus, and reduced-motion handling.
++- Removed the simulation strip, scenario selector, fixture-driven production state, legacy command/approval routes, and synthetic responses.
++- Loading, empty, disconnected/auth, malformed/error, and unverifiable/unknown states use distinct copy and styling.
++
++## Focused verification
++
++- `pnpm --filter @orca-hq/web test`: **19 tests passed / 2 files**.
++- Coverage includes claim/refresh/fragment removal, coalesced concurrent recovery, malformed payload rejection, opaque cursors, abort propagation, accepted/unknown mutation non-replay, source filters, detail tabs/on-demand logs, receipt links, compaction, pagination, stale navigation abort, resources, unavailable metrics, disabled capacity, auth guidance, and Task 4 placeholders.
++- `pnpm --filter @orca-hq/web typecheck`: passed.
++- `pnpm --filter @orca-hq/web build`: passed; Vite transformed 39 modules and produced local HTML/CSS/JS assets.
++- Built output check found no remote `src`, `href`, or CSS `url()` asset references.
++
++## Changed paths
++
++- Updated: `apps/web/package.json`, `src/api.ts`, `src/api.test.ts`, `src/app.tsx`, `src/app.test.tsx`, `src/styles.css`.
++- Added: `src/hooks.ts`, `src/components/{async-state,source-badge}.tsx`, and six `src/routes/operations-*.tsx` modules.
++- Deleted: legacy `src/routes/{command-list,command-detail}.tsx` and `src/components/approval-card.tsx`.
++- Reports: this report, `2026-09-15-hq-orca-operations-task3.diff`, and the progress entry.
++
++## Known limits / handoff
++
++- Task 4 owns mutation forms, question replies, lifecycle controls, launcher/static serving, and full browser E2E. This task performs no simulated or real mutation.
++- No backend/installer/protected-plan edit, install, commit, push, restart, or production operation was performed.
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,11 +1,13 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 pending
++- Status: Task 1 and Task 2 final Spec/Quality reviews PASS; Task 3 implemented and focused verification passed; Task 4 pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
+ 
++- Task 3 real read-first React console implemented across overview, work/source-filtered details, questions, resources, settings, and evidence, with compose/reply controls explicitly deferred to Task 4. Typed dependency-free runtime response schemas follow final Task 2 native shapes; claim/coalesced CSRF recovery, cancellation/non-overlapping polls, cursor/compaction handling, separate HQ events/Orca logs, unavailable metrics, and unsupported capacity mutation are explicit. Focused web verification passed **19 tests / 2 files**, typecheck, build, and local-only asset checks; see `2026-09-15-hq-orca-operations-task3.md` and `task3.diff`.
++
+ - Task 2 fix round 1 independent re-review: **R1/R2/R3 ADDRESSED; Spec PASS / Quality PASS** in `2026-09-15-hq-orca-operations-task2-fix1-review.md`. The review reused 74 targeted/affected passing tests and the recorded gateway/test-support typechecks; no new breakage was found within the fix, and Task 3 may consume the finalized route matrix.
+ 
+ - Task 2 fix round 1 resolves review R1/R2/R3: delayed-body expiry rejection, monotonic exhausted/compacted question cursors, and explicit legacy-fake rejection for added operations. Seven new cases failed before fixes; 74 targeted/affected tests passed afterward, gateway/test-support and strict changed-test typechecks passed, and four HTTP tests passed again after a test-helper annotation fix. See the updated Task 2 report and `2026-09-15-hq-orca-operations-task2-fix1.diff`; independent re-review passed and Task 3 remains pending.
+@@ -38,4 +40,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 and Task 2 final reviews passed both Spec and Quality. Task 2's R1/R2/R3 are addressed with 74 targeted/affected passing tests and gateway/test-support typechecks, and Task 3 may consume the route matrix in `2026-09-15-hq-orca-operations-task2.md`. Task 3 remains pending; Task 5 still requires a fresh reviewer.
++Task 1 and Task 2 final reviews passed both Spec and Quality. Task 3 now consumes the finalized Task 2 route matrix with 19 focused web tests plus typecheck/build passing. Task 4 remains responsible for controls, launcher/static serving, and full browser E2E; Task 5 still requires a fresh reviewer.

@@ -18,6 +18,7 @@ import {
   assertSuccessfulReceipt,
   OrcaInvalidReceiptError,
   parseOrcaOperationReceipt,
+  parseOrcaOperationsReceipt,
   parseOrcaProjects,
   parseOrcaReceipt,
   parseOrcaSkillResponse,
@@ -123,10 +124,19 @@ export class OrcaClient {
       raw = await runOrca(operationArguments(operation), this.#options);
       const receipt = parseOrcaReceipt(raw);
       assertSuccessfulReceipt(receipt);
-      const parsed = parseOrcaOperationReceipt(operation.kind, receipt);
-      if (operation.kind === "dispatch_worker") {
-        const result = parsed.result as { taskId?: unknown };
-        if (result.taskId !== operation.taskId) throw new OrcaInvalidReceiptError();
+      let parsed: OrcaReceipt;
+      if (legacyReceiptOperation(operation.kind)) {
+        parsed = parseOrcaOperationReceipt(operation.kind, receipt);
+        if (operation.kind === "dispatch_worker") {
+          const result = parsed.result as { taskId?: unknown };
+          if (result.taskId !== operation.taskId) throw new OrcaInvalidReceiptError();
+        }
+      } else {
+        parsed = parseOrcaOperationsReceipt(operation.kind, receipt);
+        assertOperationsReceiptIdentity(
+          operation as Exclude<import("./capabilities.js").ValidatedOrcaOperation, { kind: import("./receipts.js").OrcaReceiptOperationKind }>,
+          parsed as import("./receipts.js").OrcaOperationsReceipt
+        );
       }
       return parsed;
     } catch (error) {
@@ -201,6 +211,55 @@ export class OrcaClient {
   }
 }
 
+function legacyReceiptOperation(kind: string): kind is import("./receipts.js").OrcaReceiptOperationKind {
+  return ["list_projects", "create_run", "create_task", "dispatch_worker", "show_worker", "read_worker", "stop_worker", "release_worker"].includes(kind);
+}
+
+function assertOperationsReceiptIdentity(
+  operation: Exclude<import("./capabilities.js").ValidatedOrcaOperation, { kind: import("./receipts.js").OrcaReceiptOperationKind }>,
+  receipt: import("./receipts.js").OrcaOperationsReceipt
+): void {
+  const result = receipt.result as Record<string, unknown>;
+  if (operation.kind === "operations_dispatch" && result.taskId !== operation.taskId) {
+    throw new OrcaInvalidReceiptError();
+  }
+  switch (operation.kind) {
+    case "operations_show_worker": {
+      const dispatch = result.dispatch as { id: string };
+      const worker = result.worker as { dispatchId: string };
+      const projection = result.projection as { dispatchId: string };
+      if ([dispatch.id, worker.dispatchId, projection.dispatchId].some(id => id !== operation.dispatchId)) throw new OrcaInvalidReceiptError();
+      break;
+    }
+    case "operations_reply": {
+      const message = result.message as { id: string; thread_id: string };
+      const question = result.question as { message_id: string; answer_message_id: string } | null | undefined;
+      if (message.thread_id !== operation.messageId
+        || (question != null && (question.message_id !== operation.messageId || question.answer_message_id !== message.id))) {
+        throw new OrcaInvalidReceiptError();
+      }
+      break;
+    }
+    case "operations_send":
+      if ((result.message as { to_handle: string }).to_handle !== `dispatch:${operation.dispatchId}`) {
+        throw new OrcaInvalidReceiptError();
+      }
+      break;
+    case "operations_stop":
+    case "operations_retain":
+    case "operations_release":
+      if (result.dispatchId !== operation.dispatchId) throw new OrcaInvalidReceiptError();
+      break;
+  }
+  const mutation = result.mutation;
+  if ("retryRequestId" in operation && mutation !== undefined) {
+    if (typeof mutation !== "object" || mutation === null
+      || (mutation as { requestId?: unknown }).requestId !== operation.retryRequestId) {
+      throw new OrcaInvalidReceiptError();
+    }
+  }
+}
+
 export {
   MINIMUM_ORCA_VERSION,
   REQUIRED_ORCA_CAPABILITIES,
@@ -212,14 +271,23 @@ export {
   orcaConnectionArguments,
   OrcaProcessError,
   OrcaTimeoutError,
+  OrcaOutputLimitError,
   type OrcaConnectionTarget,
 } from "./process.js";
 export {
   OrcaCommandError,
   OrcaInvalidReceiptError,
   OrcaReceiptSchema,
+  OrcaOperationsReceiptSchema,
   OrcaStaleHandleError,
   parseOrcaOperationReceipt,
+  parseOrcaOperationsReceipt,
   type OrcaProject,
+  type OrcaOperationsReceipt,
+  type OrcaOperationsReceiptKind,
   type OrcaReceipt
 } from "./receipts.js";
+
+export { parseOrcaOperation, operationArguments } from "./capabilities.js";
+export { runOrca, type RunOrcaOptions } from "./process.js";
+export { parseOrcaReceipt, assertSuccessfulReceipt } from "./receipts.js";

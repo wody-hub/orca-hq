@@ -16,9 +16,13 @@ hq chat --session <세션-ID>
 hq chat --progress-window=off
 # 특정 업무의 진행 상황 다시 보기
 hq watch --context <맥락-ID>
+# 로컬 운영 콘솔 열기 (owner-only claim을 브라우저 세션으로 교환)
+hq console
 ```
 
 지시를 접수하면 다음 입력을 바로 받을 수 있습니다. `hq chat`이 여는 것은 **관찰용 뷰어 창**(`--progress-window=auto`를 명시할 때만)일 뿐이며, 실제 작업은 HQ 서버가 소유한 별도의 **Orca 네이티브 터미널**에서 codex/claude worker로 실행됩니다. `--progress-window`를 지정하지 않거나 `off`로 주면 뷰어 창은 열리지 않지만, 네이티브 실행 자체는 이 값과 무관하게 항상 그대로 진행됩니다. 개발·분석·검토를 요청해 업무 맥락이 배정되면 `hq watch --context <맥락-ID>`로 확인할 수 있는 안내가 출력됩니다.
+
+`hq console`은 owner-mode `control.sock`에서 60초짜리 단일 사용 claim을 받은 뒤 macOS 브라우저를 엽니다. claim fragment는 즉시 제거되고 30분 로컬 세션으로 교환됩니다. Console의 `accepted` 표시는 접수일 뿐 완료가 아니므로, 이후 HQ 이벤트나 Orca worker 관찰에서 완료를 확인하세요. `unknown` 또는 `unverifiable` 결과는 inspect-only이며 같은 작업을 새 요청 ID로 다시 보내지 마세요. 저장소에서 개발 중이면 `pnpm hq console`로 같은 명령을 실행할 수 있습니다.
 
 전체 작업 목록 조회, 인사, 도움말은 새 업무를 만들지 않고 HQ 입력창에 답합니다. 따라서 “지금 돌아가고 있는 작업 목록 보여줘”에는 별도 네이티브 worker가 실행되지 않습니다.
 

@@ -13,3 +13,5 @@ export * from "./pilot-config.js";
 export * from "./ports.js";
 export * from "./proposal.js";
 export * from "./progress.js";
+export * from "./operations.js";
+export * from "./public-output.js";

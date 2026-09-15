@@ -1,0 +1,1306 @@
+# Task 4 scoped overlay
+
+Generated from explicit Task 4 pre-edit baselines under `/tmp/orca-task4.jF0Rnh` and `/dev/null` for new files. `operations-list.tsx` uses the exact Task 3 final content reconstructed from the recorded Task 3 fix overlays because its pre-edit copy was omitted at Task 4 start. No whole-worktree diff, protected document, build output, dependency tree, or unrelated workspace change is included.
+
+```diff
+--- a/README.md
++++ b/README.md
+@@ -16,10 +16,14 @@
+ hq chat --progress-window=off
+ # 특정 업무의 진행 상황 다시 보기
+ hq watch --context <맥락-ID>
++# 로컬 운영 콘솔 열기 (owner-only claim을 브라우저 세션으로 교환)
++hq console
+ ```
+ 
+ 지시를 접수하면 다음 입력을 바로 받을 수 있습니다. `hq chat`이 여는 것은 **관찰용 뷰어 창**(`--progress-window=auto`를 명시할 때만)일 뿐이며, 실제 작업은 HQ 서버가 소유한 별도의 **Orca 네이티브 터미널**에서 codex/claude worker로 실행됩니다. `--progress-window`를 지정하지 않거나 `off`로 주면 뷰어 창은 열리지 않지만, 네이티브 실행 자체는 이 값과 무관하게 항상 그대로 진행됩니다. 개발·분석·검토를 요청해 업무 맥락이 배정되면 `hq watch --context <맥락-ID>`로 확인할 수 있는 안내가 출력됩니다.
+ 
++`hq console`은 owner-mode `control.sock`에서 60초짜리 단일 사용 claim을 받은 뒤 macOS 브라우저를 엽니다. claim fragment는 즉시 제거되고 30분 로컬 세션으로 교환됩니다. Console의 `accepted` 표시는 접수일 뿐 완료가 아니므로, 이후 HQ 이벤트나 Orca worker 관찰에서 완료를 확인하세요. `unknown` 또는 `unverifiable` 결과는 inspect-only이며 같은 작업을 새 요청 ID로 다시 보내지 마세요. 저장소에서 개발 중이면 `pnpm hq console`로 같은 명령을 실행할 수 있습니다.
++
+ 전체 작업 목록 조회, 인사, 도움말은 새 업무를 만들지 않고 HQ 입력창에 답합니다. 따라서 “지금 돌아가고 있는 작업 목록 보여줘”에는 별도 네이티브 worker가 실행되지 않습니다.
+ 
+ **동시 실행 worker 수**는 설치된 설정 파일의 `nativeExecution.maxActiveWorkers`(생략 시 기본값 **10**, 운영자 override로 `HQ_MAX_ACTIVE_WORKERS` 환경변수 사용 가능, `"unlimited"` 허용)로 정해집니다. 이 한도를 넘는 요청은 순서대로 대기합니다. 같은 프로젝트 checkout을 수정하는 등 자원 충돌이 있으면 슬롯이 남아 있어도 대기할 수 있습니다.
+
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,7 @@
+   "engines": { "node": ">=22.20 <23" },
+   "scripts": {
+     "build": "pnpm -r build",
+-    "prepare": "pnpm --filter @orca-hq/core build && pnpm --filter @orca-hq/installer build && node packages/installer/bin/install-global.js",
++    "prepare": "pnpm --filter @orca-hq/core build && pnpm --filter @orca-hq/orca-adapter build && pnpm --filter @orca-hq/web build && pnpm --filter @orca-hq/gateway build && pnpm --filter @orca-hq/installer build && node packages/installer/bin/install-global.js",
+     "typecheck": "tsc -p tsconfig.json --noEmit && pnpm typecheck:tests",
+     "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit && pnpm -r --if-present run typecheck:test",
+     "test": "vitest run",
+
+--- a/apps/web/src/api.ts
++++ b/apps/web/src/api.ts
+@@ -49,7 +49,7 @@
+ function bool(value: unknown): boolean { return typeof value === "boolean" ? value : malformed(); }
+ function integer(value: unknown): number { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : malformed(); }
+ function positiveInteger(value: unknown): number { const result = integer(value); return result > 0 ? result : malformed(); }
+-function array<T>(value: unknown, parser: (item: unknown) => T, max = 500): T[] { if (!Array.isArray(value) || value.length > max) malformed(); return value.map(parser); }
++function array<T>(value: unknown, parser: (item: unknown) => T, max = 500): T[] { if (!Array.isArray(value) || value.length > max) malformed(); return value.map((item) => parser(item)); }
+ function literal<T extends string | boolean>(value: unknown, allowed: readonly T[]): T { return allowed.includes(value as T) ? value as T : malformed(); }
+ function iso(value: unknown): string { const result = text(value); return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(result) && !Number.isNaN(Date.parse(result)) ? result : malformed(); }
+ function strings(value: unknown, max = 500, item = text): string[] { return array(value, item, max); }
+@@ -86,8 +86,23 @@
+   const send = async <T>(path: string, schema: Schema<T>, init: RequestInit = {}): Promise<T> => { try { const response = await fetcher(path, { credentials: "same-origin", ...init }); if (!response.ok) throw await parseError(response); return schema.parse(await response.json()); } catch (error) { if (error instanceof OperationsApiError || (error instanceof DOMException && error.name === "AbortError")) throw error; throw new OperationsApiError(undefined, "network_error"); } };
+   const refresh = () => { if (!refreshPromise) refreshPromise = (async () => { if (!csrf) throw new OperationsApiError(401, "session_required"); const result = await send("/auth/local/refresh", authSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf }, body: "{}" }); csrf = result.csrf; storage.setItem(storageKey, csrf); })().finally(() => { refreshPromise = undefined; }); return refreshPromise; };
+   const read = async <T>(path: string, schema: Schema<T>, signal?: AbortSignal, recover = true): Promise<T> => { try { return await send(path, schema, signal ? { signal } : {}); } catch (error) { if (recover && error instanceof OperationsApiError && error.status === 401 && csrf) { try { await refresh(); } catch (refreshError) { storage.removeItem(storageKey); csrf = undefined; throw refreshError; } return read(path, schema, signal, false); } throw error; } };
++  const mutate = async (path: string, body: object, requestId: string): Promise<OperationsMutationReceipt> => {
++    try {
++      const response = await fetcher(path, { credentials: "same-origin", method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) });
++      if (!response.ok && response.status !== 409 && response.status !== 502) throw await parseError(response);
++      const value: unknown = await response.json();
++      if (!response.ok) {
++        try { return mutationReceiptSchema.parse(value); }
++        catch { const error = record(value).error; if (typeof error === "string") throw new OperationsApiError(response.status, error); throw new OperationsApiError(502, "malformed_response"); }
++      }
++      return mutationReceiptSchema.parse(value);
++    } catch (error) {
++      if (error instanceof OperationsApiError) throw error;
++      throw new OperationsApiError(undefined, "network_error");
++    }
++  };
+   return {
+     async bootstrap() { const hash = location.hash; if (!hash.startsWith("#claim=")) return; history.replaceState(history.state, "", `${location.pathname}${location.search}`); const claim = hash.slice(7); if (!/^[A-Za-z0-9_-]{43}$/.test(claim)) throw new OperationsApiError(400, "claim_invalid"); const result = await send("/auth/local/claim", authSchema, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim }) }); csrf = result.csrf; storage.setItem(storageKey, csrf); },
+-    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), tasks: (runId, signal) => read(`/api/operations/orca/tasks?runId=${encodeURIComponent(runId)}`, orcaTaskPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate: (path, body, requestId) => send(path, mutationReceiptSchema, { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf ?? "", "idempotency-key": requestId }, body: JSON.stringify(body) }),
++    status: (signal) => read("/api/operations/status", operationsStatusSchema, signal), contexts: (next, signal) => read(`/api/operations/hq/contexts${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, hqContextPageSchema, signal), context: (contextId, signal) => read(`/api/operations/hq/contexts/${encodeURIComponent(contextId)}`, hqContextDetailSchema, signal), events: (contextId, after = "0", signal) => read(`/api/operations/hq/events?contextId=${encodeURIComponent(contextId)}&after=${encodeURIComponent(after)}&limit=100`, hqEventPageSchema, signal), hqQuestions: (after = "0", signal) => read(`/api/operations/hq/questions?after=${encodeURIComponent(after)}&limit=100`, hqQuestionPageSchema, signal), runs: (next, signal) => read(`/api/operations/orca/runs${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaRunPageSchema, signal), tasks: (runId, signal) => read(`/api/operations/orca/tasks?runId=${encodeURIComponent(runId)}`, orcaTaskPageSchema, signal), workers: (next, signal) => read(`/api/operations/orca/workers${next ? `?cursor=${encodeURIComponent(next)}` : ""}`, orcaWorkerPageSchema, signal), worker: (dispatchId, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}`, orcaWorkerDetailSchema, signal), output: (dispatchId, source, next, signal) => read(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/output?source=${source}&limit=100${next ? `&cursor=${encodeURIComponent(next)}` : ""}`, orcaOutputPageSchema, signal), orcaQuestions: (signal) => read("/api/operations/orca/questions", orcaQuestionPageSchema, signal), resources: (signal) => read("/api/operations/orca/resources", orcaResourcesSchema, signal), mutate,
+   };
+ }
+
+--- a/apps/web/src/api.test.ts
++++ b/apps/web/src/api.test.ts
+@@ -113,6 +113,13 @@
+     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+   });
+ 
++  it("parses non-empty terminal lines and warnings without treating array indexes as text limits", async () => {
++    // Break caught: Array.map can pass its index into a parser's optional max-length parameter and reject every non-empty first row.
++    const body = { source: "terminal", cursor: "next", archived: false, warnings: ["truncated"], lines: ["first output"] };
++    const api = createOperationsApi(vi.fn<typeof fetch>().mockResolvedValue(response(200, body)), store());
++    await expect(api.output("dispatch-1", "terminal")).resolves.toEqual(body);
++  });
++
+   it("does not retry mutations and preserves accepted as queued evidence", async () => {
+     const receipt = { requestId: "request-1", action: "dispatch", targetId: "task-1", state: "accepted", observedAt };
+     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(202, receipt));
+@@ -126,4 +133,12 @@
+     await expect(createOperationsApi(fetcher, store("csrf")).mutate("/api/operations/orca/dispatches", {}, "request-2")).rejects.toMatchObject({ status: 502, code: "mutation_unknown" });
+     expect(fetcher).toHaveBeenCalledOnce();
+   });
++
++  it.each([[409, "rejected"], [502, "unknown"]] as const)("preserves a %i mutation receipt as %s instead of discarding its journal evidence", async (statusCode, state) => {
++    // Break caught: non-2xx journal receipts can be mistaken for generic transport errors and lose their stable request identity.
++    const receipt = { requestId: "request-3", action: "stop", targetId: "dispatch-1", state, observedAt, detail: "fresh_gate" };
++    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(statusCode, receipt));
++    await expect(createOperationsApi(fetcher, store("csrf")).mutate("/api/operations/orca/workers/dispatch-1/stop", { runId: "run-1", expectedIncarnation: "inc-1" }, "request-3")).resolves.toEqual(receipt);
++    expect(fetcher).toHaveBeenCalledOnce();
++  });
+ });
+
+--- a/apps/web/src/app.tsx
++++ b/apps/web/src/app.tsx
+@@ -1,12 +1,12 @@
+ import { useEffect, useState } from "react";
+ import { createOperationsApi, OperationsApiError, type OperationsApi } from "./api.js";
+ import { AsyncState } from "./components/async-state.js";
+-import { SourceBadge } from "./components/source-badge.js";
+-import { useRead } from "./hooks.js";
++import { OperationsCompose } from "./routes/operations-compose.js";
+ import { HqDetail, OrcaDetail } from "./routes/operations-detail.js";
+ import { OperationsEvidence } from "./routes/operations-evidence.js";
+ import { OperationsList } from "./routes/operations-list.js";
+ import { OperationsOverview } from "./routes/operations-overview.js";
++import { OperationsQuestions } from "./routes/operations-questions.js";
+ import { OperationsResources } from "./routes/operations-resources.js";
+ import { OperationsSettings } from "./routes/operations-settings.js";
+ 
+@@ -15,18 +15,6 @@
+   ["/resources", "프로젝트/터미널"], ["/settings", "운영 설정"], ["/evidence", "리서치/기획"],
+ ] as const;
+ 
+-function Questions({ api }: Readonly<{ api: OperationsApi }>) {
+-  const read = useRead(async (signal) => {
+-    const [hq, orca] = await Promise.all([api.hqQuestions("0", signal), api.orcaQuestions(signal)]);
+-    return { hq, orca };
+-  }, [api]);
+-  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
+-  return <><div className="view-head"><h1>질문함</h1><p>질문은 실제 읽기 전용입니다. 답변 폼은 Task 4에서 안전한 mutation으로 연결합니다.</p></div><div className="grid-2">
+-    <section className="card card-body"><h2><SourceBadge source="hq" /> HQ 질문</h2>{read.data.hq.questions.length === 0 ? <p className="empty-copy">대기 질문 없음</p> : <ul className="question-list">{read.data.hq.questions.map((item) => <li key={`${item.requestId}:${item.occurredAt}`}><strong>{item.body}</strong><small>{item.requestId} · {item.state}</small><button disabled>Task 4에서 답변</button></li>)}</ul>}</section>
+-    <section className="card card-body"><h2><SourceBadge source="orca" /> Orca inbox</h2>{read.data.orca.messages.length === 0 ? <p className="empty-copy">관찰된 질문 없음</p> : <ul className="question-list">{read.data.orca.messages.map((item) => <li key={item.id}><strong>{item.subject || item.body}</strong><small>{item.run_id ?? "Run 미제공"}</small><button disabled>Task 4에서 답변</button></li>)}</ul>}<p className="muted">pending 여부는 공개 inbox에서 권위 있게 제공되지 않습니다.</p></section>
+-  </div></>;
+-}
+-
+ function Screen({ path, api, navigate }: Readonly<{ path: string; api: OperationsApi; navigate: (path: string) => void }>) {
+   const hq = path.match(/^\/work\/hq\/([^/]+)$/);
+   const orca = path.match(/^\/work\/orca\/([^/]+)$/);
+@@ -36,8 +24,8 @@
+   if (path === "/resources") return <OperationsResources api={api} />;
+   if (path === "/settings") return <OperationsSettings api={api} />;
+   if (path === "/evidence") return <OperationsEvidence api={api} />;
+-  if (path === "/questions") return <Questions api={api} />;
+-  if (path === "/compose") return <><div className="view-head"><h1>새 지시</h1><p>Task 4에서 idempotency와 결과 관찰을 포함한 실제 제출 폼을 연결합니다.</p></div><section className="card placeholder"><strong>읽기 전용 단계</strong><p>시뮬레이션 응답이나 임시 요청은 생성하지 않습니다.</p><button disabled>Task 4에서 지시 작성</button></section></>;
++  if (path === "/questions") return <OperationsQuestions api={api} />;
++  if (path === "/compose") return <OperationsCompose api={api} />;
+   return <OperationsOverview api={api} navigate={navigate} />;
+ }
+ 
+@@ -55,7 +43,7 @@
+   }, [api]);
+   const activeBase = path.startsWith("/work/") ? "/work" : path;
+   return <div className="app-shell"><aside className="sidebar"><div className="brand"><strong>HQ / Orca Operations</strong><small>실제 읽기 콘솔</small></div><nav aria-label="주요 화면">{nav.map(([href, label]) => <a className={activeBase === href ? "active" : ""} href={href} key={href} onClick={(event) => { event.preventDefault(); navigate(href); }}><span className="nav-dot" />{label}</a>)}</nav><p className="nav-footer">단일 운영자용 로컬 콘솔<br />HQ와 Orca 출처를 분리합니다.</p></aside>
+-    <div className="content-shell"><header className="topbar"><span className={`connection ${session}`}><i />{session === "loading" ? "세션 확인 중" : session === "ready" ? "로컬 세션" : "인증 필요"}</span><span>same-origin · read-first</span></header><main className="main-content">
++    <div className="content-shell"><header className="topbar"><span className={`connection ${session}`}><i />{session === "loading" ? "세션 확인 중" : session === "ready" ? "로컬 세션" : "인증 필요"}</span><span>same-origin · reviewed controls</span></header><main className="main-content">
+       {session === "loading" ? <AsyncState state="loading" /> : session === "error" ? <section className="auth-error" role="alert"><h1>로컬 세션을 열 수 없습니다</h1><p>터미널에서 <code>hq console</code>을 실행해 새 단일 사용 링크로 접속하세요.</p><small>{sessionError}</small></section> : <Screen key={path} path={path} api={api} navigate={navigate} />}
+     </main></div>
+   </div>;
+
+--- a/apps/web/src/app.test.tsx
++++ b/apps/web/src/app.test.tsx
+@@ -49,6 +49,15 @@
+     expect(screen.getByText("dispatch-1")).toBeTruthy();
+   });
+ 
++  it("searches source-specific work rows without changing their identities", async () => {
++    // Break caught: visual search can merge or relabel HQ contexts and Orca Dispatch records.
++    window.history.replaceState({}, "", "/work"); const user = userEvent.setup();
++    render(<App api={apiFor()} />); await screen.findByText("정산 배치 확인");
++    await user.type(screen.getByLabelText("업무 검색"), "dispatch-1");
++    expect(screen.queryByText("정산 배치 확인")).toBeNull();
++    expect(screen.getByText("dispatch-1")).toBeTruthy();
++  });
++
+   it("keeps unverifiable Orca inbox observations out of actionable attention", async () => {
+     const orcaQuestions = vi.fn().mockResolvedValue({ source: "orca", messages: [{ id: "message-1", type: "question", subject: "historical question", body: "body" }], count: 1, support: { pendingState: { supported: false, reason: "inbox_has_no_authoritative_pending_question_state" } }, evidence });
+     render(<App api={apiFor({ orcaQuestions })} />);
+@@ -187,10 +196,76 @@
+     expect(within(alert).queryByText(/secret/)).toBeNull();
+   });
+ 
+-  it("keeps compose and question responses explicitly pending Task 4", async () => {
+-    window.history.replaceState({}, "", "/compose"); const user = userEvent.setup(); render(<App api={apiFor()} />);
+-    expect(await screen.findByText("시뮬레이션 응답이나 임시 요청은 생성하지 않습니다.")).toBeTruthy();
+-    await user.click(screen.getByRole("link", { name: "질문함" }));
+-    expect(await screen.findByText(/Task 4에서 안전한 mutation/)).toBeTruthy();
++  it("reviews a full HQ request, restores focus on Escape, and submits one stable request ID", async () => {
++    // Break caught: an unreviewed or regenerated browser request can bypass the idempotency contract.
++    window.history.replaceState({}, "", "/compose"); const user = userEvent.setup();
++    const mutate = vi.fn().mockResolvedValue({ requestId: "request-fixed", action: "hq_request", targetId: "request-fixed", state: "accepted", observedAt: at });
++    render(<App api={apiFor({ mutate })} />);
++    await user.type(await screen.findByLabelText("세션 ID"), "session-1");
++    await user.type(screen.getByLabelText("지시 내용"), "실제 요청을 검토하고 제출합니다.");
++    const review = screen.getByRole("button", { name: "제출 전 검토" });
++    await user.click(review);
++    const dialog = await screen.findByRole("dialog", { name: "HQ 지시 검토" });
++    expect(within(dialog).getByText("실제 요청을 검토하고 제출합니다.")).toBeTruthy();
++    await user.keyboard("{Escape}");
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(document.activeElement).toBe(review);
++    await user.click(review);
++    await user.click(await screen.findByRole("button", { name: "확인 후 제출" }));
++    expect(mutate).toHaveBeenCalledTimes(1);
++    const [path, body, requestId] = mutate.mock.calls[0]!;
++    expect(path).toBe("/api/operations/hq/requests");
++    expect(body).toEqual({ requestId, sessionId: "session-1", text: "실제 요청을 검토하고 제출합니다.", contextHint: { mode: "new" } });
++    expect(requestId).toMatch(/^request_[0-9a-f-]{36}$/);
++    expect(await screen.findByText(/접수되었지만 완료된 것은 아닙니다/)).toBeTruthy();
+   });
++
++  it("keeps unknown HQ mutation inspect-only without retrying or minting another ID", async () => {
++    // Break caught: an ambiguous effect can be repeated under a new ID and execute twice.
++    window.history.replaceState({}, "", "/compose"); const user = userEvent.setup();
++    const mutate = vi.fn().mockResolvedValue({ requestId: "unknown-id", action: "hq_request", targetId: "unknown-id", state: "unknown", observedAt: at, detail: "effect_unverifiable" });
++    render(<App api={apiFor({ mutate })} />);
++    await user.type(await screen.findByLabelText("세션 ID"), "session-1");
++    await user.type(screen.getByLabelText("지시 내용"), "모호한 결과를 다시 실행하지 않습니다.");
++    await user.click(screen.getByRole("button", { name: "제출 전 검토" }));
++    await user.click(await screen.findByRole("button", { name: "확인 후 제출" }));
++    expect(await screen.findByText(/결과를 확인할 수 없습니다/)).toBeTruthy();
++    expect(screen.queryByRole("button", { name: /다시|재시도|새 요청/ })).toBeNull();
++    expect(mutate).toHaveBeenCalledTimes(1);
++  });
++
++  it("routes HQ clarification answers and observed Orca replies through their exact APIs", async () => {
++    // Break caught: a native HQ answer can be sent to public reply without the trusted Run scope, or vice versa.
++    window.history.replaceState({}, "", "/questions"); const user = userEvent.setup();
++    const mutate = vi.fn().mockResolvedValue({ requestId: "accepted-id", action: "reply", targetId: "message-1", state: "accepted", observedAt: at });
++    const hqQuestions = vi.fn().mockResolvedValue({ source: "hq", questions: [{ source: "hq", kind: "router_clarification", requestId: "request-1", sessionId: "session-1", body: "어느 프로젝트인가요?", occurredAt: at, state: "awaiting_input", evidence: hqEvidence }], cursor: "3", compacted: false });
++    const orcaQuestions = vi.fn().mockResolvedValue({ source: "orca", messages: [{ id: "message-1", type: "question", subject: "배포할까요?", body: "확인이 필요합니다", run_id: "run-1" }], count: 1, support: { pendingState: { supported: false, reason: "inbox_has_no_authoritative_pending_question_state" } }, evidence });
++    render(<App api={apiFor({ hqQuestions, orcaQuestions, mutate })} />);
++    await user.type(await screen.findByLabelText("HQ 답변 request-1"), "project-1입니다.");
++    await user.click(screen.getByRole("button", { name: "HQ 답변 검토 request-1" }));
++    await user.click(await screen.findByRole("button", { name: "확인 후 제출" }));
++    const hqCall = mutate.mock.calls[0]!;
++    expect(hqCall[0]).toBe("/api/operations/hq/requests");
++    expect(hqCall[1]).toEqual({ requestId: hqCall[2], sessionId: "session-1", text: "project-1입니다." });
++    await user.type(screen.getByLabelText("Orca 답변 message-1"), "진행하세요.");
++    await user.click(screen.getByRole("button", { name: "Orca 답변 검토 message-1" }));
++    await user.click(await screen.findByRole("button", { name: "확인 후 제출" }));
++    expect(mutate.mock.calls[1]?.[0]).toBe("/api/operations/orca/replies");
++    expect(mutate.mock.calls[1]?.[1]).toEqual({ messageId: "message-1", runId: "run-1", body: "진행하세요." });
++  });
++
++  it("uses displayed Run and incarnation for reviewed follow-up and keeps unsafe lifecycle controls disabled", async () => {
++    // Break caught: a control can target stale browser IDs or become enabled on non-live observation.
++    window.history.replaceState({}, "", "/work/orca/dispatch-1"); const user = userEvent.setup();
++    const mutate = vi.fn().mockResolvedValue({ requestId: "accepted-id", action: "followup", targetId: "dispatch-1", state: "accepted", observedAt: at });
++    const base = await apiFor().worker("dispatch-1");
++    const safe = { ...base, observation: { ...base.observation, status: "live" }, terminalResource: { ...base.terminalResource, ownerDispatchId: "dispatch-1", terminalHandle: "term-1", endpointIncarnation: "pty-1:inc-1", releaseState: "not_requested" }, projection: { ...base.projection, resource: { state: "owned", ownerDispatchId: "dispatch-1", releaseState: "not_requested" } }, dispatch: { ...base.dispatch, processIncarnation: "pty-1:inc-1" }, terminal: base.terminal && { ...base.terminal, ptyId: "pty-1", executionHostId: "local" } };
++    render(<App api={apiFor({ worker: vi.fn().mockResolvedValue(safe), mutate })} />);
++    await user.type(await screen.findByLabelText("후속 지시"), "focused tests를 실행하세요.");
++    await user.click(screen.getByRole("button", { name: "후속 지시 검토" }));
++    await user.click(await screen.findByRole("button", { name: "확인 후 제출" }));
++    expect(mutate.mock.calls[0]?.[0]).toBe("/api/operations/orca/followups");
++    expect(mutate.mock.calls[0]?.[1]).toEqual({ dispatchId: "dispatch-1", runId: "run-1", expectedIncarnation: "inc-1", body: "focused tests를 실행하세요." });
++    expect(screen.getByRole("button", { name: "release" })).toHaveProperty("disabled", true);
++  });
+ });
+
+--- a/apps/web/src/routes/operations-list.tsx
++++ b/apps/web/src/routes/operations-list.tsx
+@@ -14,6 +14,7 @@
+ 
+ export function OperationsList({ api, navigate }: Readonly<{ api: OperationsApi; navigate: (path: string) => void }>) {
+   const [filter, setFilter] = useState<"all" | "hq" | "orca">("all");
++  const [query, setQuery] = useState("");
+   const [selectedRun, setSelectedRun] = useState<string>();
+   const [moreContexts, setMoreContexts] = useState<readonly HqContext[]>([]);
+   const [moreWorkers, setMoreWorkers] = useState<readonly Worker[]>([]);
+@@ -60,8 +61,10 @@
+   }, []);
+ 
+   if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
+-  const contexts = [...read.data.contexts.contexts, ...(contextFirstPage.current === contextSignature ? moreContexts : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.contextId === row.contextId) === index);
+-  const workers = [...read.data.workers.workers, ...(workerFirstPage.current === workerSignature ? moreWorkers : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.dispatchId === row.dispatchId) === index);
++  const needle = query.trim().toLocaleLowerCase();
++  const contexts = [...read.data.contexts.contexts, ...(contextFirstPage.current === contextSignature ? moreContexts : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.contextId === row.contextId) === index).filter((row) => !needle || [row.contextId, row.title, row.state].some((value) => value.toLocaleLowerCase().includes(needle)));
++  const workers = [...read.data.workers.workers, ...(workerFirstPage.current === workerSignature ? moreWorkers : [])].filter((row, index, all) => all.findIndex((candidate) => candidate.dispatchId === row.dispatchId) === index).filter((row) => !needle || [row.dispatchId, row.projection.taskId, row.projection.runId, row.projection.liveness.verdict].some((value) => value.toLocaleLowerCase().includes(needle)));
++  const runs = read.data.runs.runs.filter((row) => !needle || [row.id, row.objective].some((value) => value.toLocaleLowerCase().includes(needle)));
+   const loadMore = async () => {
+     if (pageState === "loading") return;
+     const contextNext = filter !== "orca" ? contextCursor : undefined;
+@@ -94,9 +97,9 @@
+   };
+ 
+   return <><div className="view-head"><h1>업무 목록</h1><p>HQ 문맥과 Orca Run/Task/Dispatch를 합성하지 않고 나란히 조회합니다.</p></div>
+-    <div className="filters" aria-label="출처 필터">{(["all", "hq", "orca"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value === "all" ? "전체" : value === "hq" ? "HQ" : "Orca"}</button>)}</div>
++    <div className="list-tools"><div className="filters" aria-label="출처 필터">{(["all", "hq", "orca"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{value === "all" ? "전체" : value === "hq" ? "HQ" : "Orca"}</button>)}</div><label>업무 검색<input type="search" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+     {(filter === "all" || filter === "hq") && <section className="card"><div className="card-head"><h2><SourceBadge source="hq" /> 문맥/요청</h2><span>{contexts.length}건</span></div><div className="table-wrap"><table><thead><tr><th>제목</th><th>상태</th><th>문맥 ID</th><th>갱신</th></tr></thead><tbody>{contexts.map((item) => <tr key={item.contextId} onClick={() => navigate(`/work/hq/${encodeURIComponent(item.contextId)}`)}><td>{item.title}</td><td>{item.state}</td><td className="mono">{item.contextId}</td><td>{new Date(item.updatedAt).toLocaleString()}</td></tr>)}</tbody></table>{contexts.length === 0 ? <p className="empty-copy">HQ 문맥이 없습니다.</p> : null}</div></section>}
+-    {(filter === "all" || filter === "orca") && <><section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Run</h2><span>{read.data.runs.runs.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Run</th><th>objective</th><th>coordinator</th></tr></thead><tbody>{read.data.runs.runs.map((run) => <tr key={run.id}><td><button className="mono" onClick={() => setSelectedRun(run.id)} aria-pressed={selectedRun === run.id}>{run.id}</button></td><td>{run.objective || "목표 없음"}</td><td className="mono">{run.coordinator_handle ?? "제공되지 않음"}</td></tr>)}</tbody></table>{read.data.runs.runs.length === 0 ? <p className="empty-copy">Orca Run이 없습니다.</p> : null}</div>{selectedRun ? <div className="card-body"><h3><span className="mono">{selectedRun}</span> Task</h3><RunTasks api={api} runId={selectedRun} /></div> : <p className="card-body muted">Run을 선택하면 native Task를 읽습니다.</p>}</section>
++    {(filter === "all" || filter === "orca") && <><section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Run</h2><span>{runs.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Run</th><th>objective</th><th>coordinator</th></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td><button className="mono" onClick={() => setSelectedRun(run.id)} aria-pressed={selectedRun === run.id}>{run.id}</button></td><td>{run.objective || "목표 없음"}</td><td className="mono">{run.coordinator_handle ?? "제공되지 않음"}</td></tr>)}</tbody></table>{runs.length === 0 ? <p className="empty-copy">Orca Run이 없습니다.</p> : null}</div>{selectedRun ? <div className="card-body"><h3><span className="mono">{selectedRun}</span> Task</h3><RunTasks api={api} runId={selectedRun} /></div> : <p className="card-body muted">Run을 선택하면 native Task를 읽습니다.</p>}</section>
+     <section className="card section-gap"><div className="card-head"><h2><SourceBadge source="orca" /> Dispatch</h2><span>{workers.length}건</span></div><div className="table-wrap"><table><thead><tr><th>Dispatch</th><th>liveness</th><th>Task</th><th>Run</th></tr></thead><tbody>{workers.map((item) => <tr key={item.dispatchId} onClick={() => navigate(`/work/orca/${encodeURIComponent(item.dispatchId)}`)}><td className="mono">{item.dispatchId}</td><td>{item.projection.liveness.verdict}</td><td>{item.projection.taskId}</td><td>{item.projection.runId}</td></tr>)}</tbody></table>{workers.length === 0 ? <p className="empty-copy">Orca Dispatch가 없습니다.</p> : null}</div></section></>}
+     {pageState !== "ready" && pageState !== "loading" ? <AsyncState state={pageState} onRetry={() => void loadMore()} /> : null}
+     {((filter !== "orca" && contextCursor) || (filter !== "hq" && workerCursor)) ? <button className="load-more" disabled={pageState === "loading"} onClick={() => void loadMore()}>{pageState === "loading" ? "읽는 중" : "다음 페이지 읽기"}</button> : null}
+
+--- a/apps/web/src/routes/operations-detail.tsx
++++ b/apps/web/src/routes/operations-detail.tsx
+@@ -3,6 +3,7 @@
+ import { AsyncState, type LoadState } from "../components/async-state.js";
+ import { SourceBadge } from "../components/source-badge.js";
+ import { stateForError, useRead } from "../hooks.js";
++import { ReviewedMutation } from "./operations-compose.js";
+ 
+ export function HqDetail({ api, contextId, navigate }: Readonly<{ api: OperationsApi; contextId: string; navigate: (path: string) => void }>) {
+   const detail = useRead((signal) => api.context(contextId, signal), [api, contextId]);
+@@ -45,6 +46,7 @@
+   const [tab, setTab] = useState<"state" | "terminal" | "transcript" | "evidence">("state");
+   const [log, setLog] = useState<OrcaOutputPage>();
+   const [logState, setLogState] = useState<LoadState>("loading");
++  const [followup, setFollowup] = useState("");
+   const lastRequestedCursor = useRef<string | undefined>(undefined);
+   const logRequest = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 });
+   useEffect(() => {
+@@ -75,9 +77,23 @@
+   const selectTab = (next: typeof tab) => { setTab(next); if ((next === "terminal" || next === "transcript") && log?.source !== next) { lastRequestedCursor.current = undefined; void loadLog(next); } };
+   if (!detail.data || detail.state !== "ready") return <AsyncState state={detail.state} onRetry={detail.reload} />;
+   const item = detail.data;
++  const uncertain = new Set(["unknown", "unverifiable", "release_pending", "release_unknown", "transferred"]);
++  const terminal = item.terminal;
++  const ptyId = terminal && typeof terminal.ptyId === "string" ? terminal.ptyId : undefined;
++  const resource = item.terminalResource;
++  const projectedResource = item.projection.resource;
++  const exact = !!terminal && item.observation.exactWorker && terminal.executionHostId === "local" && terminal.handle === item.worker.agentTerminalHandle && !!ptyId && item.dispatch.processIncarnation === `${ptyId}:${terminal.incarnationId}` && resource.endpointIncarnation === item.dispatch.processIncarnation && resource.ownerDispatchId === dispatchId && resource.terminalHandle === terminal.handle && ["owned", "retained"].includes(resource.ownershipState) && ["not_requested", "retained"].includes(resource.releaseState) && projectedResource?.ownerDispatchId === dispatchId && ["owned", "retained"].includes(projectedResource.state) && ["not_requested", "retained"].includes(projectedResource.releaseState) && ![item.worker.state, item.dispatch.status, item.projection.liveness.verdict, item.observation.status].some((value) => uncertain.has(value));
++  const live = exact && item.projection.liveness.verdict === "live" && item.observation.status === "live" && terminal.connected && terminal.writable && terminal.orphaned !== true;
++  const settled = exact && ["succeeded", "failed", "stopped"].includes(item.projection.outcome ?? "") && ["worker_done", "completed", "succeeded", "failed", "stopped"].includes(item.dispatch.status) && ["live", "exited"].includes(item.projection.liveness.verdict) && ["live", "exited"].includes(item.observation.status);
++  const scope = terminal ? { runId: item.dispatch.runId, expectedIncarnation: terminal.incarnationId } : undefined;
++  const lifecycle = (action: "stop" | "retain" | "release") => (requestId: string) => api.mutate(`/api/operations/orca/workers/${encodeURIComponent(dispatchId)}/${action}`, scope!, requestId);
+   return <><button className="back" onClick={() => navigate("/work")}>← 업무 목록</button><div className="view-head"><h1><SourceBadge source="orca" /> {item.dispatch.id}</h1><p>Dispatch, worker projection, PTY 상태를 각각 표시합니다.</p></div>
+     <div className="tabs" role="tablist">{(["state", "terminal", "transcript", "evidence"] as const).map((value) => <button role="tab" aria-selected={tab === value} key={value} onClick={() => selectTab(value)}>{value === "state" ? "상태" : value === "terminal" ? "터미널 로그" : value === "transcript" ? "대화 로그" : "증거"}</button>)}</div>
+-    {tab === "state" && <div className="grid-2"><section className="card card-body"><h2>Dispatch / projection</h2><dl className="kv"><dt>dispatch status</dt><dd>{item.dispatch.status}</dd><dt>worker stage</dt><dd>{item.worker.stage}</dd><dt>liveness</dt><dd>{item.projection.liveness.verdict}</dd><dt>observation</dt><dd>{item.observation.status}</dd><dt>outcome</dt><dd>{item.projection.outcome ?? "아직 없음"}</dd></dl></section><section className="card card-body"><h2>PTY / resource</h2><dl className="kv"><dt>connected</dt><dd>{item.terminal ? String(item.terminal.connected) : "터미널 없음"}</dd><dt>writable</dt><dd>{item.terminal ? String(item.terminal.writable) : "터미널 없음"}</dd><dt>incarnation</dt><dd className="mono">{item.terminal?.incarnationId ?? "아직 없음"}</dd><dt>ownership</dt><dd>{item.terminalResource.ownershipState}</dd><dt>release</dt><dd>{item.terminalResource.releaseState}</dd></dl></section></div>}
++    {tab === "state" && <><div className="grid-2"><section className="card card-body"><h2>Dispatch / projection</h2><dl className="kv"><dt>dispatch status</dt><dd>{item.dispatch.status}</dd><dt>worker stage</dt><dd>{item.worker.stage}</dd><dt>liveness</dt><dd>{item.projection.liveness.verdict}</dd><dt>observation</dt><dd>{item.observation.status}</dd><dt>outcome</dt><dd>{item.projection.outcome ?? "아직 없음"}</dd></dl></section><section className="card card-body"><h2>PTY / resource</h2><dl className="kv"><dt>connected</dt><dd>{item.terminal ? String(item.terminal.connected) : "터미널 없음"}</dd><dt>writable</dt><dd>{item.terminal ? String(item.terminal.writable) : "터미널 없음"}</dd><dt>incarnation</dt><dd className="mono">{item.terminal?.incarnationId ?? "아직 없음"}</dd><dt>ownership</dt><dd>{item.terminalResource.ownershipState}</dd><dt>release</dt><dd>{item.terminalResource.releaseState}</dd></dl></section></div>
++      <section className="card card-body control-panel"><h2>검토된 제어</h2><p className="muted">브라우저에 표시된 Run/Dispatch/incarnation만 전송하며 서버가 fresh owner/liveness/resource 증거를 다시 읽습니다.</p><label>후속 지시<textarea rows={5} maxLength={8000} value={followup} onChange={(event) => setFollowup(event.target.value)} /></label><ReviewedMutation api={api} label="후속 지시 검토" title="Orca 후속 지시 검토" disabled={!live || followup.trim().length === 0} review={<><p className="review-text">{followup}</p><dl className="kv compact"><dt>dispatch</dt><dd className="mono">{dispatchId}</dd><dt>run</dt><dd className="mono">{item.dispatch.runId}</dd><dt>incarnation</dt><dd className="mono">{terminal?.incarnationId ?? "없음"}</dd></dl></>} execute={(requestId) => api.mutate("/api/operations/orca/followups", { dispatchId, ...scope!, body: followup }, requestId)} onConflict={detail.reload} />
++        <div className="control-actions"><ReviewedMutation api={api} label="stop" title="worker stop 검토" disabled={!live} review={<p>live/live인 정확한 worker를 중지 요청합니다.</p>} execute={lifecycle("stop")} onConflict={detail.reload} /><ReviewedMutation api={api} label="retain" title="resource retain 검토" disabled={!(live || settled)} review={<p>현재 Dispatch 소유 terminal resource를 유지합니다.</p>} execute={lifecycle("retain")} onConflict={detail.reload} /><ReviewedMutation api={api} label="release" title="resource release 검토" disabled={!settled} review={<p>권위 있게 settled이고 releasable인 resource만 해제합니다.</p>} execute={lifecycle("release")} onConflict={detail.reload} /></div>
++        {!live && !settled ? <p className="mutation-result unknown">현재 증거는 inspect-only입니다. unknown/unverifiable/non-live 상태에서는 제어하지 않습니다.</p> : null}
++      </section></>}
+     {(tab === "terminal" || tab === "transcript") && <section className="card card-body log-card"><h2>{tab === "terminal" ? "Orca 터미널 출력" : "Orca transcript"}</h2>{logState !== "ready" ? <AsyncState state={logState} /> : log?.source === "terminal" ? <pre>{log.lines.join("\n") || "출력 없음"}</pre> : log?.source === "transcript" ? <ol>{log.messages.map((message) => <li key={message.id}><strong>{message.role}</strong><p>{message.text}</p></li>)}</ol> : null}{log?.cursor && log.cursor !== lastRequestedCursor.current ? <button onClick={() => void loadLog(tab, log.cursor)}>다음 로그 페이지</button> : null}</section>}
+     {tab === "evidence" && <section className="card card-body"><h2>Orca 관찰 증거</h2><dl className="kv"><dt>source</dt><dd>{item.evidence.source}</dd><dt>verification</dt><dd>{item.evidence.verification}</dd><dt>observed</dt><dd>{item.evidence.observedAt}</dd><dt>exact worker</dt><dd>{String(item.observation.exactWorker)}</dd></dl></section>}
+   </>;
+
+--- /dev/null
++++ b/apps/web/src/routes/operations-compose.tsx
+@@ -0,0 +1,79 @@
++import { useEffect, useId, useRef, useState, type ReactNode } from "react";
++import { OperationsApiError, type OperationsApi, type OperationsMutationReceipt } from "../api.js";
++
++function newRequestId(): string {
++  return `request_${crypto.randomUUID()}`;
++}
++
++export function ReviewedMutation({ label, title, review, disabled = false, execute, onConflict }: Readonly<{
++  api: OperationsApi;
++  label: string;
++  title: string;
++  review: ReactNode;
++  disabled?: boolean;
++  execute(requestId: string): Promise<OperationsMutationReceipt>;
++  onConflict?: () => void;
++}>) {
++  const headingId = useId();
++  const requestId = useRef(newRequestId());
++  const trigger = useRef<HTMLButtonElement>(null);
++  const confirm = useRef<HTMLButtonElement>(null);
++  const [open, setOpen] = useState(false);
++  const [submitting, setSubmitting] = useState(false);
++  const [receipt, setReceipt] = useState<OperationsMutationReceipt>();
++  const close = () => { setOpen(false); queueMicrotask(() => trigger.current?.focus()); };
++  useEffect(() => {
++    if (!open) return;
++    confirm.current?.focus();
++    const keydown = (event: KeyboardEvent) => {
++      if (event.key === "Escape" && !submitting) { event.preventDefault(); close(); }
++    };
++    document.addEventListener("keydown", keydown);
++    return () => document.removeEventListener("keydown", keydown);
++  }, [open, submitting]);
++  const submit = async () => {
++    if (submitting || receipt) return;
++    setSubmitting(true);
++    try {
++      const next = await execute(requestId.current);
++      setReceipt(next);
++      if (next.state === "rejected") onConflict?.();
++    } catch (error) {
++      const rejected = error instanceof OperationsApiError && error.status === 409;
++      setReceipt({ requestId: requestId.current, action: "unconfirmed", targetId: requestId.current, state: rejected ? "rejected" : "unknown", observedAt: new Date().toISOString(), detail: error instanceof OperationsApiError ? error.code : "network_error" });
++      if (rejected) onConflict?.();
++    } finally { setSubmitting(false); setOpen(false); }
++  };
++  return <div className="reviewed-mutation">
++    <button ref={trigger} type="button" disabled={disabled || !!receipt} onClick={() => setOpen(true)}>{label}</button>
++    {receipt?.state === "accepted" ? <p className="mutation-result accepted" role="status">접수되었지만 완료된 것은 아닙니다. 이후 권위 있는 상태 관찰로 완료를 확인하세요.</p> : null}
++    {receipt?.state === "rejected" ? <p className="mutation-result rejected" role="status">현재 증거와 충돌해 실행되지 않았습니다. 새로 읽은 상태를 확인하세요.</p> : null}
++    {receipt?.state === "unknown" ? <p className="mutation-result unknown" role="alert">결과를 확인할 수 없습니다. inspect-only로 상태를 확인하고 이 요청을 자동 재시도하지 마세요.</p> : null}
++    {receipt ? <small className="mono">request {receipt.requestId}</small> : null}
++    {open ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !submitting) close(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby={headingId}>
++      <h2 id={headingId}>{title}</h2><div className="review-copy">{review}</div><dl className="kv compact"><dt>request ID</dt><dd className="mono">{requestId.current}</dd></dl><p className="muted">접수 응답은 작업 완료를 뜻하지 않습니다.</p>
++      <div className="modal-actions"><button type="button" onClick={close} disabled={submitting}>취소</button><button ref={confirm} type="button" className="primary" onClick={() => void submit()} disabled={submitting}>{submitting ? "제출 중" : "확인 후 제출"}</button></div>
++    </section></div> : null}
++  </div>;
++}
++
++export function OperationsCompose({ api }: Readonly<{ api: OperationsApi }>) {
++  const [mode, setMode] = useState<"new" | "continue">("new");
++  const [sessionId, setSessionId] = useState("");
++  const [contextId, setContextId] = useState("");
++  const [text, setText] = useState("");
++  const [taskId, setTaskId] = useState("");
++  const [runId, setRunId] = useState("");
++  const [terminalHandle, setTerminalHandle] = useState("");
++  const [incarnation, setIncarnation] = useState("");
++  const hqValid = sessionId.trim().length > 0 && sessionId.length <= 100 && text.trim().length > 0 && text.length <= 8000 && (mode === "new" || contextId.trim().length > 0);
++  const dispatchValid = [taskId, runId, terminalHandle, incarnation].every((value) => value.trim().length > 0 && value.length <= 512);
++  return <><div className="view-head"><h1>새 지시</h1><p>입력 전체와 고정 요청 ID를 검토한 뒤 실제 HQ 또는 Orca 제어 경로로 제출합니다.</p></div><div className="grid-2 controls-grid">
++    <section className="card card-body"><h2>HQ 지시</h2><label>문맥 방식<select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}><option value="new">새 문맥</option><option value="continue">기존 문맥 계속</option></select></label><label>세션 ID<input value={sessionId} maxLength={100} onChange={(event) => setSessionId(event.target.value)} /></label>{mode === "continue" ? <label>문맥 ID<input value={contextId} maxLength={100} onChange={(event) => setContextId(event.target.value)} /></label> : null}<label>지시 내용<textarea value={text} maxLength={8000} rows={10} onChange={(event) => setText(event.target.value)} /></label><small>{text.length} / 8000</small>
++      <ReviewedMutation api={api} label="제출 전 검토" title="HQ 지시 검토" disabled={!hqValid} review={<><p className="review-text">{text}</p><dl className="kv compact"><dt>session</dt><dd className="mono">{sessionId}</dd><dt>mode</dt><dd>{mode}</dd>{mode === "continue" ? <><dt>context</dt><dd className="mono">{contextId}</dd></> : null}</dl></>} execute={(requestId) => api.mutate("/api/operations/hq/requests", { requestId, sessionId, text, contextHint: mode === "new" ? { mode: "new" } : { mode: "continue", contextId } }, requestId)} />
++    </section>
++    <section className="card card-body"><h2>Orca Task dispatch</h2><p className="muted">서버가 현재 Run 소유권, Task 생성 provenance, 대상 PTY incarnation을 다시 확인합니다.</p><label>Task ID<input value={taskId} maxLength={512} onChange={(event) => setTaskId(event.target.value)} /></label><label>Run ID<input value={runId} maxLength={512} onChange={(event) => setRunId(event.target.value)} /></label><label>Terminal handle<input value={terminalHandle} maxLength={512} onChange={(event) => setTerminalHandle(event.target.value)} /></label><label>Expected incarnation<input value={incarnation} maxLength={512} onChange={(event) => setIncarnation(event.target.value)} /></label>
++      <ReviewedMutation api={api} label="dispatch 검토" title="Orca dispatch 검토" disabled={!dispatchValid} review={<dl className="kv compact"><dt>task</dt><dd className="mono">{taskId}</dd><dt>run</dt><dd className="mono">{runId}</dd><dt>terminal</dt><dd className="mono">{terminalHandle}</dd><dt>incarnation</dt><dd className="mono">{incarnation}</dd></dl>} execute={(requestId) => api.mutate("/api/operations/orca/dispatches", { taskId, runId, terminalHandle, expectedIncarnation: incarnation }, requestId)} />
++    </section>
++  </div></>;
++}
+
+--- /dev/null
++++ b/apps/web/src/routes/operations-questions.tsx
+@@ -0,0 +1,27 @@
++import { useState } from "react";
++import type { HqQuestion, OperationsApi, OrcaQuestionPage } from "../api.js";
++import { AsyncState } from "../components/async-state.js";
++import { SourceBadge } from "../components/source-badge.js";
++import { useRead } from "../hooks.js";
++import { ReviewedMutation } from "./operations-compose.js";
++
++function Answer({ api, source, item, runId }: Readonly<{ api: OperationsApi; source: "HQ" | "Orca"; item: HqQuestion | OrcaQuestionPage["messages"][number]; runId?: string | undefined }>) {
++  const [body, setBody] = useState("");
++  const hq = source === "HQ" ? item as HqQuestion : undefined;
++  const orca = source === "Orca" ? item as OrcaQuestionPage["messages"][number] : undefined;
++  const id = hq?.requestId ?? orca!.id;
++  const isHqRouter = hq?.kind === "router_clarification";
++  const valid = body.trim().length > 0 && body.length <= 8000 && (isHqRouter || !!runId);
++  const messageId = hq?.messageId ?? orca?.id ?? "";
++  return <div className="answer-form"><label>{source} 답변 {id}<textarea rows={4} maxLength={8000} value={body} onChange={(event) => setBody(event.target.value)} /></label><ReviewedMutation api={api} label={`${source} 답변 검토 ${id}`} title={`${source} 답변 검토`} disabled={!valid} review={<p className="review-text">{body}</p>} execute={(requestId) => isHqRouter ? api.mutate("/api/operations/hq/requests", { requestId, sessionId: hq!.sessionId, text: body }, requestId) : api.mutate("/api/operations/orca/replies", { messageId, runId: runId!, body }, requestId)} /></div>;
++}
++
++export function OperationsQuestions({ api }: Readonly<{ api: OperationsApi }>) {
++  const read = useRead(async (signal) => { const [hq, orca] = await Promise.all([api.hqQuestions("0", signal), api.orcaQuestions(signal)]); return { hq, orca }; }, [api]);
++  if (!read.data || read.state !== "ready") return <AsyncState state={read.state} onRetry={read.reload} />;
++  const runFor = (question: HqQuestion) => question.messageId ? read.data!.orca.messages.find((message) => message.id === question.messageId)?.run_id ?? undefined : undefined;
++  return <><div className="view-head"><h1>질문함</h1><p>HQ pending 질문과 Orca inbox 관찰을 분리하고, 제출 직전 서버가 권위 상태를 다시 확인합니다.</p></div><div className="grid-2 controls-grid">
++    <section className="card card-body"><h2><SourceBadge source="hq" /> HQ 질문</h2>{read.data.hq.questions.length === 0 ? <p className="empty-copy">대기 질문 없음</p> : <ul className="question-list">{read.data.hq.questions.map((item) => <li key={`${item.requestId}:${item.occurredAt}`}><strong>{item.body}</strong><small>{item.requestId} · {item.state}</small><Answer api={api} source="HQ" item={item} runId={runFor(item)} /></li>)}</ul>}</section>
++    <section className="card card-body"><h2><SourceBadge source="orca" /> Orca inbox</h2>{read.data.orca.messages.length === 0 ? <p className="empty-copy">관찰된 질문 없음</p> : <ul className="question-list">{read.data.orca.messages.map((item) => <li key={item.id}><strong>{item.subject || item.body}</strong><small>{item.run_id ?? "Run 미제공"}</small><Answer api={api} source="Orca" item={item} runId={item.run_id ?? undefined} /></li>)}</ul>}<p className="muted">공개 inbox에는 권위 있는 pending 상태가 없습니다. 관찰 이력만 표시하며 서버의 fresh gate가 거부할 수 있습니다.</p></section>
++  </div></>;
++}
+
+--- a/apps/web/src/styles.css
++++ b/apps/web/src/styles.css
+@@ -71,6 +71,10 @@
+ .async-state button, .back, .load-more, .timeline button, .tabs button, .filters button { border: 1px solid #cfc8b8; background: white; color: var(--text); border-radius: 7px; padding: 7px 10px; }
+ .back { margin-bottom: 14px; }
+ .filters, .tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
++.list-tools { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
++.list-tools .filters { margin-bottom: 0; }
++.list-tools label { display: grid; grid-template-columns: auto minmax(140px, 240px); align-items: center; gap: 8px; color: var(--muted); }
++.list-tools input { min-width: 0; border: 1px solid #cfc8b8; border-radius: 7px; padding: 7px 10px; font: inherit; }
+ .filters button.active, .tabs button[aria-selected="true"] { background: var(--navy); color: white; border-color: var(--navy); }
+ .load-more { margin-top: 16px; }
+ .timeline { list-style: none; padding: 0 16px 12px; margin: 0; }
+@@ -81,6 +85,26 @@
+ .question-list li { display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+ .question-list small { color: var(--muted); }
+ .question-list button { width: fit-content; }
++.controls-grid { align-items: start; }
++.controls-grid input, .controls-grid select, .controls-grid textarea, .control-panel textarea { width: 100%; box-sizing: border-box; margin-top: 6px; border: 1px solid #cfc8b8; border-radius: 8px; background: white; color: var(--text); padding: 10px 12px; font: inherit; }
++.controls-grid textarea, .control-panel textarea { resize: vertical; line-height: 1.5; }
++.controls-grid label, .control-panel label { display: block; margin: 14px 0; color: var(--muted); font-size: 13px; font-weight: 650; }
++.reviewed-mutation { margin-top: 16px; }
++.reviewed-mutation > button, .modal-actions button, .control-actions button { border: 1px solid #cfc8b8; border-radius: 8px; padding: 9px 14px; background: white; color: var(--text); font: inherit; }
++.reviewed-mutation > button:not(:disabled), .modal-actions .primary { background: var(--navy); color: white; border-color: var(--navy); cursor: pointer; }
++.reviewed-mutation > button:disabled, .modal-actions button:disabled, .control-actions button:disabled { cursor: not-allowed; opacity: .5; }
++.mutation-result { padding: 10px 12px; border-radius: 8px; line-height: 1.45; }
++.mutation-result.accepted { background: #ecfdf3; color: #166534; }
++.mutation-result.rejected { background: #fff7ed; color: #9a3412; }
++.mutation-result.unknown { background: #fff1f2; color: #9f1239; }
++.modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgb(15 23 42 / .55); }
++.modal { width: min(680px, 100%); max-height: min(760px, calc(100vh - 40px)); overflow: auto; box-sizing: border-box; border-radius: 14px; background: white; box-shadow: 0 24px 70px rgb(15 23 42 / .35); padding: 24px; }
++.modal h2 { margin-top: 0; }
++.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
++.review-text { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; max-height: 320px; overflow: auto; background: var(--surface); border-radius: 8px; }
++.kv.compact { grid-template-columns: minmax(90px, auto) minmax(0, 1fr); }
++.answer-form, .control-panel { margin-top: 12px; }
++.control-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+ .tree ul { padding-left: 22px; }
+ .tree-row { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 8px; }
+ .tree-row:hover { background: var(--surface-alt); }
+@@ -98,6 +122,8 @@
+   .main-content { padding: 17px 14px 50px; }
+   .grid-2, .stat-row { grid-template-columns: 1fr; }
+   .timeline li { grid-template-columns: 1fr; }
++  .list-tools { align-items: stretch; flex-direction: column; }
++  .list-tools label { grid-template-columns: auto minmax(0, 1fr); }
+   .kv { grid-template-columns: 95px minmax(0, 1fr); }
+ }
+ @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+
+--- a/apps/web/e2e/mobile-dashboard.spec.ts
++++ /dev/null
+@@ -1,82 +0,0 @@
+-import { expect, test, type Page } from "@playwright/test";
+-
+-const command = {
+-  id: "cmd-42", summary: "승인 대시보드를 배포합니다", projectKey: "hq", status: "진행 중", riskLevel: "L3", createdAt: "2026-09-01T08:00:00Z", updatedAt: "2026-09-01T08:10:00Z",
+-  project: { key: "hq", displayName: "Orca HQ", path: "/redacted/hq" }, routing: { score: 92, selectedReason: "보호된 경로와 일치", candidates: ["primary: 92"] },
+-  contract: { base: "main", allowedScope: ["apps/web/**"], prohibitedEffects: ["외부 메시지 전송"], testCommands: ["pnpm --filter @orca-hq/web test"] },
+-  tasks: [
+-    { id: "task-ui", title: "모바일 화면", status: "진행 중", dependencies: [], workerFamily: "gpt-5", verifierFamily: "gpt-5", dispatchId: "dispatch-42", dispatchStatus: "running", canStop: true, canRetry: true },
+-    { id: "task-verify", title: "검증 실행", status: "대기", dependencies: ["task-ui"], workerFamily: "claude", verifierFamily: "gpt-5", dispatchId: "dispatch-99", dispatchStatus: "queued", canStop: true, canRetry: true }
+-  ],
+-  verification: { status: "passed", commands: ["pnpm test"] }, diff: { summary: "3 files changed" },
+-  approval: { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", operationPhrase: "APPROVE RELEASE", status: "pending", permitted: true },
+-  audit: { reference: "audit:cmd-42", summary: "승인 대기" },
+-  approvalHistory: [
+-    { id: "approval-42", level: "L3", digest: "a".repeat(64), expiresAt: "2099-01-01T00:00:00Z", approvedAt: "", operationPhrase: "APPROVE RELEASE", status: "pending" },
+-    { id: "approval-expired", level: "L2", digest: "b".repeat(64), expiresAt: "2026-09-01T08:15:00Z", approvedAt: "2026-09-01T08:00:00Z", status: "expired" }
+-  ],
+-  auditHistory: [
+-    { reference: "audit:denied", subjectId: "approval-42", summary: "approval.denied", occurredAt: "2026-09-01T08:12:00Z" },
+-    { reference: "audit:expired", subjectId: "approval-expired", summary: "approval.expired", occurredAt: "2026-09-01T08:10:00Z" }
+-  ],
+-  delivery: [{ channel: "Slack", status: "pending" }, { channel: "Telegram", status: "sent" }]
+-};
+-
+-async function mockApi(page: Page) {
+-  await page.route("**/auth/session", async (route) => route.fulfill({ status: 204, headers: { "x-csrf-token": "test-csrf" } }));
+-  await page.route("**/api/commands", async (route) => route.fulfill({ json: { commands: [command] } }));
+-  await page.route("**/api/commands/cmd-42", async (route) => route.fulfill({ json: command }));
+-}
+-
+-for (const viewport of [{ name: "모바일", width: 390, height: 844 }, { name: "데스크톱", width: 1280, height: 800 }]) {
+-  test(`${viewport.name}에서 목록과 상세 증거가 수평 overflow 없이 표시된다`, async ({ page }) => {
+-    await page.setViewportSize(viewport);
+-    await mockApi(page);
+-    await page.goto("/commands");
+-    await expect(page.getByRole("link", { name: command.summary })).toBeVisible();
+-    await page.getByRole("link", { name: command.summary }).click();
+-    for (const evidence of ["경로 선택 근거", "검증 완료", "승인 이력", "감사 이력", "approval.denied", "Slack 전송 대기"]) {
+-      await expect(page.getByText(evidence, { exact: true })).toBeVisible();
+-    }
+-    const approvalCard = page.getByRole("region", { name: "승인" });
+-    for (const evidence of ["APPROVE RELEASE", "apps/web/**", "외부 메시지 전송", "pnpm --filter @orca-hq/web test"]) {
+-      await expect(approvalCard.getByText(evidence, { exact: true })).toBeVisible();
+-    }
+-    await expect(page.getByRole("button", { name: "Dispatch 중지: 검증 실행 (dispatch-99)" })).toBeVisible();
+-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+-  });
+-}
+-
+-test("키보드로 핵심 제어에 도달하면 focus outline이 표시된다", async ({ page }) => {
+-  await mockApi(page);
+-  await page.goto("/commands");
+-  await page.keyboard.press("Tab");
+-  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+-  await page.getByRole("link", { name: command.summary }).click();
+-  const phrase = page.getByLabel("승인 문구 입력");
+-  for (let index = 0; index < 12 && !await phrase.evaluate((node) => document.activeElement === node); index += 1) {
+-    await page.keyboard.press("Tab");
+-  }
+-  expect(await phrase.evaluate((node) => document.activeElement === node)).toBe(true);
+-  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+-  await page.keyboard.type("APPROVE RELEASE");
+-  await page.keyboard.press("Tab");
+-  expect(await page.getByRole("button", { name: "L3 승인" }).evaluate((node) => document.activeElement === node)).toBe(true);
+-  expect(await page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle)).not.toBe("none");
+-});
+-
+-test("정확한 L3 문구만 승인 요청에 digest와 phrase로 전달한다", async ({ page }) => {
+-  let body = "";
+-  await mockApi(page);
+-  await page.route("**/api/approvals/approval-42/confirm", async (route) => { body = route.request().postData() ?? ""; await route.fulfill({ status: 200, json: { status: "approved" } }); });
+-  await page.goto("/commands");
+-  await page.getByRole("link", { name: command.summary }).click();
+-  const approve = page.getByRole("button", { name: "L3 승인" });
+-  await expect(approve).toBeDisabled();
+-  await page.getByLabel("승인 문구 입력").fill("approve release");
+-  await expect(approve).toBeDisabled();
+-  await page.getByLabel("승인 문구 입력").fill("APPROVE RELEASE");
+-  await expect(approve).toBeEnabled();
+-  await approve.click();
+-  expect(JSON.parse(body)).toEqual({ digest: "a".repeat(64), phrase: "APPROVE RELEASE" });
+-});
+
+--- /dev/null
++++ b/apps/web/e2e/operations-console.spec.ts
+@@ -0,0 +1,64 @@
++import { expect, test, type Page, type Route } from "@playwright/test";
++
++const at = "2026-09-15T09:00:00.000Z";
++const evidence = { source: "orca_cli", observedAt: at, verification: "observed" };
++const hqEvidence = { ...evidence, source: "hq_store" };
++const context = { contextId: "context-1", title: "정산 배치 확인", state: "executing", summary: "실제 HQ 문맥", projectIds: ["project-1"], jobIds: [], createdAt: at, updatedAt: at, lastSeq: 3 };
++const worker = { dispatchId: "dispatch-1", projection: { dispatchId: "dispatch-1", taskId: "task-1", runId: "run-1", liveness: { verdict: "live" } } };
++const workerDetail = { source: "orca", dispatch: { id: "dispatch-1", runId: "run-1", taskId: "task-1", status: "dispatched", processIncarnation: "pty-1:inc-1" }, worker: { dispatchId: "dispatch-1", state: "ready", stage: "working", agentTerminalHandle: "term-1" }, projection: { dispatchId: "dispatch-1", taskId: "task-1", runId: "run-1", liveness: { verdict: "live" }, resource: { state: "owned", ownerDispatchId: "dispatch-1", releaseState: "not_requested" } }, observation: { status: "live", exactWorker: true }, terminal: { handle: "term-1", incarnationId: "inc-1", ptyId: "pty-1", connected: true, writable: true, orphaned: false, executionHostId: "local", worktreeId: "wt-1" }, terminalResource: { id: "term-1", ownershipState: "owned", releaseState: "not_requested", ownerDispatchId: "dispatch-1", terminalHandle: "term-1", endpointIncarnation: "pty-1:inc-1" }, evidence };
++
++async function fakeApi(page: Page) {
++  const mutations: Array<{ path: string; body: unknown; requestId: string }> = [];
++  await page.route("**/api/operations/**", async (route: Route) => {
++    const request = route.request(); const url = new URL(request.url()); const path = url.pathname;
++    if (request.method() === "POST") {
++      const requestId = request.headers()["idempotency-key"] ?? "missing";
++      mutations.push({ path, body: request.postDataJSON(), requestId });
++      await route.fulfill({ status: 202, json: { requestId, action: path.split("/").at(-1) ?? "mutation", targetId: requestId, state: "accepted", observedAt: at } }); return;
++    }
++    let body: unknown;
++    if (path.endsWith("/status")) body = { collectedAt: at, hq: { state: "running", capacity: { limit: 10, source: "default", active: 1, queued: 0, byState: { executing: 1 }, updateSupported: false, reason: "restart_safe_mutation_contract_unavailable" } }, orca: { state: "ready", reachable: true, version: "1.4.203", runtimeId: "runtime-1", features: { controls: { supported: true } } }, metrics: { tokens: { available: false, reason: "not_collected" }, cost: { available: false, reason: "not_collected" } } };
++    else if (path.endsWith("/hq/contexts/context-1")) body = { source: "hq", context, evidence: hqEvidence };
++    else if (path.endsWith("/hq/contexts")) body = { contexts: [context] };
++    else if (path.endsWith("/hq/events")) body = { events: [{ source: "hq", eventSource: "hq", seq: 3, eventKey: "event-3", requestId: "request-1", contextId: "context-1", kind: "worker.ready", occurredAt: at, payload: {}, receiptLink: { runId: "run-1", taskId: "task-1", dispatchId: "dispatch-1", terminalHandle: "term-1" } }], snapshots: [context], cursor: "3", compacted: false, oldestSeq: 1, latestSeq: 3 };
++    else if (path.endsWith("/hq/questions")) body = { source: "hq", questions: [{ source: "hq", kind: "router_clarification", requestId: "request-1", sessionId: "session-1", body: "어느 프로젝트인가요?", occurredAt: at, state: "awaiting_input", evidence: hqEvidence }], cursor: "3", compacted: false };
++    else if (path.endsWith("/orca/runs")) body = { source: "orca", runs: [{ id: "run-1", objective: "검증", coordinator_handle: "term-owner", consumer_generation: 2 }], evidence };
++    else if (path.endsWith("/orca/tasks")) body = { source: "orca", tasks: [{ id: "task-1", status: "pending", run_id: "run-1", created_by_terminal_handle: "term-owner", created_by_process_incarnation: "pty-owner:inc-owner", created_by_run_generation: 2 }], evidence };
++    else if (path.endsWith("/orca/workers/dispatch-1/output")) body = url.searchParams.get("cursor") ? { source: url.searchParams.get("source"), archived: false, warnings: [], ...(url.searchParams.get("source") === "terminal" ? { lines: ["second output"] } : { messages: [{ id: "message-2", role: "assistant", text: "second transcript" }] }) } : { source: url.searchParams.get("source"), cursor: "next-log", archived: false, warnings: [], ...(url.searchParams.get("source") === "terminal" ? { lines: ["first output"] } : { messages: [{ id: "message-1", role: "assistant", text: "first transcript" }] }) };
++    else if (path.endsWith("/orca/workers/dispatch-1")) body = workerDetail;
++    else if (path.endsWith("/orca/workers")) body = { source: "orca", workers: [worker], page: { hasMore: false }, scope: { source: "all" }, evidence };
++    else if (path.endsWith("/orca/questions")) body = { source: "orca", messages: [{ id: "message-1", type: "question", subject: "배포할까요?", body: "확인이 필요합니다", run_id: "run-1" }], count: 1, support: { pendingState: { supported: false, reason: "inbox_has_no_authoritative_pending_question_state" } }, evidence };
++    else if (path.endsWith("/orca/resources")) body = { source: "orca", projects: [{ id: "project-1", hostScope: "covered", setups: [{ id: "setup-1", covered: true, truncated: false, worktrees: [{ id: "wt-1", terminals: [{ id: "term-1" }] }] }] }], evidence };
++    else { await route.fulfill({ status: 404, json: { error: "fake_route_missing" } }); return; }
++    await route.fulfill({ status: 200, json: body });
++  });
++  return mutations;
++}
++
++for (const viewport of [{ name: "1440", width: 1440, height: 900 }, { name: "1280", width: 1280, height: 800 }, { name: "390", width: 390, height: 844 }]) {
++  test(`${viewport.name} renders all console routes without overflow or browser errors`, async ({ page }) => {
++    await page.setViewportSize(viewport); await fakeApi(page);
++    const errors: string[] = []; const external: string[] = [];
++    page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
++    page.on("pageerror", (error) => errors.push(error.message));
++    page.on("request", (request) => { const url = new URL(request.url()); if (url.origin !== "http://127.0.0.1:4173") external.push(request.url()); });
++    const routes = [["/overview", "운영 개요"], ["/work", "업무 목록"], ["/work/hq/context-1", "정산 배치 확인"], ["/work/orca/dispatch-1", "dispatch-1"], ["/compose", "새 지시"], ["/questions", "질문함"], ["/resources", "프로젝트 / 터미널"], ["/settings", "운영 설정"], ["/evidence", "리서치 / 기획 증거"]] as const;
++    for (const [path, heading] of routes) {
++      await page.goto(path); await expect(page.getByRole("heading", { name: new RegExp(heading) }).first()).toBeVisible();
++      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
++    }
++    await page.goto("/overview"); await page.screenshot({ path: `../../screenshots/2026-09-15-operations-${viewport.name}.png`, fullPage: true });
++    expect(errors).toEqual([]); expect(external).toEqual([]);
++  });
++}
++
++test("filters, searches, pages logs, and reviews controls with keyboard focus", async ({ page }) => {
++  const mutations = await fakeApi(page);
++  await page.goto("/work");
++  await page.getByRole("button", { name: "Orca" }).click(); await expect(page.getByText("dispatch-1")).toBeVisible(); await expect(page.getByText("정산 배치 확인")).toHaveCount(0);
++  await page.getByRole("button", { name: "전체" }).click(); await page.getByLabel("업무 검색").fill("context-1"); await expect(page.getByText("정산 배치 확인")).toBeVisible(); await expect(page.getByText("dispatch-1")).toHaveCount(0);
++  await page.goto("/work/orca/dispatch-1"); await page.getByRole("tab", { name: "터미널 로그" }).click(); await expect(page.getByText("first output")).toBeVisible(); await page.getByRole("button", { name: "다음 로그 페이지" }).click(); await expect(page.getByText("second output")).toBeVisible();
++  await page.goto("/compose"); await page.getByLabel("세션 ID").fill("session-1"); await page.getByLabel("지시 내용").fill("reviewed request"); const trigger = page.getByRole("button", { name: "제출 전 검토" }); await trigger.click(); await page.keyboard.press("Escape"); await expect(trigger).toBeFocused(); await trigger.click(); await page.getByRole("button", { name: "확인 후 제출" }).click(); await expect(page.getByText(/접수되었지만 완료된 것은 아닙니다/)).toBeVisible();
++  expect(mutations).toHaveLength(1); expect(mutations[0]?.path).toBe("/api/operations/hq/requests"); expect(mutations[0]?.requestId).toMatch(/^request_[0-9a-f-]{36}$/);
++  await page.goto("/settings"); await expect(page.getByRole("button", { name: "용량 변경 지원 안 함" })).toBeDisabled();
++});
+
+--- a/apps/gateway/src/managed-service.ts
++++ b/apps/gateway/src/managed-service.ts
+@@ -1,10 +1,12 @@
+ import { OperationsJournal } from "./operations-journal.js";
+ import { OperationsService, type OperationsServiceOptions } from "./operations-service.js";
+ import { OperationsHttp } from "./operations-http.js";
++import { createOperationsAssets } from "./operations-assets.js";
+ import { createServer } from "node:http";
+ import type { createProgressControl } from "./progress-control.js";
+ import { chmod } from "node:fs/promises";
+ import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
+ import { openDatabase } from "@orca-hq/persistence";
+ import { LocalTextStore, type LocalTextMessage } from "./local-store.js";
+ import type { LocalChannelFactory } from "./local-service.js";
+@@ -28,6 +30,7 @@
+   channelFactory: LocalChannelFactory;
+   getJob(id: string): CommandJob | undefined;
+   operations?: Omit<OperationsServiceOptions, "journal">;
++  operationsAssetsRoot?: string;
+   progress?: ReturnType<typeof createProgressControl>;
+   beforeReady?: () => Promise<void>;
+   initialCursors?: Partial<Record<"slack" | "telegram", string | number>>;
+@@ -40,6 +43,7 @@
+   const operationsJournal = options.operations ? new OperationsJournal(db) : undefined;
+   const operationsService = options.operations && operationsJournal ? new OperationsService({ ...options.operations, journal: operationsJournal }) : undefined;
+   const operationsHttp = operationsService ? new OperationsHttp({ route: (method, url, body, key) => operationsService.route(method, url, body, key) }) : undefined;
++  const operationsAssets = operationsService ? await createOperationsAssets(options.operationsAssetsRoot ?? fileURLToPath(new URL("../../web/dist", import.meta.url))) : undefined;
+   for (const channel of ["slack", "telegram"] as const) {
+     const cursor = options.initialCursors?.[channel];
+     if (cursor !== undefined && inbox.loadCursor(channel) === undefined)
+@@ -329,7 +333,10 @@
+           queue: inbox.summary(),
+         }),
+       );
+-    } else if (req.method === "GET" && req.url === "/") {
++      return;
++    }
++    if (operationsAssets && await operationsAssets.handle(req, res)) return;
++    if (req.method === "GET" && req.url === "/") {
+       res.writeHead(200, {
+         "Content-Type": "text/html; charset=utf-8",
+         "Content-Security-Policy": "default-src 'none'",
+
+--- /dev/null
++++ b/apps/gateway/src/operations-assets.ts
+@@ -0,0 +1,59 @@
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { lstat, readFile, realpath } from "node:fs/promises";
++import { extname, join } from "node:path";
++
++type Asset = Readonly<{ body: Buffer; type: string }>;
++
++async function safeFile(root: string, relative: string): Promise<Buffer> {
++  try {
++    const path = join(root, relative);
++    const stat = await lstat(path);
++    if (!stat.isFile() || stat.isSymbolicLink() || await realpath(path) !== path) throw new Error("operations_assets_unsafe");
++    return await readFile(path);
++  } catch (error) {
++    if (error instanceof Error && error.message === "operations_assets_unsafe") throw error;
++    throw new Error("operations_assets_missing");
++  }
++}
++
++export async function createOperationsAssets(inputRoot: string) {
++  let root: string;
++  try {
++    const stat = await lstat(inputRoot);
++    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("operations_assets_unsafe");
++    root = await realpath(inputRoot);
++  } catch (error) {
++    if (error instanceof Error && error.message === "operations_assets_unsafe") throw error;
++    throw new Error("operations_assets_missing");
++  }
++  const index = await safeFile(root, "index.html");
++  const html = index.toString("utf8");
++  const referenced = [...html.matchAll(/(?:src|href)=["'](\/assets\/[^"']+)["']/gu)].map((match) => match[1]!);
++  if (!referenced.some((path) => path.endsWith(".js"))) throw new Error("operations_assets_missing");
++  const assets = new Map<string, Asset>();
++  for (const path of new Set(referenced)) {
++    if (!/^\/assets\/[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/u.test(path)) throw new Error("operations_assets_unsafe");
++    assets.set(path, { body: await safeFile(root, path.slice(1)), type: path.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8" });
++  }
++  const send = (res: ServerResponse, status: number, body?: Buffer, type?: string, cache = "no-store") => {
++    res.setHeader("Cache-Control", cache);
++    res.setHeader("X-Content-Type-Options", "nosniff");
++    res.setHeader("Referrer-Policy", "no-referrer");
++    if (type) res.setHeader("Content-Type", type);
++    res.writeHead(status);
++    res.end(body);
++  };
++  return Object.freeze({
++    async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
++      if (!req.url || req.url.startsWith("/api/") || req.url.startsWith("/auth/") || !["GET", "HEAD"].includes(req.method ?? "")) return false;
++      if (/%(?:2e|2f|5c)/iu.test(req.url) || req.url.includes("\\")) { send(res, 404); return true; }
++      const pathname = new URL(req.url, "http://127.0.0.1").pathname;
++      const asset = assets.get(pathname);
++      if (asset) { send(res, 200, req.method === "HEAD" ? undefined : asset.body, asset.type, "public, max-age=31536000, immutable"); return true; }
++      if (pathname.startsWith("/assets/") || extname(pathname) !== "") { send(res, 404); return true; }
++      res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'");
++      send(res, 200, req.method === "HEAD" ? undefined : index, "text/html; charset=utf-8");
++      return true;
++    },
++  });
++}
+
+--- a/apps/gateway/test/end-to-end.test.ts
++++ b/apps/gateway/test/end-to-end.test.ts
+@@ -166,6 +166,7 @@
+       case "list_projects":
+         return receipt("receipt-projects", { repos: [] });
+     }
++    throw new Error(`unsupported fake Orca operation: ${operation.kind}`);
+   }
+ }
+ 
+
+--- a/apps/gateway/test/managed-service.test.ts
++++ b/apps/gateway/test/managed-service.test.ts
+@@ -1,5 +1,5 @@
+ import { request } from "node:http";
+-import { mkdtemp,rm } from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
++import { mkdir,mkdtemp,rm,writeFile } from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
+ import { openDatabase } from '@orca-hq/persistence';
+ import {describe,it,expect,vi} from 'vitest';
+ import {startManagedService} from '../src/managed-service.js';
+@@ -102,11 +102,16 @@
+     ownerKey: "local",
+   });
+   const dir = await mkdtemp(join(tmpdir(), "operations-managed-"));
++  const web = join(dir, "web");
++  await mkdir(join(web, "assets"), { recursive: true });
++  await writeFile(join(web, "index.html"), '<!doctype html><script type="module" src="/assets/index-a1b2c3d4.js"></script>');
++  await writeFile(join(web, "assets/index-a1b2c3d4.js"), "globalThis.__hq=true");
+   const submit = vi.fn(async () => ({ accepted: true }));
+   const service = await startManagedService({
+     directory: dir,
+     databasePath: join(dir, "control.sqlite"),
+     port: 0,
++    operationsAssetsRoot: web,
+     owner: { slackUserId: "x", telegramUserId: "y" },
+     execute: async () => ({ text: "ok" }),
+     getJob: () => undefined,
+@@ -152,6 +157,12 @@
+     const url = new URL(claim.url),
+       origin = url.origin;
+     expect(origin).toBe(`http://127.0.0.1:${service.port}`);
++    const consolePage = await fetch(origin + "/work/orca/dispatch-1");
++    expect(consolePage.status).toBe(200);
++    expect(consolePage.headers.get("content-type")).toBe("text/html; charset=utf-8");
++    const protectedMiss = await fetch(origin + "/api/operations/missing");
++    expect(protectedMiss.status).toBe(401);
++    expect(protectedMiss.headers.get("content-type")).toBe("application/json; charset=utf-8");
+     const auth = await fetch(origin + "/auth/local/claim", {
+       method: "POST",
+       headers: { origin, "content-type": "application/json" },
+
+--- a/apps/gateway/test/operations-journal.test.ts
++++ b/apps/gateway/test/operations-journal.test.ts
+@@ -1,6 +1,9 @@
+ import { describe, expect, it } from "vitest";
+ import { openDatabase } from "@orca-hq/persistence";
+ import { OperationsJournal } from "../src/operations-journal.js";
++import { mkdtemp, rm } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ 
+ describe("operations durable intent", () => {
+   it("serializes concurrent duplicates and rejects changed identity before effect", async () => {
+@@ -72,4 +75,20 @@
+     ).not.toContain("secret");
+     db.close();
+   });
++  it("reloads an interrupted intent as unknown after an on-disk database restart", async () => {
++    // Break caught: recovery that works only in one SQLite connection can replay an effect after a real process restart.
++    const directory = await mkdtemp(join(tmpdir(), "operations-journal-restart-"));
++    const path = join(directory, "control.sqlite");
++    const input = { requestId: "disk-request", action: "release", targetId: "dispatch-1", input: { runId: "run-1" } };
++    try {
++      const first = openDatabase(path); const journal = new OperationsJournal(first);
++      await journal.execute(input, async () => ({ state: "accepted" }));
++      first.prepare("UPDATE operations_mutation_receipts SET state='prepared' WHERE request_id=?").run(input.requestId);
++      first.close();
++      const second = openDatabase(path); const restarted = new OperationsJournal(second); let effects = 0;
++      expect(await restarted.execute(input, async () => { effects++; return { state: "accepted" }; })).toMatchObject({ state: "unknown", detail: "interrupted" });
++      expect(effects).toBe(0);
++      second.close();
++    } finally { await rm(directory, { recursive: true, force: true }); }
++  });
+ });
+
+--- /dev/null
++++ b/apps/gateway/test/operations-assets.test.ts
+@@ -0,0 +1,61 @@
++import { createServer, request } from "node:http";
++import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import { createOperationsAssets } from "../src/operations-assets.js";
++
++const roots: string[] = [];
++afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
++
++async function fixture() {
++  const root = await mkdtemp(join(tmpdir(), "hq-assets-")); roots.push(root);
++  await mkdir(join(root, "assets"));
++  await writeFile(join(root, "index.html"), '<!doctype html><link rel="stylesheet" href="/assets/index-a1b2c3d4.css"><script type="module" src="/assets/index-e5f6a7b8.js"></script>');
++  await writeFile(join(root, "assets/index-a1b2c3d4.css"), "body{color:#123}");
++  await writeFile(join(root, "assets/index-e5f6a7b8.js"), "globalThis.__hq=true");
++  return root;
++}
++
++async function get(handler: Awaited<ReturnType<typeof createOperationsAssets>>, path: string) {
++  const server = createServer(async (req, res) => { if (!await handler.handle(req, res)) { res.writeHead(418); res.end("protected"); } });
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address(); if (!address || typeof address === "string") throw Error("listener");
++  const result = await new Promise<{ status: number; type?: string; body: string }>((resolve, reject) => {
++    const outgoing = request({ host: "127.0.0.1", port: address.port, path }, (response) => { const chunks: Buffer[] = []; response.on("data", (chunk) => chunks.push(chunk)); response.on("end", () => resolve({ status: response.statusCode ?? 0, ...(typeof response.headers["content-type"] === "string" ? { type: response.headers["content-type"] } : {}), body: Buffer.concat(chunks).toString("utf8") })); });
++    outgoing.once("error", reject); outgoing.end();
++  });
++  await new Promise<void>((resolve) => server.close(() => resolve()));
++  return result;
++}
++
++describe("operations built assets", () => {
++  it("serves only indexed built files and uses SPA fallback only for extensionless non-API paths", async () => {
++    // Break caught: the gateway could expose arbitrary files or answer an API miss with HTML.
++    const assets = await createOperationsAssets(await fixture());
++    await expect(get(assets, "/overview")).resolves.toMatchObject({ status: 200, type: "text/html; charset=utf-8", body: expect.stringContaining("index-e5f6a7b8.js") });
++    await expect(get(assets, "/assets/index-e5f6a7b8.js")).resolves.toMatchObject({ status: 200, type: "text/javascript; charset=utf-8" });
++    await expect(get(assets, "/assets/index-a1b2c3d4.css")).resolves.toMatchObject({ status: 200, type: "text/css; charset=utf-8" });
++    await expect(get(assets, "/assets/unlisted-a1b2c3d4.js")).resolves.toMatchObject({ status: 404 });
++    await expect(get(assets, "/api/operations/missing")).resolves.toMatchObject({ status: 418, body: "protected" });
++    await expect(get(assets, "/README.md")).resolves.toMatchObject({ status: 404 });
++  });
++
++  it("rejects traversal and symlinked build members", async () => {
++    // Break caught: a crafted path or swapped build file could escape the fixed Vite artifact root.
++    const root = await fixture();
++    const assets = await createOperationsAssets(root);
++    await expect(get(assets, "/assets/%2e%2e%2findex.html")).resolves.toMatchObject({ status: 404 });
++    await rm(join(root, "assets/index-e5f6a7b8.js"));
++    await symlink(join(root, "index.html"), join(root, "assets/index-e5f6a7b8.js"));
++    await expect(createOperationsAssets(root)).rejects.toThrow("operations_assets_unsafe");
++  });
++
++  it("fails closed when the built index or an indexed asset is missing", async () => {
++    // Break caught: service startup can silently fall back to source or a partial/stale web build.
++    const root = await fixture();
++    await rm(join(root, "assets/index-a1b2c3d4.css"));
++    await expect(createOperationsAssets(root)).rejects.toThrow("operations_assets_missing");
++    await expect(createOperationsAssets(join(root, "missing"))).rejects.toThrow("operations_assets_missing");
++  });
++});
+
+--- a/packages/installer/src/cli.ts
++++ b/packages/installer/src/cli.ts
+@@ -4,6 +4,7 @@
+ import { runChat } from "./chat.js";
+ import { createProgressClient, validProgressIdentifier, type ProgressClient } from "./progress-client.js";
+ import { runWatch } from "./watch.js";
++import { launchConsole, type ConsoleClaim } from "./console.js";
+ import type { ProgressWindowManager, ProgressWindowMode } from "./progress-window.js";
+ import { realpathSync } from "node:fs";
+ import { dirname, isAbsolute } from "node:path";
+@@ -34,7 +35,7 @@
+ 
+ const commandNames = [
+   "setup", "credential", "doctor", "start", "stop", "status", "logs", "update", "uninstall",
+-  "ask", "chat", "watch", "projects", "run", "jobs"
++  "ask", "chat", "watch", "console", "projects", "run", "jobs"
+ ] as const;
+ type CommandName = (typeof commandNames)[number];
+ 
+@@ -56,6 +57,7 @@
+   readonly stdin?: Readable;
+   readonly progress?: ProgressClient;
+   readonly progressWindows?: ProgressWindowManager;
++  readonly consoleLauncher?: () => Promise<ConsoleClaim>;
+   readonly signal?: AbortSignal;
+ }
+ 
+@@ -149,6 +151,17 @@
+     write(output, `Usage: hq ${commandNames.join("|")}`);
+     return 2;
+   }
++  if (selected === "console") {
++    if (input.length !== 1) { write(output, "Usage: hq console"); return 2; }
++    try {
++      await (dependencies.consoleLauncher ?? launchConsole)();
++      write(output, "브라우저에서 운영 콘솔을 열었습니다. 접수 상태와 권위 있는 완료 상태를 구분해 확인하세요.");
++      return 0;
++    } catch {
++      write(output, "운영 콘솔을 열지 못했습니다. `hq start`로 게이트웨이 상태를 확인하세요.");
++      return 1;
++    }
++  }
+   let sessionId: string | undefined;
+   let questionArguments = input.slice(1);
+   // No macOS Terminal window opens unless "--progress-window=auto" is given explicitly; native
+
+--- a/packages/installer/src/index.ts
++++ b/packages/installer/src/index.ts
+@@ -1,6 +1,7 @@
+ export * from "./backup.js";
+ export * from "./cli.js";
+ export * from "./config-files.js";
++export * from "./console.js";
+ export * from "./doctor.js";
+ export * from "./host.js";
+ export * from "./keychain.js";
+
+--- /dev/null
++++ b/packages/installer/src/console.ts
+@@ -0,0 +1,50 @@
++import { execFile } from "node:child_process";
++import { request } from "node:http";
++import { controlSocketPath } from "./control.js";
++
++export interface ConsoleClaim { readonly url: string; readonly expiresAt: string }
++export type ConsoleOpen = (executable: string, arguments_: readonly string[], options: Readonly<{ shell: false; timeout: number; maxBuffer: number }>) => Promise<void>;
++export interface LaunchConsoleOptions {
++  readonly socketPath?: string;
++  readonly env?: Readonly<Record<string, string | undefined>>;
++  readonly timeoutMs?: number;
++  readonly maxBodyBytes?: number;
++  readonly open?: ConsoleOpen;
++}
++
++const openBrowser: ConsoleOpen = async (executable, arguments_, options) => await new Promise<void>((resolve, reject) => {
++  execFile(executable, [...arguments_], options, (error) => error ? reject(new Error("console_open_failed")) : resolve());
++});
++
++function parseClaim(value: unknown): ConsoleClaim {
++  if (!value || typeof value !== "object") throw new Error("console_claim_invalid");
++  const { url, expiresAt } = value as { url?: unknown; expiresAt?: unknown };
++  if (typeof url !== "string" || typeof expiresAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(expiresAt) || Number.isNaN(Date.parse(expiresAt))) throw new Error("console_claim_invalid");
++  let parsed: URL;
++  try { parsed = new URL(url); } catch { throw new Error("console_claim_invalid"); }
++  if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" || !parsed.port || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || !/^#claim=[A-Za-z0-9_-]{43}$/u.test(parsed.hash)) throw new Error("console_claim_invalid");
++  return { url, expiresAt };
++}
++
++export async function launchConsole(options: LaunchConsoleOptions = {}): Promise<ConsoleClaim> {
++  const socketPath = options.socketPath ?? controlSocketPath(options.env);
++  const timeoutMs = options.timeoutMs ?? 10_000;
++  const maxBodyBytes = options.maxBodyBytes ?? 16 * 1024;
++  const claim = await new Promise<ConsoleClaim>((resolve, reject) => {
++    const outgoing = request({ socketPath, path: "/v1/operations/session", method: "POST", headers: { "content-type": "application/json", "content-length": 2 } }, (response) => {
++      const chunks: Buffer[] = []; let size = 0;
++      response.on("data", (chunk: Buffer) => { size += chunk.length; if (size > maxBodyBytes) response.destroy(new Error("console_claim_too_large")); else chunks.push(chunk); });
++      response.once("error", reject);
++      response.once("end", () => {
++        if (response.statusCode !== 200) { reject(new Error("console_claim_failed")); return; }
++        try { resolve(parseClaim(JSON.parse(Buffer.concat(chunks).toString("utf8")))); } catch (error) { reject(error); }
++      });
++    });
++    outgoing.once("error", reject);
++    const deadline = setTimeout(() => outgoing.destroy(new Error("console_claim_timeout")), timeoutMs);
++    outgoing.once("close", () => clearTimeout(deadline));
++    outgoing.end("{}");
++  });
++  await (options.open ?? openBrowser)("/usr/bin/open", [claim.url], { shell: false, timeout: 10_000, maxBuffer: 64 * 1024 });
++  return claim;
++}
+
+--- a/packages/installer/test/cli.test.ts
++++ b/packages/installer/test/cli.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it, vi } from "vitest";
+ 
+ import { runCli, type HostAdapters } from "../src/cli.js";
+ import type { ControlClient } from "../src/control.js";
+@@ -143,6 +143,16 @@
+ 
+     expect(texts).toEqual(["현재 상태는?"]);
+     expect(stdout.lines).toEqual(["현재 깨끗합니다.\n"]);
++  });
++
++  it("opens the local operations console only through the injected owner-socket launcher", async () => {
++    // Break caught: the CLI can print or construct a browser URL instead of delegating claim ownership to the secure launcher.
++    const stdout = output();
++    const consoleLauncher = vi.fn().mockResolvedValue({ url: `http://127.0.0.1:4310/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" });
++    await expect(runCli(["console"], { stdout, consoleLauncher })).resolves.toBe(0);
++    expect(consoleLauncher).toHaveBeenCalledOnce();
++    expect(stdout.lines.join("")).toContain("브라우저에서 운영 콘솔을 열었습니다");
++    expect(stdout.lines.join("")).not.toContain("#claim=");
+   });
+ 
+   it.each([
+
+--- a/packages/installer/test/documented-commands.test.ts
++++ b/packages/installer/test/documented-commands.test.ts
+@@ -106,6 +106,7 @@
+       uninstall: async () => undefined
+     },
+     readiness: { waitForRunning: async () => ({ ready: true }) },
++    consoleLauncher: async () => { calls.push("console"); return { url: `http://127.0.0.1:4310/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" }; },
+     lifecycle: fakeLifecycle(calls)
+   };
+ }
+@@ -160,6 +161,7 @@
+     "pnpm hq doctor --format json",
+     "pnpm hq start",
+     "pnpm hq status",
++    "pnpm hq console",
+     "pnpm hq update --revision <full-commit-sha>",
+     "pnpm hq uninstall --remove-data"
+   ]));
+
+--- /dev/null
++++ b/packages/installer/test/console.test.ts
+@@ -0,0 +1,43 @@
++import { createServer } from "node:http";
++import { mkdtemp, rm } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { launchConsole } from "../src/console.js";
++
++const roots: string[] = [];
++afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
++
++async function socketServer(value: unknown) {
++  const root = await mkdtemp(join(tmpdir(), "hq-console-")); roots.push(root);
++  const socketPath = join(root, "control.sock");
++  const seen: Array<{ method?: string; path?: string; body: string }> = [];
++  const server = createServer(async (req, res) => { let body = ""; for await (const chunk of req) body += String(chunk); seen.push({ method: req.method, path: req.url, body }); res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(value)); });
++  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
++  return { socketPath, seen, stop: async () => await new Promise<void>((resolve) => server.close(() => resolve())) };
++}
++
++describe("hq console launcher", () => {
++  it("claims through the owner socket and opens exactly one fragment URL argv without a shell", async () => {
++    // Break caught: a claim can leak through shell interpolation or be requested from a non-owner transport.
++    const url = `http://127.0.0.1:4310/#claim=${"a".repeat(43)}`;
++    const server = await socketServer({ url, expiresAt: "2026-09-15T09:01:00.000Z" });
++    const open = vi.fn().mockResolvedValue(undefined);
++    try { await expect(launchConsole({ socketPath: server.socketPath, open })).resolves.toEqual({ url, expiresAt: "2026-09-15T09:01:00.000Z" }); }
++    finally { await server.stop(); }
++    expect(server.seen).toEqual([{ method: "POST", path: "/v1/operations/session", body: "{}" }]);
++    expect(open).toHaveBeenCalledWith("/usr/bin/open", [url], expect.objectContaining({ shell: false }));
++  });
++
++  it.each([
++    { url: `https://127.0.0.1:4310/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" },
++    { url: `http://example.test/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" },
++    { url: "http://127.0.0.1:4310/#claim=short", expiresAt: "2026-09-15T09:01:00.000Z" },
++  ])("refuses a malformed claim response without invoking the browser", async (value) => {
++    // Break caught: a compromised socket response can redirect the privileged launcher off loopback.
++    const server = await socketServer(value); const open = vi.fn();
++    try { await expect(launchConsole({ socketPath: server.socketPath, open })).rejects.toThrow("console_claim_invalid"); }
++    finally { await server.stop(); }
++    expect(open).not.toHaveBeenCalled();
++  });
++});
+
+--- a/packages/core/src/public-output.ts
++++ b/packages/core/src/public-output.ts
+@@ -23,18 +23,26 @@
+   return boundResultText(text);
+ }
+ 
+-/** Removes credentials before public CLI/HQ output is stored or displayed. */
+-export function redactPublicText(value: unknown): string {
+-  if (typeof value !== "string") return "";
+-  const redacted = stripControls(value, true)
++function redactCredentials(value: string): string {
++  return stripControls(value, true)
+     .replace(/\r\n?/gu, "\n")
+     .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, "[REDACTED]")
+     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
+     .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/gu, "[REDACTED]")
+-    .replace(/\s+/gu, " ").trim();
+-  return boundResultText(redacted);
+ }
+ 
++/** Removes credentials before public CLI/HQ output is stored or displayed. */
++export function redactPublicText(value: unknown): string {
++  if (typeof value !== "string") return "";
++  return boundResultText(redactCredentials(value).replace(/\s+/gu, " ").trim());
++}
++
++/** Redacts a durable result without rewriting harmless spaces or line breaks. */
++export function redactPublicResultText(value: unknown): string {
++  if (typeof value !== "string") return "";
++  return boundResultText(redactCredentials(value));
++}
++
+ function boundResultText(text: string): string {
+   return text.length <= resultTextLimit
+     ? text
+
+--- a/apps/gateway/src/progress-events.ts
++++ b/apps/gateway/src/progress-events.ts
+@@ -1,8 +1,8 @@
+ import { redactRelayText } from "./orca-relay.js";
+-import { redactPublicText } from "@orca-hq/core";
++import { redactPublicResultText } from "@orca-hq/core";
+ import type { CommandJob } from "./managed-commands.js";
+ export function publicProgressText(text: string): string {
+-  return redactPublicText(redactRelayText(text)).slice(0, 14000);
++  return redactPublicResultText(redactRelayText(text)).slice(0, 14000);
+ }
+ export function nativeContextState(
+   jobs: CommandJob[],
+
+--- a/apps/gateway/test/progress-events.test.ts
++++ b/apps/gateway/test/progress-events.test.ts
+@@ -41,3 +41,8 @@
+   ).not.toContain("abcdefghijkl");
+   expect(publicProgressText("token=abc")).not.toContain("abc");
+ });
++it("preserves safe completion result layout", () => {
++  // Break caught: public redaction must not rewrite harmless whitespace in the durable result.
++  const result = "검토 결과입니다. \n".repeat(1000);
++  expect(publicProgressText(result)).toBe(result);
++});
+
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,11 +1,13 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1, Task 2, and Task 3 final Spec/Quality reviews PASS; Task 4 in progress
++- Status: Task 1, Task 2, and Task 3 final Spec/Quality reviews PASS; Task 4 implemented and verified; Task 5 independent review pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
+ 
++- Task 4 ships the reviewed mutation console, owner-socket `hq console` launcher, fail-closed indexed Vite asset serving, root build ordering, usage guidance, restart-safe mutation journal coverage, responsive Playwright acceptance, and isolated package-artifact proof. Focused web/gateway/installer tests, four Playwright cases, root typecheck/build, and the final **1,326-test / 104-file** root suite pass. The root run exposed and Task 4 repaired one Task 1 regression where public redaction normalized harmless durable-result whitespace; the focused long Korean completion/compaction/idempotency regression now passes without weakening credential redaction. See `2026-09-15-hq-orca-operations-task4.md` and `task4.diff`; Task 5 owns the fresh independent integration review.
++
+ - Task 3 fix round 2 independent review: **Spec PASS / Quality PASS**. The refreshed first-page owner now aborts and supersedes in-flight pagination while restoring readiness, and the stale continuation remains generation/signal fenced. The review reused the recorded focused red/green regression, **31 web tests / 2 files**, and web typecheck; see `2026-09-15-hq-orca-operations-task3-fix2-review.md`.
+ 
+ - Task 3 fix round 2 addresses the remaining Q4 pagination state defect: changed first-page reconciliation now advances one generation fence, aborts obsolete pagination, and restores readiness without permitting late settlement to mutate rows, cursors, or state. TDD red reproduced the disabled “읽는 중” control; green passed the focused regression, **31 web tests / 2 files**, and web typecheck. See `2026-09-15-hq-orca-operations-task3-fix2.md` and `task3-fix2.diff`; independent re-review is pending and Task 4 remains out of scope.
+@@ -50,4 +52,4 @@
+ 
+ ## Ready State
+ 
+-Task 1, Task 2, and Task 3 have final Spec/Quality PASS verdicts. Task 4 is in progress for controls, launcher/static serving, packaging, and full browser/E2E acceptance; Task 5 still requires a fresh reviewer.
++Task 1, Task 2, and Task 3 have final Spec/Quality PASS verdicts. Task 4 implementation and its focused/browser/root validations pass, with the exact evidence and limitations recorded in the Task 4 report. Task 5 still requires a fresh independent integration/security/state review before the overall plan is complete.
+
+--- /dev/null
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task4.md
+@@ -0,0 +1,90 @@
++# Task 4 — controls, secure launcher, assets, and end-to-end acceptance
++
++Date: 2026-09-15 KST  
++Implementation: **PASS**  
++Independent integration review: **pending (Task 5)**
++
++## Entry gate
++
++- Independently reviewed only Task 3 fix round 2 Q4 against the prior finding, its fix report/overlay, and the two changed frontend files.
++- Verdict: **Spec PASS / Quality PASS**. The refreshed first-page owner advances the generation, aborts obsolete pagination, restores readiness, and fences late stale settlement. The review reused the recorded 31 web tests / 2 files and web typecheck; it did not rerun broad validation.
++- Durable review: `docs/superpowers/reports/2026-09-15-hq-orca-operations-task3-fix2-review.md`.
++
++## Delivered behavior
++
++### Operator console
++
++- Added reviewed HQ new/continue/clarification forms with the route's 8,000-character limit, stable `request_<uuid>` idempotency IDs, a final review modal, Escape handling, initial focus, and focus restoration.
++- Added HQ clarification replies and native Orca question replies, exact-ID dispatch, worker follow-up, stop, retain, and release. Browser guards require the displayed exact task/run/terminal/Dispatch/incarnation, projection and PTY liveness where applicable, authoritative settlement, and owned/releasable resources; a server conflict refreshes authoritative detail.
++- `accepted` is explicitly presented as receipt-only, not completion. `unknown` becomes inspect-only, retains the same request identity, and offers no automatic retry or fresh-ID control.
++- Added work-list search while preserving source tabs, filters, paged logs, read-only startup capacity, unavailable metrics, and the rule that the native inbox has no authoritative HQ-owned pending state.
++
++### Gateway and launcher
++
++- Added `createOperationsAssets(root)`: startup indexes only `index.html` plus its referenced hashed Vite JavaScript/CSS. It rejects traversal encodings, symlinked roots/members, arbitrary files, unsafe asset names, missing index/assets, and partial builds. API/auth routes and `/health` remain ahead of SPA fallback; only extensionless non-API GET/HEAD routes receive the SPA.
++- Added `launchConsole()`: it claims a one-time URL through the owner `control.sock`, validates an exact loopback fragment URL, then invokes `/usr/bin/open` with one argv, `shell:false`, bounded output, and a deadline. The CLI does not print the claim.
++- Root `prepare` now orders core → Orca adapter → web → gateway → installer before the guarded global launcher registration. No dependency was added.
++- Mutation HTTP error handling now preserves journaled `rejected`/`unknown` receipts returned with 409/502. The frontend response parser now applies array element parsers without leaking `Array.map` indexes as optional length arguments.
++- Added an on-disk SQLite close/reopen regression for interrupted mutation intent; restart reloads it as `unknown` rather than rerunning the effect.
++
++### Root-suite regression repaired
++
++- The first root run reported 1,324 passing tests and one deterministic failure in `tests/e2e/context-progress.spec.ts`: a long Korean completion lost harmless trailing whitespace before compaction.
++- Root cause was Task 1's use of the normalized public display redactor for durable completion results. Added `redactPublicResultText`, sharing the same control/credential redaction and bounding while preserving safe result layout, and routed `publicProgressText` through it.
++- Focused unit and real-socket completion/compaction/idempotency tests passed before the single root-suite rerun. Credential, bearer token, private-key, GitHub token, AWS key, and control-sequence coverage remains green.
++
++## Validation evidence
++
++- `pnpm --filter @orca-hq/web test`: **37 passed / 2 files**.
++- `pnpm vitest run apps/gateway/test/operations-assets.test.ts apps/gateway/test/operations-http.test.ts apps/gateway/test/operations-journal.test.ts apps/gateway/test/operations-orca.test.ts apps/gateway/test/operations-service.test.ts apps/gateway/test/end-to-end.test.ts`: **62 passed / 6 files**.
++- `pnpm vitest run packages/installer/test/console.test.ts packages/installer/test/cli.test.ts packages/installer/test/documented-commands.test.ts`: **61 passed / 3 files**.
++- Web, gateway, and installer package typechecks passed during focused work.
++- `pnpm --filter @orca-hq/web test:e2e`: **4 passed**. The typed fake API covers all eight routes, source tabs, work search/filter, log paging, keyboard review/focus restoration, accepted copy, disabled capacity, and 1440/1280/390 layouts with no body overflow, console error, or external request.
++- Focused root-regression verification: `pnpm vitest run apps/gateway/test/progress-events.test.ts packages/core/test/public-output.test.ts tests/e2e/context-progress.spec.ts -t "preserves safe completion result layout|public output sanitizers|keeps a long Korean result and duplicate-request identity after completed detail is compacted" --reporter=dot`: **5 passed / 3 files**.
++- Final `pnpm test`: **1,326 passed / 104 files**.
++- Final `pnpm typecheck && pnpm build`: passed. Vite transformed 41 modules and emitted `apps/web/dist/index.html`, hashed `index-DFMuge9p.css`, and hashed `index-DywivQX8.js`; all 15 buildable workspace projects completed.
++- Isolated real-server/fake-port coverage exercised owner Unix claim → HTTP redemption → authenticated reads/mutations → SQLite journal replay, Origin/CSRF/idempotency/identity fences, captured typed Orca argv, and HQ reads without viewer-lease acquisition. No real Orca control was invoked.
++- Post-run checks found no listener on Playwright port 4173 and no matching Vite preview process. Both owned package-fixture directories were removed, while the workspace root remained mode 0755.
++
++## Screenshots
++
++- `screenshots/2026-09-15-operations-1440.png` — 1440×900.
++- `screenshots/2026-09-15-operations-1280.png` — 1280×800.
++- `screenshots/2026-09-15-operations-390.png` — 390×1465 full-page mobile capture.
++
++## Package/runtime asset proof
++
++- The repository remains an invitation-only source install, not a published npm/Homebrew package. A temp allowlisted fixture contained only the root manifest and built gateway/web/installer runtime trees; it did not contain project docs or protected planning material.
++- The first no-version probe failed before packing with `Invalid package, must have name and version`. After adding a fixture-only version, the first pack printed the root `prepare` command; `install-global.js` reached its existing-command conflict guard and explicitly refused to overwrite `/Users/j.jaeyo/.local/bin/hq`, so no launcher installation occurred.
++- The final fixture reran with `CI=true`. npm still printed the package `prepare` command, but `install-global.js`'s top-level CI guard skipped `installGlobalCommand`; all work occurred under `/tmp`, and no production install ran. The resulting 310-entry tarball contained `apps/web/dist/index.html`, both indexed hashed JS/CSS files, `apps/gateway/dist/operations-assets.js`, `packages/installer/dist/console.js`, and `packages/installer/bin/hq.js`.
++- This proves the source-runtime relative layout consumed by gateway (`apps/gateway/dist` → `apps/web/dist`) is present in the isolated artifact. It is not a claim that a public package distribution now exists.
++
++## Developer usage
++
++```bash
++pnpm build
++pnpm hq console
++```
++
++An installed source checkout may use `hq console`. The owner-socket claim expires after 60 seconds and is exchanged for the local browser session; do not copy or log the fragment. Treat `accepted` as pending observation and `unknown`/`unverifiable` as inspect-only.
++
++For development-only browser acceptance, use:
++
++```bash
++pnpm --filter @orca-hq/web test:e2e
++```
++
++The Playwright suite builds and previews on loopback with typed fake API routes; it does not contact a production gateway or Orca.
++
++## Limits and handoff
++
++- Capacity remains startup-only with default 10 and no write route. Tokens, cost, ETA, percent, and currency remain unavailable rather than fabricated.
++- The console is loopback, single-owner, and cookie/Origin/CSRF protected. Remote browser exposure, terminal send/close, arbitrary retry, viewer-lease control, and private Orca interfaces remain out of scope.
++- Browser E2E uses deterministic fake API data; the lower-level smoke uses a real isolated HTTP/Unix/SQLite stack with fake Orca/ports. Neither substitutes for Task 5's fresh integration/security/state review or a later invitation-only pilot on a separate machine.
++- No commit, push, worktree, dependency install, production restart, real Orca mutation, or production installation was performed. Owned temp package fixtures are removed after evidence capture.
++
++## Changed paths
++
++- Web: `apps/web/e2e/operations-console.spec.ts`, `src/{api.ts,api.test.ts,app.tsx,app.test.tsx,styles.css}`, `src/routes/{operations-compose,operations-detail,operations-list,operations-questions}.tsx`; deleted `e2e/mobile-dashboard.spec.ts`.
++- Gateway: `src/{managed-service,operations-assets}.ts`, `test/{end-to-end,managed-service,operations-assets,operations-journal}.test.ts`.
++- Installer/root/docs: `packages/installer/src/{cli,index,console}.ts`, `packages/installer/test/{cli,console,documented-commands}.test.ts`, root `package.json`, `README.md`, progress report, screenshots, this report, and the scoped overlay.
++- Focused regression: `packages/core/src/public-output.ts`, `apps/gateway/src/progress-events.ts`, and `apps/gateway/test/progress-events.test.ts`.
+
+```
+
+Binary acceptance artifacts (not embedded):
+
+- `screenshots/2026-09-15-operations-1440.png`
+- `screenshots/2026-09-15-operations-1280.png`
+- `screenshots/2026-09-15-operations-390.png`

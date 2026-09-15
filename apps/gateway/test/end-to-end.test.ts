@@ -166,6 +166,7 @@ class FakeOrcaBoundary {
       case "list_projects":
         return receipt("receipt-projects", { repos: [] });
     }
+    throw new Error(`unsupported fake Orca operation: ${operation.kind}`);
   }
 }
 

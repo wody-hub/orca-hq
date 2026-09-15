@@ -1,3 +1,5 @@
+import { OperationsOrca } from "./operations-orca.js";
+import { selectOrcaCliExecutable } from "./managed-projects.js";
 import { createHash } from "node:crypto";
 import type { ManagedCommandInput, CommandProject } from "./managed-commands.js";
 import type { ProgressStore } from "./progress-store.js";
@@ -132,6 +134,12 @@ export function resolveNativeExecutionSettings(
     retentionPolicy: native?.retentionPolicy ?? "retain",
     profiles: native?.roleProfiles ?? defaultNativeRoleProfiles
   };
+}
+
+export function resolveOperationsCapacity(config: Pick<PilotConfig, "nativeExecution">, env: Readonly<Partial<Record<"HQ_MAX_ACTIVE_WORKERS", string>>>) {
+  const { maxActiveWorkers: limit } = resolveNativeExecutionSettings(config, env);
+  const source = config.nativeExecution?.maxActiveWorkers !== undefined ? "config" as const : env.HQ_MAX_ACTIVE_WORKERS?.trim() ? "environment" as const : "default" as const;
+  return { limit, source };
 }
 
 /** Native composition shared by installed channels and isolated integration fixtures. */
@@ -386,6 +394,8 @@ export async function startManagedRuntime() {
   progress = composition.progress;
   native = composition.native;
   const progressControl = createProgressControl(progress);
+  const operationsAbort = new AbortController();
+  const operationsOrca = new OperationsOrca({ executablePath: selectOrcaCliExecutable(), signal: operationsAbort.signal });
   try {
     await catalog.list();
     const previous = openDatabase(config.databasePath);
@@ -420,6 +430,12 @@ export async function startManagedRuntime() {
       initialCursors,
       owner,
       progress: progressControl,
+      operations: {
+        store: progressStore,
+        submit: input => progress!.submit(input),
+        orca: operationsOrca,
+        capacity: { ...resolveOperationsCapacity(config, process.env), snapshot: () => admission.snapshot(), attempts: () => admission.listAttempts() }
+      },
       beforeReady: async () => {
         await engine.start();
         await native!.start();
@@ -440,6 +456,7 @@ export async function startManagedRuntime() {
     });
     return {
       async stop() {
+        operationsAbort.abort();
         await Promise.all([client.close(), routerClient.close()]);
         await native?.close();
         await progress?.close();
@@ -450,6 +467,7 @@ export async function startManagedRuntime() {
       },
     };
   } catch (e) {
+    operationsAbort.abort();
     await Promise.all([client.close(), routerClient.close()]);
     await native?.close();
     await progress?.close();

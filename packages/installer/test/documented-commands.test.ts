@@ -106,6 +106,7 @@ function fakeDependencies(calls: string[], lines: string[]): CliDependencies {
       uninstall: async () => undefined
     },
     readiness: { waitForRunning: async () => ({ ready: true }) },
+    consoleLauncher: async () => { calls.push("console"); return { url: `http://127.0.0.1:4310/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" }; },
     lifecycle: fakeLifecycle(calls)
   };
 }
@@ -160,6 +161,7 @@ it("validates every documented hq command's full argv without external side effe
     "pnpm hq doctor --format json",
     "pnpm hq start",
     "pnpm hq status",
+    "pnpm hq console",
     "pnpm hq update --revision <full-commit-sha>",
     "pnpm hq uninstall --remove-data"
   ]));

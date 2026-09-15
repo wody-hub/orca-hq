@@ -1,15 +1,8 @@
 import { redactRelayText } from "./orca-relay.js";
+import { redactPublicResultText } from "@orca-hq/core";
 import type { CommandJob } from "./managed-commands.js";
 export function publicProgressText(text: string): string {
-  return redactRelayText(text)
-    .replace(
-      /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gu,
-      "[REDACTED]",
-    )
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
-    .replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/gu, "[REDACTED]")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/gu, "")
-    .slice(0, 14000);
+  return redactPublicResultText(redactRelayText(text)).slice(0, 14000);
 }
 export function nativeContextState(
   jobs: CommandJob[],

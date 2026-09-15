@@ -1,0 +1,204 @@
+--- a/apps/gateway/src/operations-http.ts
++++ b/apps/gateway/src/operations-http.ts
+@@ -135,7 +135,9 @@
+           .object({ claim: z.string().regex(/^[A-Za-z0-9_-]{43}$/) })
+           .strict()
+           .parse(body);
+-        if (!this.claims.delete(claim))
++        const claimDeadline = this.claims.get(claim);
++        // No await between checking the deadline and consuming this claim.
++        if (!this.claims.delete(claim) || claimDeadline === undefined || claimDeadline <= this.now())
+           throw new OperationsError(401, "claim_expired");
+         if (this.sessions.size >= 100)
+           throw new OperationsError(429, "session_limit");
+@@ -158,7 +160,10 @@
+         cookies.length === 1
+           ? this.sessions.get(cookies[0]!.slice(14))
+           : undefined;
+-      if (!session) throw new OperationsError(401, "session_required");
++      // Body consumption may have crossed the deadline since the initial prune.
++      // Authentication through refresh/route invocation below is synchronous.
++      if (!session || session.expiresAt <= this.now())
++        throw new OperationsError(401, "session_required");
+       if (
+         mutation &&
+         (typeof req.headers["x-csrf-token"] !== "string" ||
+--- a/apps/gateway/src/operations-service.ts
++++ b/apps/gateway/src/operations-service.ts
+@@ -135,7 +135,7 @@
+     return {
+       source: "hq",
+       questions,
+-      cursor: String(page.events.at(-1)?.seq ?? 0),
++      cursor: String(page.events.at(-1)?.seq ?? Math.max(after, page.latestSeq)),
+       compacted: page.compacted,
+     };
+   }
+--- a/apps/gateway/test/operations-http.test.ts
++++ b/apps/gateway/test/operations-http.test.ts
+@@ -1,6 +1,52 @@
+-import { createServer, request } from "node:http";
++import { createServer, request, type IncomingMessage, type ServerResponse } from "node:http";
+ import { it, expect } from "vitest";
+ import { OperationsHttp } from "../src/operations-http.js";
++
++it.each(["claim", "mutation", "refresh"] as const)("rejects %s expiry during asynchronous body delivery", async (action) => {
++  let now = 1000, effects = 0;
++  const origin = "http://127.0.0.1:4310";
++  const http = new OperationsHttp({ now: () => now, route: async () => { effects++; return { state: "accepted" }; } });
++  http.setOrigin(origin);
++  const call = async (path: string, body: unknown, headers: Record<string, string> = {}, advance = 0) => {
++    const result = { status: 0, body: "", headers: {} as Record<string, string> };
++    const req = {
++      url: path, method: "POST", socket: { remoteAddress: "127.0.0.1" },
++      headers: { host: "127.0.0.1:4310", origin, "content-type": "application/json", ...headers },
++      async *[Symbol.asyncIterator]() {
++        await Promise.resolve();
++        now += advance;
++        yield Buffer.from(JSON.stringify(body));
++      },
++    } as unknown as IncomingMessage;
++    const res = {
++      writableEnded: false,
++      setHeader(name: string, value: string) { result.headers[name] = value; },
++      writeHead(status: number) { result.status = status; },
++      end(this: { writableEnded: boolean }, body: string) { result.body = body; this.writableEnded = true; },
++    } as unknown as ServerResponse;
++    await http.handle(req, res);
++    return result;
++  };
++  try {
++    const claim = new URL(http.issueClaim().url).hash.slice(7);
++    if (action === "claim") {
++      const expired = await call("/auth/local/claim", { claim }, {}, 60000);
++      expect(expired.status).toBe(401);
++      expect(JSON.parse(expired.body)).toEqual({ error: "claim_expired" });
++      expect(expired.headers["Set-Cookie"]).toBeUndefined();
++      expect((await call("/auth/local/claim", { claim })).status).toBe(401);
++    } else {
++      const session = await call("/auth/local/claim", { claim });
++      expect(session.status).toBe(200);
++      const headers = { cookie: session.headers["Set-Cookie"]!, "x-csrf-token": JSON.parse(session.body).csrf as string, "idempotency-key": "request" };
++      const expired = await call(action === "refresh" ? "/auth/local/refresh" : "/api/operations/hq/requests", {}, headers, 1800000);
++      expect(expired.status).toBe(401);
++      expect(JSON.parse(expired.body)).toEqual({ error: "session_required" });
++      expect(expired.headers["Set-Cookie"]).toBeUndefined();
++    }
++    expect(effects).toBe(0);
++  } finally { http.close(); }
++});
+ it("fences peer, host, origin, single-use claim, session/CSRF and body size", async () => {
+   let now = 1000,
+     effects = 0;
+--- a/apps/gateway/test/operations-service.test.ts
++++ b/apps/gateway/test/operations-service.test.ts
+@@ -610,6 +610,33 @@
+     f.close();
+   }
+ });
++it.each([false, true])("keeps exhausted question cursors monotonic with compaction=%s", (compact) => {
++  const f = fixture();
++  try {
++    f.store.acceptRequest({ requestId: "r", sessionId: "s", text: "work" });
++    f.store.updateRequest({ requestId: "r", state: "awaiting_input" });
++    f.store.appendEvent({ requestId: "r", contextId: null, eventKey: "q", kind: "clarification.required", source: "hq", occurredAt: "2026-07-01T00:00:00.000Z", payload: { text: "Which project?" } });
++    if (compact) {
++      f.store.completeRequest({ requestId: "r", eventKey: "complete", state: "completed", text: "done", occurredAt: "2026-07-01T00:00:01.000Z" });
++      f.store.pruneCompletedEvents("2026-08-01T00:00:00.000Z");
++    }
++    const history = f.store.readEvents({ after: 0, limit: 100 });
++    expect(history.compacted).toBe(compact);
++    let after = 0, seen = 0;
++    for (let i = 0; i < 10; i++) {
++      const page = f.service.questions(after, 1);
++      const next = Number(page.cursor);
++      expect(next).toBeGreaterThanOrEqual(after);
++      seen += page.questions.length;
++      if (next === after) break;
++      after = next;
++    }
++    expect(after).toBe(history.latestSeq);
++    expect(seen).toBe(compact ? 0 : 1);
++    for (let i = 0; i < 3; i++)
++      expect(f.service.questions(after, 1)).toMatchObject({ questions: [], cursor: String(after) });
++  } finally { f.close(); }
++});
+ it("turns public source_changed into a conflict instead of an empty log page", async () => {
+   const f = fixture();
+   try {
+--- a/packages/test-support/src/fake-agents.ts
++++ b/packages/test-support/src/fake-agents.ts
+@@ -127,6 +127,7 @@
+       case "list_projects":
+         return receipt("receipt-projects", { repos: [] });
+     }
++    throw new Error(`unsupported scripted Orca operation: ${operation.kind}`);
+   }
+ }
+ 
+--- /dev/null
++++ b/packages/test-support/test/fake-agents.test.ts
+@@ -0,0 +1,11 @@
++import { expect, it } from "vitest";
++import { LaunchOrca } from "../src/fake-agents.js";
++
++it.each([
++  { kind: "operations_status" } as const,
++  { kind: "operations_show_worker", dispatchId: "dispatch" } as const,
++])("explicitly rejects unsupported $kind without breaking legacy operations", async (operation) => {
++  const orca = new LaunchOrca();
++  await expect(orca.execute(operation)).rejects.toThrow(`unsupported scripted Orca operation: ${operation.kind}`);
++  expect(await orca.execute({ kind: "list_projects" })).toEqual({ id: "receipt-projects", ok: true, result: { repos: [] } });
++});
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-task2.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-task2.md
+@@ -1,6 +1,6 @@
+ # Task 2 — Trusted local operations bridge
+ 
+-Status: implemented; independent review pending. Task 1 final Spec/Quality review is complete/PASS.
++Status: fix round 1 implemented and verified; independent re-review pending. Task 1 final Spec/Quality review is complete/PASS; Task 3 remains pending.
+ 
+ ## Constructor and runtime wiring
+ 
+@@ -70,7 +70,17 @@
+ 
+ - TDD regressions cover journal duplicates/collision/recovery, owner auth, real listener/socket/DB wiring, lease coexistence, native answer routing, capability/runtime/incarnation replacement, exact-worker denial matrix, ambiguous receipts, source tags, redaction, paging/compaction/receipt links, cursor bounds, and bounded inventory. All control effects use fake ports or fake executable fixtures; no real agent was mutated.
+ - Final focused + impacted run: **11 files, 110 tests passed** (four new operations tests plus managed-control/service/runtime/progress-control and adapter operations/capabilities/process).
+-- Gateway source typecheck passed; adapter build/source check passed; direct strict NodeNext checks passed for new/changed gateway tests. Adapter operations tests now import only fake-orca, avoiding the unrelated test-support barrel's pre-existing non-exhaustive legacy fake-agent switch; the focused adapter test typecheck also passed. The 37 affected adapter/managed tests passed again after import cleanup and formatting.
++- Gateway source typecheck passed; adapter build/source check passed; direct strict NodeNext checks passed for new/changed gateway tests. The 37 affected adapter/managed tests passed again after import cleanup and formatting. Correction: the test-support switch was exhaustive against HEAD's eight operation variants; expanded `OrcaOperation` variants caused TS2366, and importing fake-orca directly only bypassed that integration regression. Fix round 1 resolves it below.
+ - A failed initial `openProgressStore(:memory:)` test setup chmodded cwd to 0700. Replaced by direct in-memory store construction; restored only cwd to **0755** using the coordinator's recorded pre-task baseline (`msg_aa9be57f3582`) and verified it. No recursive permission change.
+-- No commit, push, install, restart, protected-document access, or UI/installer edits. Task 3/4 still provide SPA and launcher. Independent Task 2 review is next; no claim of broader repository typecheck coverage.
++- No commit, push, install, restart, protected-document access, or UI/installer edits. Task 3/4 still provide SPA and launcher. Independent Task 2 re-review is next; no claim of broader repository typecheck coverage.
+ - `task2.diff` is generated from explicit pre-edit snapshots of exact owned paths (including new files); it excludes protected documents and unrelated existing edits. The progress report marks Task 1 reviewed and Task 2 review-ready.
++
++## Fix round 1 — R1/R2/R3
++
++- R1: claim redemption compares the deadline after asynchronous body parsing, with synchronous single-use consumption; session authentication also checks the current deadline after body parsing, with no await before refresh or route invocation. Delayed-body claim, write, and refresh tests each reject at the exact expiry boundary without issuing a cookie or invoking a route.
++- R2: empty question pages preserve `after`, advancing to the store's latest sequence when compaction removed later events. Retained pages remain sequential; normal and compacted fixtures verify exhaustion, monotonic cursors, current-question filtering, and three repeated empty polls.
++- R3: legacy `LaunchOrca.execute` retains all eight existing cases and explicitly rejects unsupported operations instead of resolving undefined. Two new operation variants exercise rejection, with a subsequent legacy read proving continued operation; existing pilot/provider-failure consumers pass.
++- Red phase: **7 new cases failed for the expected defects; 41 existing cases passed**. Green: **48 tests / 3 files passed** (`operations-http`, `operations-service`, new `fake-agents`); **26 tests / 5 files passed** (`operations-journal`, `operations-orca`, `managed-service`, `provider-failures`, `private-pilot`). Total: **74 tests / 8 files**, including **7 new cases**.
++- `pnpm exec tsc -p apps/gateway/tsconfig.json --noEmit --pretty false` and the equivalent `packages/test-support/tsconfig.json` check passed. Direct strict NodeNext checks passed for the three changed/new test files after correcting a test-helper `this` annotation; the HTTP file's **4 tests passed again** afterward.
++- `task2-fix1.diff` records only this round's eight owned paths from explicit pre-edit snapshots at `/var/folders/0c/w6zr1lls7nggx4f19l5dxf4h0000gn/T/orca-task2-fix1-06wnbf_2`. Original Task 2 snapshot metadata was not supplied to this round, so `task2.diff` remains the original implementation artifact; consume it together with `task2-fix1.diff`.
++- R1/R2/R3 are implemented; the historical BLOCK review remains intact for independent re-review. Task 3 has not started.
+--- a/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
++++ b/docs/superpowers/reports/2026-09-15-hq-orca-operations-progress.md
+@@ -1,10 +1,12 @@
+ # HQ + Orca Operations Console Planning Progress
+ 
+ - Date: 2026-09-15 KST
+-- Status: Task 1 final Spec/Quality review PASS; Task 2 implemented and verified; independent Task 2 review pending
++- Status: Task 1 final Spec/Quality review PASS; Task 2 fix round 1 implemented and verified; independent re-review pending; Task 3 pending
+ - Plan: `docs/superpowers/plans/2026-09-15-hq-orca-operations-implementation.md`
+ 
+ ## Completed
++
++- Task 2 fix round 1 resolves review R1/R2/R3: delayed-body expiry rejection, monotonic exhausted/compacted question cursors, and explicit legacy-fake rejection for added operations. Seven new cases failed before fixes; 74 targeted/affected tests passed afterward, gateway/test-support and strict changed-test typechecks passed, and four HTTP tests passed again after a test-helper annotation fix. See the updated Task 2 report and `2026-09-15-hq-orca-operations-task2-fix1.diff`; independent re-review is next and Task 3 remains pending.
+ 
+ - Task 2 independent review: **Spec BLOCK / Quality BLOCK** in `2026-09-15-hq-orca-operations-task2-review.md`; fix expiry after asynchronous body reads and exhausted HQ-question cursor reset. Exact-HEAD evidence and a fresh TS2366 check identify the legacy fake-agent issue as an expanded-operation-union integration regression, tracked separately; recorded 110+37 passing tests remain valid within their stated scope.
+ 
+@@ -34,4 +36,4 @@
+ 
+ ## Ready State
+ 
+-Task 1 final fix-round-2 review passed both Spec and Quality. Task 2 is implemented with 110 focused/impacted passing tests and gateway typecheck; its independent review is next before Task 3 consumes the finalized route matrix in `2026-09-15-hq-orca-operations-task2.md`. Task 5 still requires a fresh reviewer.
++Task 1 final fix-round-2 review passed both Spec and Quality. Task 2 fix round 1 addresses all three independent-review findings with 74 targeted/affected passing tests and gateway/test-support typechecks; independent re-review is next before Task 3 consumes the route matrix in `2026-09-15-hq-orca-operations-task2.md`. Task 3 remains pending; Task 5 still requires a fresh reviewer.

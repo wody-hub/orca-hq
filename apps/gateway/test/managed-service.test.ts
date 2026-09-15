@@ -1,5 +1,5 @@
 import { request } from "node:http";
-import { mkdtemp,rm } from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
+import { mkdir,mkdtemp,rm,writeFile } from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
 import { openDatabase } from '@orca-hq/persistence';
 import {describe,it,expect,vi} from 'vitest';
 import {startManagedService} from '../src/managed-service.js';
@@ -92,4 +92,115 @@ it('separates channel, owner, destination and thread conversations while retaini
   await vi.waitFor(()=>expect(seen).toHaveLength(5),{timeout:2500});
   expect(seen.map(input=>input.conversationId)).toEqual(['["slack","owner","C1","thread1"]','["slack","owner","C1","thread1"]','["slack","owner","C1","thread2"]','["slack","owner","C2","thread1"]','["telegram","42","C1","thread1"]']);
  }finally{await service.stop();await rm(dir,{recursive:true,force:true});}
+});
+
+it("wires owner socket claims to the same loopback listener and journals real HQ route submissions", async () => {
+  const { request } = await import("node:http");
+  const { SqliteProgressStore } = await import("../src/progress-store.js");
+  const store = new SqliteProgressStore(openDatabase(":memory:"), {
+    databasePath: ":memory:",
+    ownerKey: "local",
+  });
+  const dir = await mkdtemp(join(tmpdir(), "operations-managed-"));
+  const web = join(dir, "web");
+  await mkdir(join(web, "assets"), { recursive: true });
+  await writeFile(join(web, "index.html"), '<!doctype html><script type="module" src="/assets/index-a1b2c3d4.js"></script>');
+  await writeFile(join(web, "assets/index-a1b2c3d4.js"), "globalThis.__hq=true");
+  const submit = vi.fn(async () => ({ accepted: true }));
+  const service = await startManagedService({
+    directory: dir,
+    databasePath: join(dir, "control.sqlite"),
+    port: 0,
+    operationsAssetsRoot: web,
+    owner: { slackUserId: "x", telegramUserId: "y" },
+    execute: async () => ({ text: "ok" }),
+    getJob: () => undefined,
+    channelFactory: () => ({
+      start: async () => {},
+      stop: async () => {},
+      send: async () => {},
+      status: () => ({ slack: true, telegram: true }),
+    }),
+    operations: {
+      store,
+      submit,
+      orca: {
+        execute: async () => {
+          throw Error("unavailable");
+        },
+      },
+      capacity: {
+        limit: 10,
+        source: "default",
+        snapshot: () => ({ active: 0, queued: 0 }),
+        attempts: () => [],
+      },
+    },
+  });
+  try {
+    const claim = await new Promise<{ url: string }>((resolve) => {
+      const r = request(
+        {
+          socketPath: join(dir, "control.sock"),
+          path: "/v1/operations/session",
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        },
+        (res) => {
+          let text = "";
+          res.on("data", (c) => (text += c));
+          res.on("end", () => resolve(JSON.parse(text)));
+        },
+      );
+      r.end("{}");
+    });
+    const url = new URL(claim.url),
+      origin = url.origin;
+    expect(origin).toBe(`http://127.0.0.1:${service.port}`);
+    const consolePage = await fetch(origin + "/work/orca/dispatch-1");
+    expect(consolePage.status).toBe(200);
+    expect(consolePage.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const protectedMiss = await fetch(origin + "/api/operations/missing");
+    expect(protectedMiss.status).toBe(401);
+    expect(protectedMiss.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    const auth = await fetch(origin + "/auth/local/claim", {
+      method: "POST",
+      headers: { origin, "content-type": "application/json" },
+      body: JSON.stringify({ claim: url.hash.slice(7) }),
+    });
+    expect(auth.status).toBe(200);
+    const { csrf } = (await auth.json()) as { csrf: string };
+    const headers = {
+      origin,
+      "content-type": "application/json",
+      cookie: auth.headers.get("set-cookie")!,
+      "x-csrf-token": csrf,
+      "idempotency-key": "request",
+    };
+    for (let i = 0; i < 2; i++) {
+      const r = await fetch(origin + "/api/operations/hq/requests", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          requestId: "request",
+          sessionId: "s",
+          text: "work",
+        }),
+      });
+      expect(r.status).toBe(202);
+    }
+    expect(submit).toHaveBeenCalledTimes(1);
+    const db = openDatabase(join(dir, "control.sqlite"));
+    try {
+      expect(
+        db.prepare("SELECT state FROM operations_mutation_receipts").get(),
+      ).toEqual({ state: "accepted" });
+    } finally {
+      db.close();
+    }
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

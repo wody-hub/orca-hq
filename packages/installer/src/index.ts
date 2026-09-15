@@ -1,6 +1,7 @@
 export * from "./backup.js";
 export * from "./cli.js";
 export * from "./config-files.js";
+export * from "./console.js";
 export * from "./doctor.js";
 export * from "./host.js";
 export * from "./keychain.js";

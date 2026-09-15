@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { runCli, type HostAdapters } from "../src/cli.js";
 import type { ControlClient } from "../src/control.js";
@@ -143,6 +143,16 @@ describe("hq command-line contract", () => {
 
     expect(texts).toEqual(["현재 상태는?"]);
     expect(stdout.lines).toEqual(["현재 깨끗합니다.\n"]);
+  });
+
+  it("opens the local operations console only through the injected owner-socket launcher", async () => {
+    // Break caught: the CLI can print or construct a browser URL instead of delegating claim ownership to the secure launcher.
+    const stdout = output();
+    const consoleLauncher = vi.fn().mockResolvedValue({ url: `http://127.0.0.1:4310/#claim=${"a".repeat(43)}`, expiresAt: "2026-09-15T09:01:00.000Z" });
+    await expect(runCli(["console"], { stdout, consoleLauncher })).resolves.toBe(0);
+    expect(consoleLauncher).toHaveBeenCalledOnce();
+    expect(stdout.lines.join("")).toContain("브라우저에서 운영 콘솔을 열었습니다");
+    expect(stdout.lines.join("")).not.toContain("#claim=");
   });
 
   it.each([

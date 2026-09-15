@@ -78,6 +78,7 @@ async function removeStale(path: string): Promise<void> {
 export async function startManagedControl(options: {
   socketPath: string;
   execute(input: ManagedCommandInput): Promise<ManagedCommandResult>;
+  operations?: { issueClaim(): { url: string; expiresAt: string } };
   progress?: {
     handle(req: IncomingMessage, res: ServerResponse): Promise<boolean>;
     close(): void;
@@ -92,6 +93,16 @@ export async function startManagedControl(options: {
     if (!accepting) {
       res.writeHead(503);
       res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/operations/session") {
+      if (!options.operations) { res.writeHead(503); res.end('{"error":"operations_unavailable"}'); return; }
+      try {
+        let body = "";
+        for await (const chunk of req) { body += String(chunk); if (Buffer.byteLength(body) > 16384) { res.writeHead(413); res.end("{}"); return; } }
+        z.object({}).strict().parse(JSON.parse(body || "{}"));
+        res.writeHead(200); res.end(JSON.stringify(options.operations.issueClaim()));
+      } catch { res.writeHead(400); res.end("{}"); }
       return;
     }
     if (options.progress && (await options.progress.handle(req, res))) return;

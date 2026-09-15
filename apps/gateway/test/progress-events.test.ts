@@ -41,3 +41,8 @@ it("only exposes allowlisted tool metadata and redacts credentials/control seque
   ).not.toContain("abcdefghijkl");
   expect(publicProgressText("token=abc")).not.toContain("abc");
 });
+it("preserves safe completion result layout", () => {
+  // Break caught: public redaction must not rewrite harmless whitespace in the durable result.
+  const result = "검토 결과입니다. \n".repeat(1000);
+  expect(publicProgressText(result)).toBe(result);
+});

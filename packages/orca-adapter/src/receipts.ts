@@ -196,6 +196,206 @@ function successReceiptSchema<Result extends z.ZodTypeAny>(result: Result) {
   }).strict();
 }
 
+const BoundedIdSchema = z.string().trim().min(1).max(512);
+const BoundedTextSchema = z.string().max(64 * 1024);
+const CursorSchema = z.string().trim().min(1).max(2048);
+const NullableCursorSchema = CursorSchema.nullable().optional();
+const MutationSchema = z.object({ requestId: BoundedIdSchema, replayed: z.boolean() }).passthrough();
+const RunSchema = z.object({ id: BoundedIdSchema, objective: BoundedTextSchema }).passthrough();
+const TaskSchema = z.object({ id: BoundedIdSchema, status: OrcaStateSchema }).passthrough();
+const ProjectionSchema = z.object({
+  dispatchId: BoundedIdSchema,
+  taskId: BoundedIdSchema,
+  runId: BoundedIdSchema,
+  liveness: z.object({ verdict: OrcaStateSchema }).passthrough()
+}).passthrough();
+const WorkerListSchema = z.object({ dispatchId: BoundedIdSchema, projection: ProjectionSchema }).passthrough();
+const InboxMessageSchema = z.object({
+  id: BoundedIdSchema,
+  type: OrcaStateSchema,
+  subject: BoundedTextSchema,
+  body: BoundedTextSchema
+}).passthrough();
+const ProjectSchema = z.object({ id: BoundedIdSchema, displayName: BoundedTextSchema, kind: OrcaStateSchema }).passthrough();
+const SetupSchema = z.object({
+  id: BoundedIdSchema,
+  projectId: BoundedIdSchema,
+  hostId: BoundedIdSchema,
+  repoId: BoundedIdSchema,
+  path: BoundedTextSchema
+}).passthrough();
+const WorktreeSchema = z.object({
+  id: BoundedIdSchema,
+  repoId: BoundedIdSchema,
+  projectId: BoundedIdSchema,
+  hostId: BoundedIdSchema,
+  projectHostSetupId: BoundedIdSchema,
+  path: BoundedTextSchema
+}).passthrough();
+const TerminalSchema = z.object({
+  handle: BoundedIdSchema,
+  incarnationId: BoundedIdSchema,
+  worktreeId: BoundedIdSchema,
+  connected: z.boolean(),
+  writable: z.boolean(),
+  executionHostId: BoundedIdSchema
+}).passthrough();
+const HostScopeSchema = z.object({
+  hostIds: z.array(BoundedIdSchema).max(100),
+  omittedHostIds: z.array(BoundedIdSchema).max(100)
+}).passthrough();
+const DispatchResultSchema = z.object({
+  dispatchId: BoundedIdSchema,
+  taskId: BoundedIdSchema,
+  runId: BoundedIdSchema,
+  mutation: MutationSchema.optional()
+}).passthrough();
+// Public Orca 1.4.203 reply receipt: message.thread_id identifies the replied-to message.
+const OperationsMessageSchema = InboxMessageSchema.extend({
+  type: BoundedIdSchema,
+  run_id: BoundedIdSchema,
+  from_handle: BoundedIdSchema,
+  to_handle: BoundedIdSchema,
+  thread_id: BoundedIdSchema.nullable(),
+  created_at: z.string().datetime()
+});
+const MessageMutationResultSchema = z.object({
+  message: OperationsMessageSchema,
+  mutation: MutationSchema
+}).passthrough();
+const ReplyQuestionSchema = z.object({
+  message_id: BoundedIdSchema,
+  run_id: BoundedIdSchema,
+  dispatch_id: BoundedIdSchema,
+  asker_handle: BoundedIdSchema,
+  status: z.literal("answered"),
+  answer_message_id: BoundedIdSchema,
+  answer_body: BoundedTextSchema,
+  answered_by_generation: z.number().int().positive(),
+  created_at: z.string().datetime(),
+  answered_at: z.string().datetime(),
+  closed_at: z.string().datetime().nullable()
+}).passthrough();
+const ReplyMutationResultSchema = z.object({
+  message: OperationsMessageSchema.extend({ thread_id: BoundedIdSchema }),
+  question: ReplyQuestionSchema.nullish(),
+  duplicate: z.boolean(),
+  mutation: MutationSchema
+}).passthrough();
+const OperationsStateSchema = z.string().trim().min(1).max(512);
+const OperationsWorkerReadBaseSchema = z.object({
+  dispatchId: BoundedIdSchema,
+  cursor: CursorSchema,
+  status: z.object({ worker: OperationsStateSchema, terminal: OperationsStateSchema }).passthrough(),
+  warnings: z.array(BoundedTextSchema).max(100),
+  archived: z.boolean()
+}).passthrough();
+const OperationsWorkerReadResultSchema = z.discriminatedUnion("source", [
+  OperationsWorkerReadBaseSchema.extend({
+    source: z.literal("transcript"),
+    terminal: z.never().optional(),
+    transcript: z.object({
+      messages: z.array(z.object({
+        id: BoundedIdSchema,
+        role: OperationsStateSchema,
+        blocks: z.array(z.object({}).passthrough().refine(
+          (block) => JSON.stringify(block).length <= 64 * 1024,
+          "transcript block exceeds public text bound"
+        )).max(500),
+        timestamp: z.number().finite(),
+        source: OperationsStateSchema
+      }).passthrough()).max(500),
+      limited: z.boolean(),
+      nextCursor: CursorSchema,
+      returnedMessageCount: z.number().int().nonnegative().max(500)
+    }).passthrough()
+  }),
+  OperationsWorkerReadBaseSchema.extend({
+    source: z.literal("terminal"),
+    transcript: z.never().optional(),
+    terminal: z.object({
+      lines: z.array(BoundedTextSchema).max(500),
+      limited: z.boolean(),
+      nextCursor: CursorSchema
+    }).passthrough()
+  })
+]);
+const WorkerMutationResultSchema = z.object({
+  dispatchId: BoundedIdSchema,
+  state: OperationsStateSchema,
+  verdict: OperationsStateSchema,
+  mutation: MutationSchema.optional()
+}).passthrough();
+
+const operationsReceiptSchemas = {
+  operations_show_worker: successReceiptSchema(z.object({
+    dispatch: z.object({ id: BoundedIdSchema, runId: BoundedIdSchema, taskId: BoundedIdSchema, status: OperationsStateSchema, processIncarnation: BoundedIdSchema.nullable().optional() }).passthrough(),
+    worker: z.object({ dispatchId: BoundedIdSchema, state: OperationsStateSchema, stage: OperationsStateSchema, agentTerminalHandle: BoundedIdSchema.nullable() }).passthrough(),
+    projection: ProjectionSchema,
+    observation: z.object({ status: OperationsStateSchema, exactWorker: z.boolean() }).passthrough(),
+    terminal: TerminalSchema.nullable(),
+    terminalResource: z.object({ id: BoundedIdSchema, ownershipState: OperationsStateSchema, releaseState: OperationsStateSchema }).passthrough()
+  }).passthrough()),
+  operations_status: OrcaStatusReceiptSchema,
+  list_runs: successReceiptSchema(z.object({ runs: z.array(RunSchema).max(100), nextCursor: NullableCursorSchema }).passthrough()),
+  show_run: successReceiptSchema(z.object({ run: RunSchema }).passthrough()),
+  list_tasks: successReceiptSchema(z.object({ tasks: z.array(TaskSchema).max(100) }).passthrough()),
+  list_workers: successReceiptSchema(z.object({
+    workers: z.array(WorkerListSchema).max(100),
+    page: z.object({ limit: z.number().int().positive().max(100), hasMore: z.boolean(), nextCursor: NullableCursorSchema }).passthrough(),
+    scope: z.object({ source: OrcaStateSchema }).passthrough()
+  }).passthrough()),
+  operations_worker_read: successReceiptSchema(OperationsWorkerReadResultSchema),
+  operations_inbox: successReceiptSchema(z.object({ messages: z.array(InboxMessageSchema).max(100), count: z.number().int().nonnegative() }).passthrough()),
+  operations_list_projects: successReceiptSchema(z.object({ projects: z.array(ProjectSchema).max(100) }).passthrough()),
+  list_project_setups: successReceiptSchema(z.object({ setups: z.array(SetupSchema).max(100) }).passthrough()),
+  list_worktrees: successReceiptSchema(z.object({ worktrees: z.array(WorktreeSchema).max(100), hostScope: HostScopeSchema, totalCount: z.number().int().nonnegative(), truncated: z.boolean() }).passthrough()),
+  show_worktree: successReceiptSchema(z.object({ worktree: WorktreeSchema }).passthrough()),
+  list_terminals: successReceiptSchema(z.object({ terminals: z.array(TerminalSchema).max(100), hostScope: HostScopeSchema, totalCount: z.number().int().nonnegative(), truncated: z.boolean() }).passthrough()),
+  show_terminal: successReceiptSchema(z.object({ terminal: TerminalSchema }).passthrough()),
+  read_terminal: successReceiptSchema(z.object({ terminal: z.object({
+    handle: BoundedIdSchema,
+    status: OrcaStateSchema,
+    tail: z.array(BoundedTextSchema).max(500),
+    truncated: z.boolean(),
+    limited: z.boolean(),
+    nextCursor: CursorSchema,
+    source: OrcaStateSchema
+  }).passthrough() }).passthrough()),
+  operations_dispatch: successReceiptSchema(DispatchResultSchema),
+  operations_reply: successReceiptSchema(ReplyMutationResultSchema),
+  operations_send: successReceiptSchema(MessageMutationResultSchema),
+  operations_stop: successReceiptSchema(WorkerMutationResultSchema),
+  operations_retain: successReceiptSchema(WorkerMutationResultSchema),
+  operations_release: successReceiptSchema(WorkerMutationResultSchema)
+} as const;
+
+export type OrcaOperationsReceiptKind = keyof typeof operationsReceiptSchemas;
+export const OrcaOperationsReceiptSchema = z.union([
+  operationsReceiptSchemas.operations_show_worker,
+  operationsReceiptSchemas.operations_status,
+  operationsReceiptSchemas.list_runs,
+  operationsReceiptSchemas.show_run,
+  operationsReceiptSchemas.list_tasks,
+  operationsReceiptSchemas.list_workers,
+  operationsReceiptSchemas.operations_worker_read,
+  operationsReceiptSchemas.operations_inbox,
+  operationsReceiptSchemas.operations_list_projects,
+  operationsReceiptSchemas.list_project_setups,
+  operationsReceiptSchemas.list_worktrees,
+  operationsReceiptSchemas.show_worktree,
+  operationsReceiptSchemas.list_terminals,
+  operationsReceiptSchemas.show_terminal,
+  operationsReceiptSchemas.read_terminal,
+  operationsReceiptSchemas.operations_dispatch,
+  operationsReceiptSchemas.operations_reply,
+  operationsReceiptSchemas.operations_send,
+  operationsReceiptSchemas.operations_stop,
+  operationsReceiptSchemas.operations_retain,
+  operationsReceiptSchemas.operations_release
+]);
+export type OrcaOperationsReceipt = z.infer<typeof OrcaOperationsReceiptSchema>;
+
 export const OrcaCreateRunReceiptSchema = successReceiptSchema(OrcaRunResultSchema);
 export const OrcaCreateTaskReceiptSchema = successReceiptSchema(OrcaTaskResultSchema);
 export const OrcaStartWorkerReceiptSchema = successReceiptSchema(OrcaWorkerStartResultSchema);
@@ -266,6 +466,14 @@ function invalidReceipt(): never {
 
 export function parseOrcaReceipt(value: unknown): OrcaReceiptEnvelope {
   const parsed = OrcaReceiptSchema.safeParse(value);
+  return parsed.success ? parsed.data : invalidReceipt();
+}
+
+export function parseOrcaOperationsReceipt(
+  kind: OrcaOperationsReceiptKind,
+  value: unknown
+): OrcaOperationsReceipt {
+  const parsed = operationsReceiptSchemas[kind].safeParse(value);
   return parsed.success ? parsed.data : invalidReceipt();
 }
 
