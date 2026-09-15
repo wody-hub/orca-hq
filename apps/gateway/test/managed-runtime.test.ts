@@ -2,6 +2,21 @@ import { describe, expect, it } from "vitest";
 import { createObservedJobListReader } from "../src/managed-runtime.js";
 import type { CommandJob } from "../src/managed-commands.js";
 
+/**
+ * A test that closes the runtime while an `execute` is still polling deliberately abandons that
+ * promise. Tracking it here keeps shutdown from surfacing as an unhandled rejection that would
+ * poison unrelated test files, and still asserts the abandoned call failed *because of shutdown*
+ * rather than for some real reason the test would otherwise have hidden.
+ */
+function abandonedOnShutdown(pending: Promise<unknown>): Promise<string> {
+  return pending.then(
+    () => "completed",
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  );
+}
+
+const shutdownOutcomes = ["completed", "progress_runtime_closed"];
+
 const job = (
   input: Partial<CommandJob> & Pick<CommandJob, "id" | "state">,
 ): CommandJob => ({
@@ -119,6 +134,174 @@ it("names HQ_MAX_ACTIVE_WORKERS and its accepted values when the env var is unus
     expect(() => parseMaxActiveWorkers(bad)).toThrow(/HQ_MAX_ACTIVE_WORKERS=".*" is not usable: set a positive whole number \(for example 10\) or "unlimited"\./);
 });
 
+it("answers a job-list lookup with zero native launches, then launches exactly one worker for real project work", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { vi } = await import("vitest");
+  const { openProgressStore } = await import("../src/progress-store.js");
+  const { createWorkerAdmission } = await import("../src/worker-admission.js");
+  const { createContextRouter } = await import("../src/context-router.js");
+  const { createManagedNativeRuntime } = await import("../src/managed-runtime.js");
+  const dir = mkdtempSync(join(tmpdir(), "managed-lookup-"));
+  const store = openProgressStore({ databasePath: join(dir, "db"), ownerKey: "local" });
+  const admission = createWorkerAdmission({ store });
+  const project = { id: "p", name: "Project", absolutePath: "/tmp/project", aliases: [], enabled: true, sensitivePaths: [], setupPolicy: "inherit" as const };
+  const relay = {
+    startNativeWork: vi.fn(async (item: import("@orca-hq/core").NativeWorkItem) => ({ state: "ready" as const, receipt: { attemptId: item.attemptId, runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term_worker", worktreeId: item.worktreeId, requested: item.profile, effective: { agent: item.profile.agent, model: item.profile.model } } })),
+    getNativeLaunch() { throw Error("missing"); }, async checkDelivery() { return undefined; }, async acknowledgeDelivery() {},
+    async cleanupNative() { return { verdict: "retained_idle" as const }; },
+    async sendNativeGuidance() { return { messageId: "m" }; }, async replyNativeQuestion() { return { messageId: "m" }; }
+  };
+  const readJobs = vi.fn(async () => ({ text: "현재 활성 작업 0개 (마지막 관찰 스냅샷 기준)" }));
+  const runtime = createManagedNativeRuntime({
+    store, admission, relay, catalog: { list: async () => [project], resolve: async () => project },
+    router: createContextRouter({ propose: async () => ({ parts: [{ action: "new", title: "Review", objective: "Review code", text: "Review code", projectIds: ["p"] }] }) }),
+    retentionPolicy: "retain", pollMs: 10, legacyReadJobs: readJobs
+  });
+  let abandoned: Promise<string> = Promise.resolve("completed");
+  try {
+    await runtime.native.start(); await runtime.progress.start();
+    // Break caught: a read-only lookup that spawned a worker would burn an admission slot and a
+    // real Orca terminal just to answer "what is running right now?".
+    const listed = await runtime.execute({ id: "list", text: "지금 돌아가고 있는 작업 내용들 리스트업해줘", source: "telegram", userId: "1" });
+    expect(listed.text).toContain("현재 활성 작업 0개");
+    expect(readJobs).toHaveBeenCalledOnce();
+    expect(relay.startNativeWork).not.toHaveBeenCalled();
+    expect(admission.listAttempts()).toHaveLength(0);
+
+    // The same composition still launches a worker for work that actually needs one.
+    abandoned = abandonedOnShutdown(runtime.execute({ id: "work", text: "이 프로젝트 코드를 분석해줘", source: "telegram", userId: "1" }));
+    await vi.waitFor(() => expect(relay.startNativeWork).toHaveBeenCalledOnce());
+    expect(admission.listAttempts()).toHaveLength(1);
+  } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("resolves admission, retention and role profiles from the installed config file's own text", async () => {
+  const { parsePilotConfigText } = await import("@orca-hq/core");
+  const { resolveNativeExecutionSettings, defaultNativeRoleProfiles } = await import("../src/managed-runtime.js");
+  // Exactly what `startManagedRuntime` reads off disk, parsed by the same schema, so this proves
+  // the file -> runtime path rather than the in-process `profiles` option a caller can pass.
+  const base = { schema: "orca-hq.private-pilot.v1", databasePath: "/tmp/hq/db", projectRegistryPath: "/tmp/hq/projects.json", credentialAccounts: ["openai"] };
+  const configured = parsePilotConfigText(JSON.stringify({ ...base, nativeExecution: {
+    maxActiveWorkers: 3, retentionPolicy: "release",
+    roleProfiles: { primary: { agent: "claude", model: "opus-from-file", effort: "med", reason: "configured in the installed config file" } }
+  } }));
+  expect(resolveNativeExecutionSettings(configured, {})).toEqual({
+    maxActiveWorkers: 3, retentionPolicy: "release",
+    profiles: { primary: { agent: "claude", model: "opus-from-file", effort: "med", reason: "configured in the installed config file" } }
+  });
+
+  // A config file without the block keeps today's installed behavior untouched.
+  const bare = parsePilotConfigText(JSON.stringify(base));
+  expect(resolveNativeExecutionSettings(bare, {})).toEqual({ maxActiveWorkers: 10, retentionPolicy: "retain", profiles: defaultNativeRoleProfiles });
+
+  // Precedence is one-directional and has no surprises: the env var fills only the gap the file
+  // left, and never overrides a limit the operator wrote into the file.
+  expect(resolveNativeExecutionSettings(bare, { HQ_MAX_ACTIVE_WORKERS: "4" }).maxActiveWorkers).toBe(4);
+  expect(resolveNativeExecutionSettings(configured, { HQ_MAX_ACTIVE_WORKERS: "4" }).maxActiveWorkers).toBe(3);
+  // The env var is still validated where it is actually consulted.
+  expect(() => resolveNativeExecutionSettings(bare, { HQ_MAX_ACTIVE_WORKERS: "0" })).toThrow(/HQ_MAX_ACTIVE_WORKERS/);
+  expect(() => resolveNativeExecutionSettings(configured, { HQ_MAX_ACTIVE_WORKERS: "0" })).not.toThrow();
+});
+
+it("actually launches work with a configured role profile instead of the hardcoded default", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { vi } = await import("vitest");
+  const { openProgressStore } = await import("../src/progress-store.js");
+  const { createWorkerAdmission } = await import("../src/worker-admission.js");
+  const { createContextRouter } = await import("../src/context-router.js");
+  const { createManagedNativeRuntime } = await import("../src/managed-runtime.js");
+  const dir = mkdtempSync(join(tmpdir(), "managed-profile-"));
+  const store = openProgressStore({ databasePath: join(dir, "db"), ownerKey: "local" });
+  const admission = createWorkerAdmission({ store });
+  const project = { id: "p", name: "Project", absolutePath: "/tmp/project", aliases: [], enabled: true, sensitivePaths: [], setupPolicy: "inherit" as const };
+  const relay = {
+    startNativeWork: vi.fn(async (item: import("@orca-hq/core").NativeWorkItem) => ({ state: "ready" as const, receipt: { attemptId: item.attemptId, runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term_worker", worktreeId: item.worktreeId, requested: item.profile, effective: { agent: item.profile.agent, model: item.profile.model } } })),
+    getNativeLaunch() { throw Error("missing"); }, async checkDelivery() { return undefined; }, async acknowledgeDelivery() {},
+    async cleanupNative() { return { verdict: "retained_idle" as const }; },
+    async sendNativeGuidance() { return { messageId: "m" }; }, async replyNativeQuestion() { return { messageId: "m" }; }
+  };
+  const runtime = createManagedNativeRuntime({
+    store, admission, relay, catalog: { list: async () => [project], resolve: async () => project },
+    router: createContextRouter({ propose: async () => ({ parts: [{ action: "new", title: "Review", objective: "Review code", text: "Review code", projectIds: ["p"] }] }) }),
+    retentionPolicy: "retain", pollMs: 10,
+    profiles: { primary: { agent: "claude", model: "opus-configured", effort: "med", reason: "configured role profile" } }
+  });
+  let abandoned: Promise<string> = Promise.resolve("completed");
+  try {
+    await runtime.native.start(); await runtime.progress.start();
+    abandoned = abandonedOnShutdown(runtime.execute({ id: "req", text: "Review this", source: "telegram", userId: "1" }));
+    await vi.waitFor(() => expect(relay.startNativeWork).toHaveBeenCalledOnce());
+    expect(relay.startNativeWork.mock.calls[0]?.[0]).toMatchObject({ profile: { agent: "claude", model: "opus-configured", effort: "med" } });
+  } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("launches native work and records the receipt with no viewer attached at all", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { vi } = await import("vitest");
+  const { openProgressStore } = await import("../src/progress-store.js");
+  const { createWorkerAdmission } = await import("../src/worker-admission.js");
+  const { createContextRouter } = await import("../src/context-router.js");
+  const { createManagedNativeRuntime } = await import("../src/managed-runtime.js");
+  const dir = mkdtempSync(join(tmpdir(), "managed-no-viewer-"));
+  const store = openProgressStore({ databasePath: join(dir, "db"), ownerKey: "local" });
+  const admission = createWorkerAdmission({ store });
+  const project = { id: "p", name: "Project", absolutePath: "/tmp/project", aliases: [], enabled: true, sensitivePaths: [], setupPolicy: "inherit" as const };
+  const relay = {
+    startNativeWork: vi.fn(async (item: import("@orca-hq/core").NativeWorkItem) => ({ state: "ready" as const, receipt: { attemptId: item.attemptId, runId: "run", taskId: "task", dispatchId: "dispatch", terminalHandle: "term_worker", worktreeId: item.worktreeId, requested: item.profile, effective: { agent: item.profile.agent, model: item.profile.model } } })),
+    getNativeLaunch() { throw Error("missing"); }, async checkDelivery() { return undefined; }, async acknowledgeDelivery() {},
+    async cleanupNative() { return { verdict: "retained_idle" as const }; },
+    async sendNativeGuidance() { return { messageId: "m" }; }, async replyNativeQuestion() { return { messageId: "m" }; }
+  };
+  const runtime = createManagedNativeRuntime({
+    store, admission, relay, catalog: { list: async () => [project], resolve: async () => project },
+    router: createContextRouter({ propose: async () => ({ parts: [{ action: "new", title: "Review", objective: "Review code", text: "Review code", projectIds: ["p"] }] }) }),
+    retentionPolicy: "retain", pollMs: 10
+  });
+  let abandoned: Promise<string> = Promise.resolve("completed");
+  try {
+    await runtime.native.start(); await runtime.progress.start();
+    // Break caught: if the viewer were ever an execution precondition, this composition — which has
+    // no window manager, no watch process and never acquires a viewer lease — could not launch.
+    abandoned = abandonedOnShutdown(runtime.execute({ id: "req", text: "Review this", source: "telegram", userId: "1" }));
+    await vi.waitFor(() => expect(relay.startNativeWork).toHaveBeenCalledOnce());
+    const attempt = admission.listAttempts()[0]!;
+    const contextId = attempt.item.contextId;
+    await vi.waitFor(() => expect(store.readEvents({ contextId, after: 0, limit: 100 }).events.some(e => e.kind === "worker.ready")).toBe(true));
+    const ready = store.readEvents({ contextId, after: 0, limit: 100 }).events.find(e => e.kind === "worker.ready")!;
+    expect(ready.payload).toMatchObject({ terminalHandle: "term_worker", taskId: "task" });
+    // The composition takes no viewer option, and nothing it ran acquired a viewer lease: the
+    // context is still free for a viewer that has not started yet.
+    expect(Object.keys(runtime).sort()).toEqual(["execute", "native", "progress"]);
+    expect(store.acquireViewerLease({ contextId, viewerInstanceId: "viewer_late" })).toMatchObject({ acquired: true });
+  } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("refuses to start without a primary role profile instead of silently launching an unconfigured one", async () => {
+  const { openProgressStore } = await import("../src/progress-store.js");
+  const { createWorkerAdmission } = await import("../src/worker-admission.js");
+  const { createContextRouter } = await import("../src/context-router.js");
+  const { createManagedNativeRuntime } = await import("../src/managed-runtime.js");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "managed-profile-missing-"));
+  const store = openProgressStore({ databasePath: join(dir, "db"), ownerKey: "local" });
+  const admission = createWorkerAdmission({ store });
+  try {
+    expect(() => createManagedNativeRuntime({
+      store, admission, relay: {} as never, catalog: { list: async () => [], resolve: async () => { throw Error("n/a"); } },
+      router: createContextRouter({ propose: async () => ({ parts: [] }) }), retentionPolicy: "retain",
+      profiles: { secondary: { agent: "codex", model: "x", reason: "not primary" } }
+    })).toThrow(/native_profile_primary_required/);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 it("resolves a declared scope through project aliases and fails closed instead of widening it to write", async () => {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -143,9 +326,10 @@ it("resolves a declared scope through project aliases and fails closed instead o
     router: createContextRouter({ propose: async () => ({ parts: [{ action: "new", title: "Review", objective: "Review code", text: "Review code", projectIds: ["p"] }] }) }),
     retentionPolicy: "retain", pollMs: 10 });
   const scope = { worktreeId: "p::/tmp/project", access: "read" as const, resources: [{ resourceKey: "checkout:/tmp/project", mode: "read" as const }] };
+  let abandoned: Promise<string> = Promise.resolve("completed");
   try {
     await runtime.native.start(); await runtime.progress.start();
-    void runtime.execute({ id: "aliased", text: "Review this", source: "telegram", userId: "1", nativeScope: { projectId: "alias", ...scope } });
+    abandoned = abandonedOnShutdown(runtime.execute({ id: "aliased", text: "Review this", source: "telegram", userId: "1", nativeScope: { projectId: "alias", ...scope } }));
     // An alias selector resolves to the catalog id, so the declared read-only claim survives intact.
     await vi.waitFor(() => expect(relay.startNativeWork).toHaveBeenCalledOnce());
     expect(relay.startNativeWork.mock.calls[0]?.[0]).toMatchObject({ projectId: "p", access: "read", resources: [{ resourceKey: expect.stringMatching(/^checkout:.*\/tmp\/project$/), mode: "read" }] });
@@ -153,5 +337,5 @@ it("resolves a declared scope through project aliases and fails closed instead o
     expect(await runtime.execute({ id: "foreign", text: "Review that", source: "telegram", userId: "1", nativeScope: { projectId: "elsewhere", ...scope } })).toMatchObject({ state: "failed" });
     expect(relay.startNativeWork).toHaveBeenCalledOnce();
     expect(admission.listAttempts().every(a => a.item.access === "read")).toBe(true);
-  } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { await runtime.native.close(); await runtime.progress.close(); store.close(); expect(shutdownOutcomes).toContain(await abandoned); rmSync(dir, { recursive: true, force: true }); }
 });

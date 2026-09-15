@@ -175,6 +175,79 @@ export function sanitizeResultText(value: unknown): string {
   return stripped.length <= limit ? stripped : `${stripped.slice(0, limit)}\n[표시 길이 제한으로 이후 내용을 생략했습니다.]`;
 }
 
+interface NativeProfileFields {
+  readonly agent: string;
+  readonly model?: string;
+  readonly effort?: string;
+}
+
+/**
+ * Reads only the fields the payload actually carries. `effective.model` and `effective.effort` are
+ * optional in the wire schema, so an absent one stays absent here rather than collapsing the whole
+ * profile to "unknown" and throwing away the provider the worker did report.
+ */
+function nativeProfileFields(value: unknown): NativeProfileFields | undefined {
+  const profile = value as { readonly agent?: unknown; readonly model?: unknown; readonly effort?: unknown } | undefined;
+  if (typeof profile?.agent !== "string" || profile.agent.trim() === "") return undefined;
+  return {
+    agent: profile.agent,
+    ...(typeof profile.model === "string" && profile.model.trim() !== "" ? { model: profile.model } : {}),
+    ...(typeof profile.effort === "string" && profile.effort.trim() !== "" ? { effort: profile.effort } : {})
+  };
+}
+
+function nativeProfileText(profile: NativeProfileFields | undefined): string {
+  if (profile === undefined) return "확인 필요";
+  return [
+    sanitizeDisplayText(profile.agent),
+    profile.model === undefined ? "모델 미확인" : sanitizeDisplayText(profile.model),
+    ...(profile.effort === undefined ? [] : [sanitizeDisplayText(profile.effort)])
+  ].join("/");
+}
+
+/**
+ * A mismatch is claimed only on a field the worker actually reported back. An effective payload
+ * that simply omits `effort` is silence about it, not a downgrade, and must not be shown as one.
+ */
+function nativeProfileMismatch(requested: NativeProfileFields | undefined, effective: NativeProfileFields | undefined): boolean {
+  if (requested === undefined || effective === undefined) return false;
+  if (requested.agent !== effective.agent) return true;
+  if (effective.model !== undefined && requested.model !== effective.model) return true;
+  return effective.effort !== undefined && requested.effort !== effective.effort;
+}
+
+/**
+ * Renders a native `worker.*` event's receipt-backed identity as one line. Every interpolated value
+ * comes from the server and is sanitized like any other displayed text, so a handle or model name
+ * cannot carry terminal control sequences into the line. A missing terminal handle or effective
+ * model always renders an explicit verification state; it is never replaced with an invented
+ * reference or with the requested value standing in for the effective one.
+ */
+export function describeNativeWorkerEvent(event: Pick<ProgressEvent, "kind" | "payload">): string | undefined {
+  if (!event.kind.startsWith("worker.")) return undefined;
+  const payload = event.payload;
+  const requested = nativeProfileFields(payload.requested);
+  const effective = nativeProfileFields(payload.effective);
+  const requestedText = nativeProfileText(requested);
+  const handle = typeof payload.terminalHandle === "string" && payload.terminalHandle.trim() !== ""
+    ? sanitizeDisplayText(payload.terminalHandle) : undefined;
+  const identity = [
+    typeof payload.taskId === "string" ? `task ${sanitizeDisplayText(payload.taskId)}` : undefined,
+    typeof payload.dispatchId === "string" ? `dispatch ${sanitizeDisplayText(payload.dispatchId)}` : undefined,
+    typeof payload.worktreeId === "string" ? `worktree ${sanitizeDisplayText(payload.worktreeId)}` : undefined
+  ].filter((entry): entry is string => entry !== undefined).join(" · ");
+  const suffix = identity === "" ? "" : ` · ${identity}`;
+  if (event.kind === "worker.launching") {
+    return `실행 대기 중(워커 시작 전) · 요청 ${requestedText}${suffix}`;
+  }
+  if (event.kind === "worker.ready" || event.kind === "worker.retained") {
+    const mismatch = nativeProfileMismatch(requested, effective) ? ` (요청 ${requestedText})` : "";
+    const reused = event.kind === "worker.retained" ? " · 기존 터미널 재사용" : "";
+    return `워커 준비됨 · 터미널 ${handle ?? "확인 필요"} · 모델 ${nativeProfileText(effective)}${mismatch}${reused}${suffix}`;
+  }
+  return `확인 필요 · 터미널 ${handle ?? "미확인"} · 요청 ${requestedText}${suffix}`;
+}
+
 function assertIdentifier(value: string): string {
   if (!opaqueIdentifier.test(value)) throw new Error("progress_identifier_invalid");
   return value;

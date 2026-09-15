@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  describeNativeWorkerEvent,
   isProgressCompaction,
   isProgressEvent,
   ProgressRequestFailed,
@@ -88,10 +89,14 @@ export function createWatchRenderer(options: WatchRendererOptions): WatchRendere
     if (event.kind === "context.assigned") {
       return event.payload.relation === "continue" ? "기존 작업 계속" : "새 작업으로 시작";
     }
+    // The event's own source (hq/tool/orca/system) stays visible and distinct from the context's
+    // own updatedAt, which the header renders separately from any single event's occurredAt.
+    if (event.kind.startsWith("worker.")) return `네이티브 워커 [${sanitizeDisplayText(event.source)}]`;
     return eventLabels[event.kind] ?? sanitizeDisplayText(event.kind);
   }
 
   function body(event: ProgressEvent): string {
+    if (event.kind.startsWith("worker.")) return describeNativeWorkerEvent(event) ?? "";
     const text = ["request.completed", "request.failed", "recovery.required"].includes(event.kind)
       ? sanitizeResultText(event.payload.text) : sanitizeDisplayText(event.payload.text);
     if (text !== "") return text;
@@ -115,9 +120,13 @@ export function createWatchRenderer(options: WatchRendererOptions): WatchRendere
       const summary = sanitizeResultText(snapshot.summary);
       const state = sanitizeDisplayText(snapshot.state);
       const projects = snapshot.projectIds.map(sanitizeDisplayText).filter(entry => entry !== "").join(", ");
+      // Context updatedAt reflects the last state transition HQ recorded; it is intentionally
+      // distinct from any single native event's own observedAt (when HQ noticed it) or
+      // occurredAt (when the terminal reported it) shown per-line below.
+      const updatedAt = sanitizeDisplayText(snapshot.updatedAt);
       const lines = [
         `HQ 진행 · ${title === "" ? "제목 없음" : title} [${sanitizeDisplayText(snapshot.contextId)}]`,
-        `상태 ${state === "" ? "알 수 없음" : state}${projects === "" ? "" : ` · 프로젝트 ${projects}`}`
+        `상태 ${state === "" ? "알 수 없음" : state}${projects === "" ? "" : ` · 프로젝트 ${projects}`}${updatedAt === "" ? "" : ` · 갱신 ${updatedAt}`}`
       ];
       if (summary !== "") lines.push(`요약 ${summary}`);
       return lines.join("\n");

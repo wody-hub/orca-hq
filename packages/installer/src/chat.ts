@@ -3,7 +3,7 @@ import { createInterface, clearLine, cursorTo } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { validSessionId } from "./control.js";
 import {
-  createProgressClient, isProgressCompaction, isProgressEvent, ProgressRequestFailed,
+  createProgressClient, describeNativeWorkerEvent, isProgressCompaction, isProgressEvent, ProgressRequestFailed,
   sanitizeDisplayText, sanitizeResultText, validProgressIdentifier, type ContextHint, type ProgressClient,
   type ProgressEvent, type ProgressRequestStatus
 } from "./progress-client.js";
@@ -32,7 +32,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const inputIsTTY = options.inputIsTTY ?? (options.input as { isTTY?: boolean }).isTTY === true;
   const outputIsTTY = options.outputIsTTY ?? (options.output as { isTTY?: boolean }).isTTY === true;
   const terminal = inputIsTTY && outputIsTTY;
-  const autoWindows = options.progressWindow !== "off" && canOpenProgressWindow({
+  // No watch window opens unless the caller explicitly opts in; an unspecified or "off"
+  // preference both mean no macOS Terminal window, and neither ever affects native execution.
+  const autoWindows = options.progressWindow === "auto" && canOpenProgressWindow({
     platform: options.platform ?? process.platform, inputIsTTY, outputIsTTY, env: options.env ?? process.env
   });
   const windows = options.windows ?? createProgressWindowManager({ client });
@@ -132,6 +134,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     } else if (event.kind === "clarification.required" || event.kind === "agent.waiting" || event.kind === "request.queued") {
       notify(`[${id}] ${text || sanitizeDisplayText(event.kind)}`);
+    } else if (event.kind.startsWith("worker.")) {
+      const description = describeNativeWorkerEvent(event);
+      if (description !== undefined) notify(`[${id}] ${description}`);
     } else if ((!autoWindows || (event.contextId !== null && inlineContexts.has(event.contextId))) && text !== ""
       && ["hq.progress", "tool.started", "tool.completed", "tool.failed", "job.linked", "job.state"].includes(event.kind)) {
       notify(`[${id}] ${sanitizeDisplayText(event.kind)} · ${text}`);

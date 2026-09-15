@@ -72,6 +72,40 @@ describe("guided private-pilot setup", () => {
     expect(fixture.output.lines.join("\n")).toContain(fixture.configFile.path);
   });
 
+  it("carries an existing native execution block through a re-run instead of resetting it", async () => {
+    // Break caught: setup never asks about native execution, so rebuilding the config from the
+    // answers alone silently reverted an operator's worker limit, retention policy and role
+    // profiles to the runtime defaults the next time they ran `hq setup`.
+    const fixture = ports();
+    const nativeExecution = {
+      maxActiveWorkers: 3,
+      retentionPolicy: "release" as const,
+      roleProfiles: { primary: { agent: "claude" as const, model: "opus-configured", effort: "med", reason: "operator choice" } }
+    };
+    const result = await createSetup({
+      ...fixture,
+      existingConfig: async () => ({
+        projectRegistryPath: "/private/pilot/projects.yaml",
+        credentialAccounts: ["slack-app-token"],
+        nativeExecution
+      })
+    }).run({ credentials: { "slack-app-token": "xapp-secret" }, registryPath: "" });
+
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(fixture.configFile.writes[0] ?? "{}").nativeExecution).toEqual(nativeExecution);
+  });
+
+  it("writes no native execution block when the existing config never had one", async () => {
+    const fixture = ports();
+    const result = await createSetup({
+      ...fixture,
+      existingConfig: async () => ({ projectRegistryPath: "/private/pilot/projects.yaml", credentialAccounts: [] })
+    }).run({ credentials: {}, registryPath: "/private/pilot/projects.yaml" });
+
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(fixture.configFile.writes[0] ?? "{}")).not.toHaveProperty("nativeExecution");
+  });
+
   it("does not write configuration when a prerequisite check fails", async () => {
     // Break caught: setup could leave partial machine configuration after detecting an unsupported host.
     const fixture = ports();

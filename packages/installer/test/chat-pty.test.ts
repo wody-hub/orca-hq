@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { expect, it } from "vitest";
 
-it.skipIf(process.platform === "win32")("real PTY preserves partially typed input during progress and accepts new work before the first completes", async () => {
+it.skipIf(process.platform === "win32")("real PTY preserves partially typed Korean input across acceptance, queue transition and final response", async () => {
   const directory = await mkdtemp(join(tmpdir(), "hq-pty-"));
   const received: { requestId: string; text: string }[] = [];
   const routes: string[] = [];
@@ -28,6 +28,11 @@ it.skipIf(process.platform === "win32")("real PTY preserves partially typed inpu
       response.end(JSON.stringify({ requestId: body.requestId, state: "queued" }));
       if (received.length === 1) timers.push(setTimeout(() => {
         for (const stream of streams) stream.write(`${JSON.stringify({ seq: 1, eventKey: "question", requestId: body.requestId, contextId: null, kind: "clarification.required", source: "hq", occurredAt: new Date().toISOString(), payload: { text: "확인 요청" } })}\n`);
+      }, 150));
+      // A final response for the *first* request arrives while the third line is still mid-typing,
+      // proving the redraw preserves partial input across acceptance -> queue -> final-response too.
+      if (received.length === 2) timers.push(setTimeout(() => {
+        for (const stream of streams) stream.write(`${JSON.stringify({ seq: 2, eventKey: "final", requestId: received[0]!.requestId, contextId: null, kind: "request.completed", source: "hq", occurredAt: new Date().toISOString(), payload: { text: "최종 응답" } })}\n`);
       }, 150));
     } else if (request.url?.startsWith("/v1/progress/contexts?")) response.end('{"contexts":[]}');
     else { response.writeHead(404); response.end('{"text":"unexpected route"}'); }
@@ -53,9 +58,10 @@ it.skipIf(process.platform === "win32")("real PTY preserves partially typed inpu
       child.on("error", reject);
       child.on("exit", code => code === 0 ? resolve(stdout) : reject(new Error(stderr)));
     });
-    expect(received.map(request => request.text)).toEqual(["첫 질문", "두 번째 질문"]);
-    expect(received[0]!.requestId).not.toBe(received[1]!.requestId);
+    expect(received.map(request => request.text)).toEqual(["첫 질문", "두 번째 질문", "세 번째 질문"]);
+    expect(new Set(received.map(request => request.requestId)).size).toBe(3);
     expect(JSON.parse(output).output).toContain("진행 창은 계속됩니다");
+    expect(JSON.parse(output).output).toContain("최종 응답");
     expect(routes.every(route => route.startsWith("GET ") || route === "POST /v1/progress/requests")).toBe(true);
   } finally {
     for (const timer of timers) clearTimeout(timer);

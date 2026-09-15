@@ -151,7 +151,9 @@ export async function runCli(input: readonly string[], dependencies: CliDependen
   }
   let sessionId: string | undefined;
   let questionArguments = input.slice(1);
-  let progressWindow: ProgressWindowMode = "auto";
+  // No macOS Terminal window opens unless "--progress-window=auto" is given explicitly; native
+  // execution itself never depends on this flag.
+  let progressWindow: ProgressWindowMode = "off";
   if (selected === "ask" && questionArguments[0] === "--session") {
     sessionId = questionArguments[1];
     if (sessionId === undefined || !validSessionId(sessionId)) { write(output, terminalUsage(selected)); return 2; }

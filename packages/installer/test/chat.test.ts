@@ -131,6 +131,94 @@ describe("async terminal conversations", () => {
   });
 });
 
+describe("progress window preference never gates native execution", () => {
+  it("opens no window when the preference is left unspecified, but still submits the request natively", async () => {
+    const f = fixture();
+    const { progressWindow: _unused, ...rest } = f.options;
+    const running = runChat({ ...rest, outputIsTTY: true });
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(event(1, id, "context.assigned", "ctx_a"));
+    await vi.waitFor(() => expect(f.output).toContain("hq watch --context ctx_a"));
+    expect(f.windows.open).not.toHaveBeenCalled();
+    f.input.write("/exit\n"); await running;
+  });
+  it("opens no window with an explicit --progress-window=off, but still submits the request natively", async () => {
+    const f = fixture();
+    const running = runChat({ ...f.options, progressWindow: "off", outputIsTTY: true });
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(event(1, id, "context.assigned", "ctx_a"));
+    await vi.waitFor(() => expect(f.output).toContain("hq watch --context ctx_a"));
+    expect(f.windows.open).not.toHaveBeenCalled();
+    f.input.write("/exit\n"); await running;
+  });
+  it("opens a window only for the explicit --progress-window=auto opt-in", async () => {
+    const f = fixture();
+    vi.mocked(f.windows.open).mockResolvedValue("opened");
+    const running = runChat({ ...f.options, progressWindow: "auto", outputIsTTY: true });
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(event(1, id, "context.assigned", "ctx_a"));
+    await vi.waitFor(() => expect(f.windows.open).toHaveBeenCalledWith("ctx_a"));
+    f.input.write("/exit\n"); await running;
+  });
+});
+
+describe("native worker receipts render exact identity, never an invented one", () => {
+  function workerEvent(kind: string, requestId: string, payload: Record<string, unknown>): ProgressEvent {
+    return {
+      seq: 1, eventKey: `w${requestId}`, requestId, contextId: null, kind, source: "orca", occurredAt: "2026-09-08T00:00:00Z",
+      payload: { requested: { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "project analysis" }, ...payload }
+    };
+  }
+  it("shows a waiting state (never running) for worker.launching before a receipt exists", async () => {
+    const f = fixture();
+    const running = runChat(f.options);
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(workerEvent("worker.launching", id, { attemptId: "attempt_1", worktreeId: "wt_1" }));
+    await vi.waitFor(() => expect(f.output).toContain("실행 대기 중"));
+    expect(f.output).not.toContain("실행 중");
+    f.input.write("/exit\n"); await running;
+  });
+  it("shows the exact returned terminal handle and effective model once the worker is ready", async () => {
+    const f = fixture();
+    const running = runChat(f.options);
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(workerEvent("worker.ready", id, {
+      attemptId: "attempt_1", worktreeId: "wt_1", runId: "run_1", taskId: "task_1", dispatchId: "dispatch_1",
+      terminalHandle: "term_9f2a", effective: { agent: "codex", model: "gpt-5.6-sol", effort: "high" }
+    }));
+    await vi.waitFor(() => expect(f.output).toContain("터미널 term_9f2a"));
+    expect(f.output).toContain("모델 codex/gpt-5.6-sol/high");
+    f.input.write("/exit\n"); await running;
+  });
+  it("renders an explicit verification state, never a fabricated handle, when the receipt is incomplete", async () => {
+    const f = fixture();
+    const running = runChat(f.options);
+    f.input.write("질문\n");
+    await vi.waitFor(() => expect(f.client.submitRequest).toHaveBeenCalledTimes(1));
+    const id = vi.mocked(f.client.submitRequest).mock.calls[0]![0].requestId;
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    f.streams[0]!.push(workerEvent("worker.recovery_required", id, { attemptId: "attempt_1", worktreeId: "wt_1" }));
+    await vi.waitFor(() => expect(f.output).toContain("확인 필요"));
+    expect(f.output).toContain("터미널 미확인");
+    f.input.write("/exit\n"); await running;
+  });
+});
+
 it("preserves a partially typed line while an asynchronous notification redraws the terminal", async () => {
   const f = fixture();
   const running = runChat({ ...f.options, outputIsTTY: true });

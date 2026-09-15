@@ -1,6 +1,6 @@
 # HQ native Orca 구현 여부 확인
 
-> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1(실행 계약·계획기·native 이벤트 검증)을 구현했고 집중 테스트 48개와 소스 타입 검사를 통과했다. [Task 1 결과](2026-09-08-native-orca-task1-result.md)를 참조한다. 이후 Task 2(지속형 워커 진입 제어·리소스 점유·재시작 복구·코디네이터 소유권 검증)도 구현했고 관련 테스트 62개와 소스 타입 검사를 통과했다. [Task 2 결과](2026-09-08-native-orca-task2-result.md)를 참조한다. 이후 Task 3(명시적 모델·터미널 실행, 실행 기록·복구, 안전한 터미널 재사용)도 구현했고 관련 테스트 108개와 소스 타입 검사를 통과했다. [Task 3 결과](2026-09-08-native-orca-task3-result.md)를 참조한다. Task 4(native runtime·durable Delivery·공통 admission·외부 실행 우회 차단)도 구현했고 188개 집중 테스트, `pnpm typecheck`, 전체 1191개 테스트를 통과했다. [Task 4 결과](2026-09-15-native-orca-task4-result.md)를 참조한다. Task 4 순차 독립 리뷰도 끝났고 blocker 1건과 후속 4건을 모두 수정했다. [Task 4 리뷰](2026-09-15-native-orca-task4-review.md)의 **Review resolutions** 절에 항목별 해소 내역, 근거 있는 부분 이견 1건, 그리고 재시작 생존 판정을 권위 있는 `worker-list projection.liveness`로 바로잡은 후속 보정이 있다. Task 5~7과 운영 설치는 남아 있다. 과거 기준점 `86e3845`의 typecheck·1165개 테스트·전체 빌드 통과와 이번 Task 4 새 검증을 구분한다.
+> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1~5 구현 및 Task 4/5 독립 리뷰 수정이 완료됐다(각 결과/리뷰 문서 참조). Task 6의 additive `executionBackend` migration, real SQLite recovery barrier, isolated real-socket native 수용 검사도 완료됐다. [Task 6 결과](2026-09-15-native-orca-task6-result.md)와 [마이그레이션/롤백 절차](2026-09-08-native-orca-migration.md)를 참조한다. Task 6은 집중 8 files / 110 tests, `pnpm typecheck`, 전체 93 files / 1231 tests, global installer를 피한 15 of 16 workspace package/app build를 통과했다. HEAD는 여전히 `8f59bee`이며 Task 5/6 변경은 uncommitted·미설치다. 다음은 **Task 7** 독립 리뷰와 live installed acceptance이고, 레거시 `apps/web`/`dashboard.ts` 배선과 quarantine 운영자 표면은 별도 미완 항목으로 남아 있다. 과거 기준점 `86e3845`의 검증 수치와 이번 Task 6 새 검증을 구분한다.
 
 확인일: 2026-09-08. 기준: 최신 native Orca 설계 및 실행 계획. 동시 실행은 **초기 기본값 10, 양의 안전한 정수 또는 `"unlimited"`로 변경 가능**이라는 사용자 결정을 적용한다.
 
@@ -50,4 +50,11 @@ Run: `run_8bb7664f144b`.
 
 ## 현재 다음 순서 (2026-09-15)
 
-Task 4 순차 리뷰와 그 수정이 끝났으므로 다음은 Task 5의 native worker 표시·설정 UX다. quarantine 기록의 운영자 표면도 Task 5 범위다. 이후 Task 6~7의 migration 및 실제 HQ endpoint/GUI 검증이 남는다. Task 4 구현은 기존 checkout에서 수행했고 설치·재시작·commit·push·외부 채널 메시지를 수행하지 않았다. 위 표와 설치 상태 서술은 구현 전 감사 기록이며 현재 소스 구현 판정으로 재사용하지 않는다.
+Task 4 순차 리뷰와 수정, Task 5 구현/독립 리뷰 수정, Task 6 migration/복구 및 격리된 native
+수용 검사가 끝났다. Task 6은 real SQLite와 managed Unix socket/fake relay로 old assignment replay
+차단, completed/active/unknown 무교체 복구, untouched queued native 1회 배정, mixed-channel 10+1,
+failure/stop/unknown/retained terminal/gateway restart를 검증했다. 다음은 **Task 7** 독립 리뷰와 실제
+HQ endpoint/GUI 검증이다. quarantine 운영자 표면, 레거시 `apps/web`/`dashboard.ts`, 다중 viewer,
+sanitization 공용화는 별도 미완 범위다. Task 6에서도 설치·재시작·commit·push·외부 채널 메시지나
+real Orca worker를 수행하지 않았다(HEAD는 여전히 `8f59bee`, Task 5/6은 uncommitted). 위 표와 설치
+상태 서술은 구현 전 감사 기록이며 현재 소스 구현 판정으로 재사용하지 않는다.

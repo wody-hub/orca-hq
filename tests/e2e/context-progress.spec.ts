@@ -96,6 +96,11 @@ it("durably accepts five overlapping executions, queues the sixth, and serialize
     gates.forEach(gate => gate.resolve());
   }
   await vi.waitFor(async () => expect((await test.client.getRequest("r_follow")).state).toBe("completed"));
+  expect(
+    ["r_0", "r_1", "r_2", "r_3", "r_4", "r_5", "r_follow"].flatMap(
+      requestId => test.store.listRequestAssignments(requestId).map(assignment => assignment.executionBackend),
+    ),
+  ).toEqual(Array(7).fill("legacy_conversation"));
 });
 
 it("answers the user's global job lookup over the socket without creating a context or executing an agent", async () => {

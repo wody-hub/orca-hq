@@ -11,6 +11,7 @@ import {
   ProgressEventCollisionError,
   ProgressEventContextMismatchError,
   ProgressRequestCollisionError,
+  ProgressRecordCollisionError,
   ViewerLeaseConflictError,
   openProgressStore,
   type SqliteProgressStore
@@ -569,4 +570,55 @@ it("never prunes native recovery evidence while a completed request still holds 
   admission.settle("attempt", "dispatch", "succeeded", "retained_idle");
   expect(store.pruneCompletedEvents("2099-01-01T00:00:00.000Z")).toBe(1);
   expect(admission.listAttempts()[0]?.receipt?.dispatchId).toBe("dispatch");
+});
+
+describe("executionBackend migration (Task 6)", () => {
+  it("backfills legacy assignments to legacy_conversation on reopen and lets a new assignment pick native_orca once", async () => {
+    const old = await fixture("owner", { now: () => new Date("2026-09-01T00:00:00.000Z") });
+    old.store.acceptRequest({ requestId: "completed_req", sessionId: "s", text: "Completed work" });
+    old.store.createContext({ contextId: "ctx_completed", originSessionId: "s", title: "Completed", objective: "Completed" });
+    old.store.assignRequestContext({ requestId: "completed_req", contextId: "ctx_completed", partId: "0", relation: "new", instruction: "Completed" });
+    old.store.completeAssignment({ requestId: "completed_req", partId: "0", eventKey: "completed_req:0", outcome: { state: "completed", text: "Done" } });
+    old.store.completeRequest({ requestId: "completed_req", eventKey: "completed_req:done", state: "completed", text: "Done" });
+
+    old.store.acceptRequest({ requestId: "active_req", sessionId: "s", text: "Active work" });
+    old.store.createContext({ contextId: "ctx_active", originSessionId: "s", title: "Active", objective: "Active" });
+    old.store.assignRequestContext({ requestId: "active_req", contextId: "ctx_active", partId: "0", relation: "new", instruction: "Active" });
+
+    old.store.acceptRequest({ requestId: "uncertain_req", sessionId: "s", text: "Uncertain work" });
+    old.store.createContext({ contextId: "ctx_uncertain", originSessionId: "s", title: "Uncertain", objective: "Uncertain" });
+    old.store.assignRequestContext({ requestId: "uncertain_req", contextId: "ctx_uncertain", partId: "0", relation: "new", instruction: "Uncertain" });
+
+    old.store.acceptRequest({ requestId: "queued_req", sessionId: "s", text: "Queued work" });
+
+    old.store.close();
+
+    const legacy = openDatabase(old.databasePath);
+    legacy.exec("ALTER TABLE request_contexts DROP COLUMN execution_backend");
+    legacy.close();
+
+    const { store: reopened } = await fixture("owner", { databasePath: old.databasePath });
+
+    for (const [requestId, partIndex] of [["completed_req", "0"], ["active_req", "0"], ["uncertain_req", "0"]] as const) {
+      const assignments = reopened.listRequestAssignments(requestId);
+      expect(assignments.find(a => a.partId === partIndex)?.executionBackend).toBe("legacy_conversation");
+    }
+    expect(reopened.getRequest("completed_req")?.state).toBe("completed");
+    expect(reopened.getRequest("active_req")?.state).toBe("queued");
+    expect(reopened.getRequest("uncertain_req")?.state).toBe("queued");
+
+    reopened.createContext({ contextId: "ctx_queued", originSessionId: "s", title: "Queued", objective: "Queued" });
+    reopened.assignRequestContext({
+      requestId: "queued_req", contextId: "ctx_queued", partId: "0", relation: "new",
+      instruction: "Queued", executionBackend: "native_orca"
+    });
+    const queuedAssignments = reopened.listRequestAssignments("queued_req");
+    expect(queuedAssignments).toHaveLength(1);
+    expect(queuedAssignments[0]?.executionBackend).toBe("native_orca");
+
+    expect(() => reopened.assignRequestContext({
+      requestId: "queued_req", contextId: "ctx_queued", partId: "0", relation: "new",
+      instruction: "Queued", executionBackend: "legacy_conversation"
+    })).toThrow(ProgressRecordCollisionError);
+  });
 });

@@ -1,3 +1,5 @@
+import type { NativeExecutionConfig } from "@orca-hq/core";
+
 import { createConfigText, type ConfigFilePort } from "./config-files.js";
 import {
   createDoctor,
@@ -21,6 +23,7 @@ export interface SetupPorts extends DoctorPorts {
     projectRegistryPath: string;
     credentialAccounts: readonly string[];
     voiceMode?: "disabled" | "openai";
+    nativeExecution?: NativeExecutionConfig;
   }> | undefined>;
   /** Called only after the non-secret plan and config destination were displayed. */
   confirm(): Promise<boolean>;
@@ -85,7 +88,11 @@ export function createSetup(ports: SetupPorts): Readonly<{
         databasePath: ports.databasePath,
         projectRegistryPath: registryPath,
         credentialAccounts: accounts,
-        voiceMode: resolveSetupVoiceMode(answers.credentials, existing)
+        voiceMode: resolveSetupVoiceMode(answers.credentials, existing),
+        // Setup never asks about native execution, so re-running it must carry an operator's
+        // existing `nativeExecution` block through untouched instead of silently resetting the
+        // worker limit, retention policy and role profiles to the runtime defaults.
+        ...(existing?.nativeExecution === undefined ? {} : { nativeExecution: existing.nativeExecution })
       });
       ports.output.write(`Planned configuration: ${ports.configFile.path}`);
       ports.output.write("Planned changes: save non-secret pilot configuration and store selected credentials in Keychain.");

@@ -43,6 +43,11 @@ try:
     read_until("확인 요청")
     os.write(terminal, " 질문\n".encode("utf-8"))
     read_until("접수 완료")
+    read_until("> ")
+    os.write(terminal, "세 번째".encode("utf-8"))
+    read_until("최종 응답")
+    os.write(terminal, " 질문\n".encode("utf-8"))
+    read_until("접수 완료")
     os.write(terminal, b"/exit\n")
     read_until("진행 창은 계속됩니다")
     deadline = time.monotonic() + 2

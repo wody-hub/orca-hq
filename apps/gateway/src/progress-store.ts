@@ -134,6 +134,8 @@ export type AssignRequestContext = Readonly<{
   contextId: string;
   relation: "new" | "continue";
   instruction: string;
+  /** Defaults to "legacy_conversation" when omitted, preserving existing callers. */
+  executionBackend?: ExecutionBackend;
   sourceContextId?: string;
 }>;
 
@@ -164,6 +166,13 @@ export type ContextAgentRecord = Readonly<{
   lastObservedAt?: string;
 }>;
 
+/**
+ * Discriminates how one assignment (request part) was executed. This is a per-assignment fact, not
+ * a per-context one: a context created before this migration keeps its `legacy_conversation` history
+ * while a new request routed to the very same context admits its new assignment as `native_orca`.
+ */
+export type ExecutionBackend = "legacy_conversation" | "native_orca";
+
 export type RequestContextAssignment = Readonly<{
   requestId: string;
   partId: string;
@@ -171,6 +180,7 @@ export type RequestContextAssignment = Readonly<{
   relation: "new" | "continue";
   sourceContextId?: string;
   instruction: string;
+  executionBackend: ExecutionBackend;
   outcome?: AssignmentOutcome;
 }>;
 
@@ -735,11 +745,13 @@ export class SqliteProgressStore implements ProgressStore {
   assignRequestContext(input: AssignRequestContext): void {
     this.requireRequestRow(input.requestId);
     this.requireContextSnapshot(input.contextId);
+    const executionBackend: ExecutionBackend = input.executionBackend ?? "legacy_conversation";
     const existing = this.database.prepare(`
-      SELECT context_id, relation, source_context_id, instruction FROM request_contexts
+      SELECT context_id, relation, source_context_id, instruction, execution_backend FROM request_contexts
       WHERE request_id = ? AND part_id = ?
     `).get(input.requestId, input.partId) as {
       context_id: string; relation: string; source_context_id: string | null; instruction: string;
+      execution_backend: string;
     } | undefined;
     if (existing !== undefined) {
       if (
@@ -747,20 +759,22 @@ export class SqliteProgressStore implements ProgressStore {
         || existing.relation !== input.relation
         || existing.source_context_id !== (input.sourceContextId ?? null)
         || existing.instruction !== input.instruction
+        || existing.execution_backend !== executionBackend
       ) throw new ProgressRecordCollisionError("request context", `${input.requestId}:${input.partId}`);
       return;
     }
     this.database.prepare(`
       INSERT INTO request_contexts (
-        request_id, part_id, context_id, relation, source_context_id, instruction
-      ) VALUES (?, ?, ?, ?, ?, ?)
+        request_id, part_id, context_id, relation, source_context_id, instruction, execution_backend
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.partId,
       input.contextId,
       input.relation,
       input.sourceContextId ?? null,
-      input.instruction
+      input.instruction,
+      executionBackend
     );
   }
 
@@ -826,7 +840,7 @@ export class SqliteProgressStore implements ProgressStore {
   listRequestAssignments(requestId: string): RequestContextAssignment[] {
     this.requireRequestRow(requestId);
     const rows = this.database.prepare(`
-      SELECT request_id, part_id, context_id, relation, source_context_id, instruction, outcome_json
+      SELECT request_id, part_id, context_id, relation, source_context_id, instruction, execution_backend, outcome_json
       FROM request_contexts WHERE request_id = ? ORDER BY part_id
     `).all(requestId) as Array<{
       request_id: string;
@@ -835,6 +849,7 @@ export class SqliteProgressStore implements ProgressStore {
       relation: "new" | "continue";
       source_context_id: string | null;
       instruction: string;
+      execution_backend: ExecutionBackend;
       outcome_json: string | null;
     }>;
     return rows.map((row) => ({
@@ -843,6 +858,7 @@ export class SqliteProgressStore implements ProgressStore {
       contextId: row.context_id,
       relation: row.relation,
       instruction: row.instruction,
+      executionBackend: row.execution_backend,
       ...(row.outcome_json === null ? {} : { outcome: JSON.parse(row.outcome_json) as AssignmentOutcome }),
       ...(row.source_context_id === null ? {} : { sourceContextId: row.source_context_id })
     }));
@@ -1435,6 +1451,8 @@ export class SqliteProgressStore implements ProgressStore {
         relation TEXT NOT NULL CHECK(relation IN ('new','continue')),
         source_context_id TEXT,
         instruction TEXT NOT NULL,
+        execution_backend TEXT NOT NULL DEFAULT 'legacy_conversation'
+          CHECK(execution_backend IN ('legacy_conversation','native_orca')),
         outcome_json TEXT,
         PRIMARY KEY(request_id, part_id)
       );
@@ -1487,6 +1505,11 @@ export class SqliteProgressStore implements ProgressStore {
     const assignmentColumns = this.database.prepare("PRAGMA table_info(request_contexts)").all() as Array<{ name: string }>;
     if (!assignmentColumns.some(({ name }) => name === "outcome_json")) {
       this.database.exec("ALTER TABLE request_contexts ADD COLUMN outcome_json TEXT");
+    }
+    if (!assignmentColumns.some(({ name }) => name === "execution_backend")) {
+      this.database.exec(
+        "ALTER TABLE request_contexts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'legacy_conversation'"
+      );
     }
     if (!contextColumns.some(({ name }) => name === "last_seq")) {
       this.database.exec("ALTER TABLE work_contexts ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0");

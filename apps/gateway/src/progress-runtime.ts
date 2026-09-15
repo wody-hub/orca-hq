@@ -11,6 +11,7 @@ import type {
   CompleteProgressRequest,
   AssignmentOutcome,
   RequestContextAssignment,
+  ExecutionBackend,
 } from "./progress-store.js";
 import type { ExecutionReservations } from "./execution-reservations.js";
 import {
@@ -109,8 +110,11 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
   function complete(input: CompleteProgressRequest) {
     return store.completeRequest(input);
   }
-  function assign(input: AssignRequestContext) {
-    store.assignRequestContext(input);
+  function assign(input: Omit<AssignRequestContext, "executionBackend">) {
+    store.assignRequestContext({
+      ...input,
+      executionBackend: options.nativeExecution ? "native_orca" : "legacy_conversation"
+    });
     const context = store.getContext(input.contextId)!;
     append({
       requestId: input.requestId,
@@ -800,6 +804,7 @@ export function createProgressRuntime(options: ProgressRuntimeOptions) {
               contextId,
               instruction: bounded,
               relation: part.action,
+              executionBackend: (options.nativeExecution ? "native_orca" : "legacy_conversation") as ExecutionBackend,
             };
           });
       if (priorAssignments.length)

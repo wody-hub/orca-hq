@@ -32,7 +32,7 @@ type Phase = "received" | "applied" | "cleanup_pending" | "acknowledged";
 interface MessageRecord { message: NativeMessage; runId: string; phase: Phase; attemptId?: string; ignored?: boolean; recovery?: unknown; children?: NativeWorkItem[]; quarantine?: string }
 export interface NativeQuarantineRecord { id: string; reason: string; detail: unknown; at: string }
 interface PlanRecord { id: string; inputKey: string; items: NativeWorkItem[]; source: ManagedCommandInput["source"]; userId: string }
-interface QuestionRecord extends NativeMessage { attemptId: string; answered?: boolean; answer?: string }
+export interface QuestionRecord extends NativeMessage { attemptId: string; answered?: boolean; answer?: string }
 const key = (...parts: string[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 
 export function createNativeCoordinator(options: {

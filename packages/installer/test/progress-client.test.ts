@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createProgressClient,
+  describeNativeWorkerEvent,
   ProgressRequestFailed,
   sanitizeDisplayText,
   type ProgressClient,
@@ -389,6 +390,102 @@ describe("display sanitizing", () => {
     expect(sanitizeDisplayText("가".repeat(500)).length).toBeLessThanOrEqual(400);
     expect(sanitizeDisplayText(undefined)).toBe("");
     expect(sanitizeDisplayText({ text: "x" })).toBe("");
+  });
+});
+
+describe("native worker event descriptions", () => {
+  const requested = { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "project analysis" };
+
+  it("describes a launching worker as waiting, never running, before any receipt exists", () => {
+    // Break caught: a worker still queued for admission must never read as already executing.
+    const description = describeNativeWorkerEvent({
+      kind: "worker.launching",
+      payload: { requested, attemptId: "attempt_1", worktreeId: "wt_1" }
+    });
+    expect(description).toContain("실행 대기 중");
+    expect(description).not.toContain("실행 중");
+    expect(description).toContain("codex/gpt-5.6-sol/high");
+  });
+
+  it("describes a ready worker with the exact terminal handle and effective model, flagging a mismatch", () => {
+    const description = describeNativeWorkerEvent({
+      kind: "worker.ready",
+      payload: {
+        requested, effective: { agent: "codex", model: "gpt-5.6-lite" },
+        terminalHandle: "term_abc123", attemptId: "attempt_1", worktreeId: "wt_1", taskId: "task_1", dispatchId: "dispatch_1"
+      }
+    });
+    expect(description).toContain("터미널 term_abc123");
+    expect(description).toContain("모델 codex/gpt-5.6-lite");
+    expect(description).toContain("(요청 codex/gpt-5.6-sol/high)");
+  });
+
+  it("marks a retained worker as reused rather than newly launched", () => {
+    const description = describeNativeWorkerEvent({
+      kind: "worker.retained",
+      payload: { requested, effective: { agent: "codex", model: "gpt-5.6-sol", effort: "high" }, terminalHandle: "term_zzz" }
+    });
+    expect(description).toContain("기존 터미널 재사용");
+  });
+
+  it("never invents a terminal handle or model when the receipt is incomplete", () => {
+    // Break caught: a missing field must render an explicit verification state, never a guess.
+    const description = describeNativeWorkerEvent({ kind: "worker.ready", payload: { requested } });
+    expect(description).toContain("터미널 확인 필요");
+    expect(description).toContain("모델 확인 필요");
+  });
+
+  it("marks recovery_required with an explicit verification state and no fabricated handle", () => {
+    const description = describeNativeWorkerEvent({ kind: "worker.recovery_required", payload: { requested, attemptId: "attempt_1", worktreeId: "wt_1" } });
+    expect(description).toContain("확인 필요");
+    expect(description).toContain("터미널 미확인");
+  });
+
+  it("keeps the reported provider visible when the worker reports no effective model", () => {
+    // Break caught: `effective.model` is optional on the wire, and collapsing the whole profile to
+    // "확인 필요" threw away the provider the worker actually did report.
+    const description = describeNativeWorkerEvent({
+      kind: "worker.ready",
+      payload: { requested, effective: { agent: "claude" }, terminalHandle: "term_abc" }
+    });
+    expect(description).toContain("모델 claude/모델 미확인");
+  });
+
+  it("does not claim a mismatch when the worker simply stayed silent about effort", () => {
+    // Break caught: comparing rendered strings reported a downgrade whenever the receipt omitted
+    // an optional field, even though nothing the worker reported actually differed.
+    const description = describeNativeWorkerEvent({
+      kind: "worker.ready",
+      payload: { requested, effective: { agent: "codex", model: "gpt-5.6-sol" }, terminalHandle: "term_abc" }
+    });
+    expect(description).not.toContain("요청");
+    expect(describeNativeWorkerEvent({
+      kind: "worker.ready",
+      payload: { requested, effective: { agent: "claude", model: "gpt-5.6-sol", effort: "high" }, terminalHandle: "term_abc" }
+    })).toContain("(요청 codex/gpt-5.6-sol/high)");
+  });
+
+  it("sanitizes every server-supplied field so a handle or model cannot drive the terminal", () => {
+    // Break caught: receipt fields were interpolated raw, so a hostile handle could clear the
+    // screen or relabel the window exactly where a trustworthy identity is supposed to be shown.
+    const description = describeNativeWorkerEvent({
+      kind: "worker.ready",
+      payload: {
+        requested,
+        effective: { agent: "codex", model: "\u001b]0;도용\u0007model" },
+        terminalHandle: "term_\u001b[2Jabc",
+        taskId: "task\u001b[31m_1",
+        worktreeId: "wt\n1",
+        dispatchId: "dispatch_1"
+      }
+    });
+    expect(description).not.toContain("\u001b");
+    expect(description).toContain("터미널 term_abc");
+    expect(description).toContain("worktree wt 1");
+  });
+
+  it("returns undefined for a non-worker event so callers keep their own rendering", () => {
+    expect(describeNativeWorkerEvent({ kind: "hq.progress", payload: {} })).toBeUndefined();
   });
 });
 

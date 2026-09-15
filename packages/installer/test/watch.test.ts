@@ -200,6 +200,37 @@ describe("watch renderer", () => {
       .toBe("02:00:01 대기 · 다른 작업의 수정 완료 대기");
     expect(renderer.event(event(2, "future.kind", { text: "새 관찰" }))).toBe("02:00:02 future.kind · 새 관찰");
   });
+
+  it("shows the context's own updatedAt separately from any single event's occurredAt", () => {
+    const renderer = createWatchRenderer({ contextId: "ctx_a", timeZone: "UTC" });
+    const header = renderer.header(snapshot({ updatedAt: "2026-09-08T02:05:00.000Z" }));
+    expect(header).toContain("갱신 2026-09-08T02:05:00.000Z");
+  });
+
+  it("tags a native worker event with its source and renders its receipt-backed identity, never a fabricated one", () => {
+    // Break caught: a native worker.* event was previously dropped (unknown kind, empty body).
+    const renderer = createWatchRenderer({ contextId: "ctx_a", timeZone: "UTC" });
+    const ready = renderer.event({
+      seq: 1, eventKey: "w1", requestId: "req_1", contextId: "ctx_a", kind: "worker.ready", source: "orca",
+      occurredAt: "2026-09-08T02:00:01.000Z",
+      payload: {
+        requested: { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "project analysis" },
+        effective: { agent: "codex", model: "gpt-5.6-sol", effort: "high" },
+        terminalHandle: "term_9f2a", attemptId: "attempt_1", worktreeId: "wt_1", runId: "run_1", taskId: "task_1", dispatchId: "dispatch_1"
+      }
+    });
+    expect(ready).toContain("네이티브 워커 [orca]");
+    expect(ready).toContain("터미널 term_9f2a");
+    expect(ready).toContain("모델 codex/gpt-5.6-sol/high");
+
+    const recovery = renderer.event({
+      seq: 2, eventKey: "w2", requestId: "req_1", contextId: "ctx_a", kind: "worker.recovery_required", source: "orca",
+      occurredAt: "2026-09-08T02:00:02.000Z",
+      payload: { requested: { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "project analysis" }, attemptId: "attempt_1", worktreeId: "wt_1" }
+    });
+    expect(recovery).toContain("확인 필요");
+    expect(recovery).toContain("터미널 미확인");
+  });
 });
 
 describe("watch process", () => {

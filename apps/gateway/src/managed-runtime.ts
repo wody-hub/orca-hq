@@ -11,7 +11,7 @@ import { openDatabase } from "@orca-hq/persistence";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { parsePilotConfigText, pilotConfigurationPath } from "@orca-hq/core";
+import { parsePilotConfigText, pilotConfigurationPath, type LaunchProfile, type PilotConfig } from "@orca-hq/core";
 import { readLocalCredential } from "./local-runtime.js";
 import { createProjectCatalog } from "./managed-projects.js";
 import { createOrcaRelay, runOrca } from "./orca-relay.js";
@@ -104,11 +104,44 @@ export function parseMaxActiveWorkers(raw: string | undefined): WorkerLimit {
     throw new TypeError(`HQ_MAX_ACTIVE_WORKERS="${raw}" is not usable: set a positive whole number (for example 10) or "unlimited".`);
   return parsed;
 }
+
+/** The profile set an installed config without `nativeExecution.roleProfiles` keeps running on. */
+export const defaultNativeRoleProfiles: Readonly<Record<string, LaunchProfile>> = Object.freeze({
+  primary: { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "HQ substantive work in the existing project checkout" }
+});
+
+export interface NativeExecutionSettings {
+  readonly maxActiveWorkers: WorkerLimit;
+  readonly retentionPolicy: NativeRetentionPolicy;
+  readonly profiles: Readonly<Record<string, LaunchProfile>>;
+}
+
+/**
+ * Resolves what the installed runtime actually runs on from the parsed config file, with the
+ * env var kept only as an operator override for hosts where editing the file is impractical.
+ * Precedence is deliberately one-directional: a value present in the config file always wins, and
+ * `HQ_MAX_ACTIVE_WORKERS` is consulted only where the file left the limit unset.
+ */
+export function resolveNativeExecutionSettings(
+  config: Pick<PilotConfig, "nativeExecution">,
+  env: Readonly<Partial<Record<"HQ_MAX_ACTIVE_WORKERS", string>>> = process.env
+): NativeExecutionSettings {
+  const native = config.nativeExecution;
+  return {
+    maxActiveWorkers: native?.maxActiveWorkers ?? parseMaxActiveWorkers(env.HQ_MAX_ACTIVE_WORKERS),
+    retentionPolicy: native?.retentionPolicy ?? "retain",
+    profiles: native?.roleProfiles ?? defaultNativeRoleProfiles
+  };
+}
+
 /** Native composition shared by installed channels and isolated integration fixtures. */
 export function createManagedNativeRuntime(options: {
   store: ProgressStore; admission: WorkerAdmission; relay: NativeCoordinatorRelay;
   catalog: { list(): Promise<CommandProject[]>; resolve(id: string): Promise<CommandProject> };
   router: ProgressRuntimeOptions["router"]; retentionPolicy: NativeRetentionPolicy;
+  /** Role launch profiles, keyed by role name; defaults to a single codex "primary" when omitted
+   * (an installed config without `nativeExecution.roleProfiles` keeps today's behavior). */
+  profiles?: Readonly<Record<string, LaunchProfile>>;
   /** The only `/hq ` command surface. There is deliberately no conversational execute path here. */
   commands?: { execute(input: ManagedCommandInput): Promise<ManagedCommandResult> };
   hasLegacyConflict?: ProgressRuntimeOptions["hasLegacyConflict"];
@@ -117,9 +150,10 @@ export function createManagedNativeRuntime(options: {
   stopJob?: (id: string) => Promise<CommandJob>;
   pollMs?: number;
 }) {
-  const planner = createNativeWorkPlanner({ profiles: {
-    primary: { agent: "codex", model: "gpt-5.6-sol", effort: "high", reason: "HQ substantive work in the existing project checkout" }
-  } });
+  const profiles = options.profiles ?? defaultNativeRoleProfiles;
+  const primary = profiles.primary;
+  if (!primary) throw new Error("native_profile_primary_required");
+  const planner = createNativeWorkPlanner({ profiles });
   const native = createNativeCoordinator({ store: options.store, admission: options.admission, relay: options.relay,
     retentionPolicy: options.retentionPolicy, ...(options.hasLegacyConflict ? { hasLegacyConflict: options.hasLegacyConflict } : {}), ...(options.pollMs ? { pollMs: options.pollMs } : {}),
     planner: { async plan(input) {
@@ -139,7 +173,7 @@ export function createManagedNativeRuntime(options: {
         scope = { ...scope, projectId: scoped.id };
       }
       const attempts = projects.map(project => {
-        const prior = options.admission.listAttempts().filter(a => a.item.contextId === context.contextId && a.item.projectId === project.id && a.item.worktreeId === (scope?.projectId === project.id ? scope.worktreeId : `${project.id}::${project.absolutePath}`) && a.item.profile.agent === "codex" && a.item.profile.model === "gpt-5.6-sol" && a.item.profile.effort === "high" && a.state === "settled" && a.resourceVerdict === "retained_idle").at(-1);
+        const prior = options.admission.listAttempts().filter(a => a.item.contextId === context.contextId && a.item.projectId === project.id && a.item.worktreeId === (scope?.projectId === project.id ? scope.worktreeId : `${project.id}::${project.absolutePath}`) && a.item.profile.agent === primary.agent && a.item.profile.model === primary.model && a.item.profile.effort === primary.effort && a.state === "settled" && a.resourceVerdict === "retained_idle").at(-1);
         return { attemptId: "attempt_" + createHash("sha256").update(JSON.stringify([input.id, project.id])).digest("hex"), projectId: project.id,
           ...(prior?.receipt ? { resumeTerminalHandle: prior.receipt.terminalHandle } : {}) };
       });
@@ -220,7 +254,8 @@ export async function startManagedRuntime() {
   });
   let progress: ReturnType<typeof createProgressRuntime> | undefined;
   let native: ReturnType<typeof createNativeCoordinator> | undefined;
-  const admission = createWorkerAdmission({ store: progressStore, maxActiveWorkers: parseMaxActiveWorkers(process.env.HQ_MAX_ACTIVE_WORKERS) });
+  const { maxActiveWorkers, retentionPolicy, profiles } = resolveNativeExecutionSettings(config, process.env);
+  const admission = createWorkerAdmission({ store: progressStore, maxActiveWorkers });
   let service: Awaited<ReturnType<typeof startManagedService>> | undefined;
   const coordinator = z
     .object({ coordinatorHandle: z.string().startsWith("term_") })
@@ -236,7 +271,7 @@ export async function startManagedRuntime() {
   const engine = createOrcaRelay({
     nativeOnly: true,
     nativeAdmission: admission,
-    nativeRetentionPolicy: "retain",
+    nativeRetentionPolicy: retentionPolicy,
     assertNativeCoordinator: () => admission.heartbeat(),
     resolveNativeProject: id => catalog.resolve(id),
     authorizeLegacyExecution: (project, worktreeId, signal) =>
@@ -343,7 +378,7 @@ export async function startManagedRuntime() {
   });
   const composition = createManagedNativeRuntime({
     store: progressStore, admission, relay: engine, catalog, commands,
-    router: createModelContextRouter(routerClient), retentionPolicy: "retain",
+    router: createModelContextRouter(routerClient), retentionPolicy, profiles,
     hasLegacyConflict: resources => compatibility!.hasLegacyConflict(resources),
     legacyGetJob: id => { try { return engine.getCached(id); } catch { return undefined; } },
     legacyReadJobs: createObservedJobListReader(engine), stopJob: id => engine.stop(id)

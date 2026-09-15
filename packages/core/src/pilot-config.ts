@@ -2,15 +2,44 @@ import { join, normalize, isAbsolute } from "node:path";
 
 import { z } from "zod";
 
+import { LaunchProfileSchema } from "./native-work.js";
+
 const AbsolutePathSchema = z.string().trim().min(1).refine(isAbsolute, "must be an absolute path").transform(normalize);
+
+/**
+ * All fields are optional so an existing installed config without this block keeps working; the
+ * runtime falls back to its own defaults (10 active workers, a single "primary" codex profile,
+ * "retain" completed-primary terminals) exactly where a field here is absent.
+ */
+export const NativeExecutionConfigSchema = z.object({
+  // `.safe()` matters: the admission gate itself rejects a non-safe integer with a bare TypeError
+  // at startup, so an out-of-range limit has to fail here as a named configuration error instead.
+  maxActiveWorkers: z.union([z.literal("unlimited"), z.number().int().positive().safe()]).optional(),
+  retentionPolicy: z.enum(["retain", "release"]).optional(),
+  roleProfiles: z.record(z.string().trim().min(1).max(128), LaunchProfileSchema).optional()
+}).strict().superRefine((value, ctx) => {
+  // Declaring role profiles replaces the built-in default set wholesale, so a set without
+  // "primary" would leave the runtime with no profile to launch substantive work with. Rejecting
+  // it here turns that into a configuration error rather than a startup crash.
+  if (value.roleProfiles !== undefined && value.roleProfiles.primary === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "native_profile_primary_required",
+      path: ["roleProfiles"]
+    });
+  }
+});
 
 export const PilotConfigSchema = z.object({
   schema: z.literal("orca-hq.private-pilot.v1"),
   databasePath: AbsolutePathSchema,
   voiceMode: z.enum(["disabled", "openai"]).optional(),
   projectRegistryPath: AbsolutePathSchema,
-  credentialAccounts: z.array(z.string().trim().min(1))
+  credentialAccounts: z.array(z.string().trim().min(1)),
+  nativeExecution: NativeExecutionConfigSchema.optional()
 }).strict();
+
+export type NativeExecutionConfig = z.infer<typeof NativeExecutionConfigSchema>;
 
 export const LegacyPilotConfigSchema = z.object({
   schema: z.literal("orca-hq.private-pilot.v1"),
