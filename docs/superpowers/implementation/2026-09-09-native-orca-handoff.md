@@ -1,22 +1,26 @@
 # HQ Native Orca 작업 인계
 
-작성일: 2026-09-09 · Task 4~6 갱신: 2026-09-15
+작성일: 2026-09-09 · Task 4~6 및 production install 갱신: 2026-09-15
 목적: 다음 세션에서 별도 재분석 없이 현재 구현 상태를 복원하고 작업을 이어간다.
 
 ## 현재 기준점
 
-- 기준 브랜치: `main`, HEAD는 여전히 `8f59bee`(Task 4 완료 커밋)이다.
+- 기준 브랜치: `main`, HEAD `a98e43f`이다. Task 5/6은 `2abf515`로 커밋했고, Orca 1.4.201의
+  nullable terminal title 호환 수정은 `a98e43f`로 별도 커밋했다.
 - 완료된 구현: 계획의 **Task 1~6** (Task 4 순차 독립 리뷰 완료 및 수정 반영, Task 5는 선행 worker
   구현 + 독립 리뷰 worker의 결함 수정까지 완료됨). 상세는
   [Task 5 결과](2026-09-15-native-orca-task5-result.md)와
   [Task 5 리뷰](2026-09-15-native-orca-task5-review.md)를 참조한다.
-- Task 5/6 변경은 **아직 커밋되지 않았고**(uncommitted), 실제 설치본
-  (`/Users/j.jaeyo/Applications/orca-hq`)에도 통합하지 않았다.
-- 다음 구현: **Task 7**(독립 리뷰와 실제 설치본 HQ endpoint/GUI 수용 검사). Task 5 리뷰 문서의
+- `a98e43f`의 15개 package/app dist tree는 실제 설치본
+  (`/Users/j.jaeyo/Applications/orca-hq`)에 byte-identical하게 설치됐다. launchd gateway는 PID
+  31689로 running이고 `/health` 200, `hq jobs list` exit 0, recovery barrier ready=1, DB 무결성,
+  기존 3개 legacy assignment identity 보존을 확인했다. 전체 근거와 rollback은
+  [production installation result](2026-09-15-native-orca-installation-result.md)에 있다.
+- 다음 구현: **Task 7**(full live native/GUI/10+1 수용 검사). Task 5 리뷰 문서의
   "남은 범위" 절 — 레거시 웹 UI 배선, 다중 뷰어 리스 모델, sanitization 공용화 — 는 별도 범위다.
 - 과거 검증 기준점 `86e3845`는 이전 세션에서 `pnpm typecheck`, 1165개 테스트, `pnpm -r build`를 이미 통과했다. 기존 인계의 전체 검증·커밋 미실행 주장은 그 이전 시점의 오래된 기록이었다.
-- Task 4~6에서 설치·서비스 재시작·커밋·푸시를 수행하지 않았다. Task 6은 안전한 workspace-local
-  build만 수행했으며 아래의 테스트 결과는 각 Task 시점의 새 검증으로 위 기준점과 구분한다.
+- 이번 release에서 Task 5/6 commit·production install·HQ-only restart를 수행했다. push와 외부
+  채널 전송은 하지 않았다. Task 6의 기존 검증과 이번 live health 증거는 서로 구분한다.
 
 ## 실제 설치·소비 경로 (범위 오인 방지)
 
@@ -95,17 +99,19 @@
   전체 `pnpm test`는 **93 files / 1231 tests passed**. root `prepare`의 global installer를
   실행하지 않고 `pnpm --filter './packages/**' --filter './apps/**' --if-present run build`로
   **15 of 16 workspace projects**의 package/app build를 통과했다.
-- 실제 HQ endpoint에서 native Task/Dispatch가 동작하는지, 새 terminal이 GUI에 표시되는지는 아직 검증하지 않았다. Task 6도 설치·서비스 재시작을 수행하지 않았다.
+- 이번 release에서 production install/restart와 `/health`·`hq status`·`hq jobs list`를 검증했다.
+  실제 HQ endpoint가 새 native Task/Dispatch를 launch/result까지 처리하는지와 새 terminal의 GUI
+  표시는 real project 교란을 피하려 아직 검증하지 않았다.
 
 ## 다음 세션 실행 순서
 
 1. Task 4 순차 독립 리뷰와 그 5개 지적 사항 수정은 완료되었다. 남은 확인은 리뷰 문서의 **Review resolutions** 절과 결과 문서의 **Review fixes** 절을 읽는 것으로 충분하다.
 2. Task 5(실제 worker 신원·상태 표시, 일반 설정 파일의 worker limit/profile/retention, HQ terminal
-   UX)는 선행 worker 구현 + 독립 리뷰 worker의 결함 수정까지 완료되었다. 커밋·설치는 아직이다.
+   UX)는 선행 worker 구현 + 독립 리뷰 worker의 결함 수정, commit, production install까지 완료됐다.
 3. Task 6 migration/복구 및 격리된 native 수용 검사는 완료됐다. 재현 명령과 exact allowlist는
    Task 6 결과 문서를 기준으로 한다.
-4. 다음은 **Task 7**이다. 독립 리뷰 후 실제 HQ endpoint/GUI·설치 준비 검증을 수행한다. 별도 승인
-   없이 설치본 변경·서비스 재시작을 하지 않는다. Task 5의 레거시 웹/quarantine/다중 viewer/
+4. 다음은 **Task 7**이다. 독립 리뷰 후 실제 HQ native launch/result와 GUI·10+1 검증을 수행한다.
+   별도 승인 없이 추가 설치본 변경·서비스 재시작을 하지 않는다. Task 5의 레거시 웹/quarantine/다중 viewer/
    sanitization 항목은 Task 7에 자동 포함하지 않는다.
 
 Task 4 검증 재현:

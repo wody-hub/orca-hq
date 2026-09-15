@@ -1,6 +1,6 @@
 # HQ native Orca 구현 여부 확인
 
-> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1~5 구현 및 Task 4/5 독립 리뷰 수정이 완료됐다(각 결과/리뷰 문서 참조). Task 6의 additive `executionBackend` migration, real SQLite recovery barrier, isolated real-socket native 수용 검사도 완료됐다. [Task 6 결과](2026-09-15-native-orca-task6-result.md)와 [마이그레이션/롤백 절차](2026-09-08-native-orca-migration.md)를 참조한다. Task 6은 집중 8 files / 110 tests, `pnpm typecheck`, 전체 93 files / 1231 tests, global installer를 피한 15 of 16 workspace package/app build를 통과했다. HEAD는 여전히 `8f59bee`이며 Task 5/6 변경은 uncommitted·미설치다. 다음은 **Task 7** 독립 리뷰와 live installed acceptance이고, 레거시 `apps/web`/`dashboard.ts` 배선과 quarantine 운영자 표면은 별도 미완 항목으로 남아 있다. 과거 기준점 `86e3845`의 검증 수치와 이번 Task 6 새 검증을 구분한다.
+> 후속 구현 업데이트: 아래 표는 구현 시작 전 감사 결과다. 이후 Task 1~6 구현과 Task 4/5 독립 리뷰 수정이 완료됐다. Task 5/6은 `2abf515`로, Orca 1.4.201 nullable terminal-title production 호환 수정은 `a98e43f`로 커밋했다. `a98e43f`의 15개 package/app dist tree를 production HQ에 byte-identical하게 설치하고 HQ만 재시작했으며, PID 31689, `/health` HTTP 200 managed/running, `hq jobs list` exit 0, additive `execution_backend`, recovery barrier ready=1, 기존 3개 legacy assignment identity 보존, native occupied 0, 네 DB 무결성을 확인했다. 상세 backup/allowlist/rollback은 [production installation result](2026-09-15-native-orca-installation-result.md)에 있다. 다음은 **Task 7**의 full live native/GUI/10+1 acceptance이며, 실제 native smoke는 real project 교란을 피하려 이번 release에서 실행하지 않았다. push·외부 채널 전송도 하지 않았다.
 
 확인일: 2026-09-08. 기준: 최신 native Orca 설계 및 실행 계획. 동시 실행은 **초기 기본값 10, 양의 안전한 정수 또는 `"unlimited"`로 변경 가능**이라는 사용자 결정을 적용한다.
 
@@ -51,10 +51,10 @@ Run: `run_8bb7664f144b`.
 ## 현재 다음 순서 (2026-09-15)
 
 Task 4 순차 리뷰와 수정, Task 5 구현/독립 리뷰 수정, Task 6 migration/복구 및 격리된 native
-수용 검사가 끝났다. Task 6은 real SQLite와 managed Unix socket/fake relay로 old assignment replay
+수용 검사, production commit/install/HQ restart가 끝났다. Task 6은 real SQLite와 managed Unix socket/fake relay로 old assignment replay
 차단, completed/active/unknown 무교체 복구, untouched queued native 1회 배정, mixed-channel 10+1,
 failure/stop/unknown/retained terminal/gateway restart를 검증했다. 다음은 **Task 7** 독립 리뷰와 실제
 HQ endpoint/GUI 검증이다. quarantine 운영자 표면, 레거시 `apps/web`/`dashboard.ts`, 다중 viewer,
-sanitization 공용화는 별도 미완 범위다. Task 6에서도 설치·재시작·commit·push·외부 채널 메시지나
-real Orca worker를 수행하지 않았다(HEAD는 여전히 `8f59bee`, Task 5/6은 uncommitted). 위 표와 설치
-상태 서술은 구현 전 감사 기록이며 현재 소스 구현 판정으로 재사용하지 않는다.
+sanitization 공용화는 별도 미완 범위다. 현재 HEAD는 `a98e43f`이고 production health/status/list까지
+검증했지만 real Orca worker/GUI/full 10+1은 실행하지 않았다. 위 표의 과거 설치 상태 서술은 구현 전
+감사 기록이며 현재 소스·설치 판정으로 재사용하지 않는다.
